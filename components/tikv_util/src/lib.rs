@@ -4,6 +4,7 @@
 #![feature(thread_id_value)]
 #![feature(min_specialization)]
 #![feature(box_patterns)]
+#![feature(str_split_once)]
 
 #[macro_use(fail_point)]
 extern crate fail;
@@ -25,7 +26,7 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use std::{env, thread, u64};
 
@@ -36,9 +37,7 @@ use rand::rngs::ThreadRng;
 pub mod log;
 pub mod buffer_vec;
 pub mod codec;
-pub mod collections;
 pub mod config;
-pub mod file;
 pub mod future;
 #[macro_use]
 pub mod macros;
@@ -90,23 +89,23 @@ pub fn create_panic_mark_file<P: AsRef<Path>>(data_dir: P) {
 
 pub fn panic_mark_file_exists<P: AsRef<Path>>(data_dir: P) -> bool {
     let path = panic_mark_file_path(data_dir);
-    file::file_exists(path)
+    file_system::file_exists(path)
 }
 
 // create a file with hole, to reserve space for TiKV.
 pub fn reserve_space_for_recover<P: AsRef<Path>>(data_dir: P, file_size: u64) -> io::Result<()> {
     let path = data_dir.as_ref().join(SPACE_PLACEHOLDER_FILE);
-    if file::file_exists(path.clone()) {
-        if file::get_file_size(path.clone())? == file_size {
+    if file_system::file_exists(path.clone()) {
+        if file_system::get_file_size(path.clone())? == file_size {
             return Ok(());
         }
-        file::delete_file_if_exist(path.clone())?;
+        file_system::delete_file_if_exist(path.clone())?;
     }
     if file_size > 0 {
         let f = File::create(path)?;
         f.allocate(file_size)?;
         f.sync_all()?;
-        file::sync_dir(data_dir)?;
+        file_system::sync_dir(data_dir)?;
     }
     Ok(())
 }
@@ -547,6 +546,10 @@ pub fn check_environment_variables() {
 #[inline]
 pub fn is_zero_duration(d: &Duration) -> bool {
     d.as_secs() == 0 && d.subsec_nanos() == 0
+}
+
+pub fn empty_shared_slice<T>() -> Arc<[T]> {
+    Vec::new().into()
 }
 
 #[cfg(test)]

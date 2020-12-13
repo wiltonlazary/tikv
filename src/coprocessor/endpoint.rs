@@ -10,18 +10,19 @@ use futures::channel::mpsc;
 use futures::prelude::*;
 use tokio::sync::Semaphore;
 
-use kvproto::kvrpcpb::IsolationLevel;
-use kvproto::{coprocessor as coppb, errorpb, kvrpcpb};
+use kvproto::kvrpcpb::{self, IsolationLevel};
+use kvproto::{coprocessor as coppb, errorpb};
 #[cfg(feature = "protobuf-codec")]
 use protobuf::CodedInputStream;
 use protobuf::Message;
 use tipb::{AnalyzeReq, AnalyzeType, ChecksumRequest, ChecksumScanOn, DagRequest, ExecType};
 
-use crate::read_pool::ReadPoolHandle;
 use crate::server::Config;
+use crate::storage::kv::PerfStatisticsInstant;
 use crate::storage::kv::{self, with_tls_engine};
 use crate::storage::mvcc::Error as MvccError;
-use crate::storage::{self, Engine, Snapshot, SnapshotStore};
+use crate::storage::{self, need_check_locks_in_replica_read, Engine, Snapshot, SnapshotStore};
+use crate::{read_pool::ReadPoolHandle, storage::kv::SnapContext};
 
 use crate::coprocessor::cache::CachedRequestHandler;
 use crate::coprocessor::interceptors::limit_concurrency;
@@ -30,6 +31,7 @@ use crate::coprocessor::metrics::*;
 use crate::coprocessor::tracker::Tracker;
 use crate::coprocessor::*;
 use concurrency_manager::ConcurrencyManager;
+use engine_rocks::PerfLevel;
 use minitrace::prelude::*;
 use txn_types::Lock;
 
@@ -47,7 +49,8 @@ pub struct Endpoint<E: Engine> {
 
     concurrency_manager: ConcurrencyManager,
 
-    check_memory_locks: bool,
+    // Perf stats level
+    perf_level: PerfLevel,
 
     /// The recursion limit when parsing Coprocessor Protobuf requests.
     ///
@@ -60,6 +63,8 @@ pub struct Endpoint<E: Engine> {
 
     /// The soft time limit of handling Coprocessor requests.
     max_handle_duration: Duration,
+
+    slow_log_threshold: Duration,
 
     _phantom: PhantomData<E>,
 }
@@ -82,6 +87,7 @@ impl<E: Engine> Endpoint<E> {
         cfg: &Config,
         read_pool: ReadPoolHandle,
         concurrency_manager: ConcurrencyManager,
+        perf_level: PerfLevel,
     ) -> Self {
         // FIXME: When yatp is used, we need to limit coprocessor requests in progress to avoid
         // using too much memory. However, if there are a number of large requests, small requests
@@ -96,29 +102,22 @@ impl<E: Engine> Endpoint<E> {
             read_pool,
             semaphore,
             concurrency_manager,
-            check_memory_locks: cfg.end_point_check_memory_locks,
+            perf_level,
             recursion_limit: cfg.end_point_recursion_limit,
             batch_row_limit: cfg.end_point_batch_row_limit,
             stream_batch_row_limit: cfg.end_point_stream_batch_row_limit,
             stream_channel_size: cfg.end_point_stream_channel_size,
             max_handle_duration: cfg.end_point_request_max_handle_duration.0,
+            slow_log_threshold: cfg.end_point_slow_log_threshold.0,
             _phantom: Default::default(),
         }
     }
 
-    fn check_memory_locks(
-        &self,
-        req_ctx: &ReqContext,
-        key_ranges: &[coppb::KeyRange],
-    ) -> Result<()> {
-        if !self.check_memory_locks {
-            return Ok(());
-        }
-
+    fn check_memory_locks(&self, req_ctx: &ReqContext) -> Result<()> {
         let start_ts = req_ctx.txn_start_ts;
         self.concurrency_manager.update_max_ts(start_ts);
         if req_ctx.context.get_isolation_level() == IsolationLevel::Si {
-            for range in key_ranges {
+            for range in &req_ctx.ranges {
                 let start_key = txn_types::Key::from_raw_maybe_unbounded(range.get_start());
                 let end_key = txn_types::Key::from_raw_maybe_unbounded(range.get_end());
                 self.concurrency_manager
@@ -233,19 +232,19 @@ impl<E: Engine> Endpoint<E> {
                 req_ctx = ReqContext::new(
                     tag,
                     context,
-                    ranges.as_slice(),
+                    ranges,
                     self.max_handle_duration,
                     peer,
                     Some(is_desc_scan),
                     start_ts.into(),
                     cache_match_version,
+                    self.perf_level,
                 );
 
-                self.check_memory_locks(&req_ctx, &ranges)?;
+                self.check_memory_locks(&req_ctx)?;
 
                 let batch_row_limit = self.get_batch_row_limit(is_streaming);
-                builder = Box::new(move |snap, req_ctx: &ReqContext| {
-                    // TODO: Remove explicit type once rust-lang#41078 is resolved
+                builder = Box::new(move |snap, req_ctx| {
                     let data_version = snap.get_data_version();
                     let store = SnapshotStore::new(
                         snap,
@@ -257,7 +256,7 @@ impl<E: Engine> Endpoint<E> {
                     );
                     dag::DagHandlerBuilder::new(
                         dag,
-                        ranges,
+                        req_ctx.ranges.clone(),
                         store,
                         req_ctx.deadline,
                         batch_row_limit,
@@ -284,20 +283,24 @@ impl<E: Engine> Endpoint<E> {
                 req_ctx = ReqContext::new(
                     tag,
                     context,
-                    ranges.as_slice(),
+                    ranges,
                     self.max_handle_duration,
                     peer,
                     None,
                     start_ts.into(),
                     cache_match_version,
+                    self.perf_level,
                 );
 
-                self.check_memory_locks(&req_ctx, &ranges)?;
+                self.check_memory_locks(&req_ctx)?;
 
-                builder = Box::new(move |snap, req_ctx: &_| {
-                    // TODO: Remove explicit type once rust-lang#41078 is resolved
+                builder = Box::new(move |snap, req_ctx| {
                     statistics::analyze::AnalyzeContext::new(
-                        analyze, ranges, start_ts, snap, req_ctx,
+                        analyze,
+                        req_ctx.ranges.clone(),
+                        start_ts,
+                        snap,
+                        req_ctx,
                     )
                     .map(|h| h.into_boxed())
                 });
@@ -318,20 +321,26 @@ impl<E: Engine> Endpoint<E> {
                 req_ctx = ReqContext::new(
                     tag,
                     context,
-                    ranges.as_slice(),
+                    ranges,
                     self.max_handle_duration,
                     peer,
                     None,
                     start_ts.into(),
                     cache_match_version,
+                    self.perf_level,
                 );
 
-                self.check_memory_locks(&req_ctx, &ranges)?;
+                self.check_memory_locks(&req_ctx)?;
 
-                builder = Box::new(move |snap, req_ctx: &_| {
-                    // TODO: Remove explicit type once rust-lang#41078 is resolved
-                    checksum::ChecksumContext::new(checksum, ranges, start_ts, snap, req_ctx)
-                        .map(|h| h.into_boxed())
+                builder = Box::new(move |snap, req_ctx| {
+                    checksum::ChecksumContext::new(
+                        checksum,
+                        req_ctx.ranges.clone(),
+                        start_ts,
+                        snap,
+                        req_ctx,
+                    )
+                    .map(|h| h.into_boxed())
                 });
             }
             tp => return Err(box_err!("unsupported tp {}", tp)),
@@ -348,13 +357,31 @@ impl<E: Engine> Endpoint<E> {
             self.batch_row_limit
         }
     }
+
     #[inline]
     fn async_snapshot(
         engine: &E,
-        ctx: &kvrpcpb::Context,
+        ctx: &ReqContext,
     ) -> impl std::future::Future<Output = Result<E::Snap>> {
-        kv::snapshot(engine, None, ctx).map_err(Error::from)
+        let mut snap_ctx = SnapContext {
+            pb_ctx: &ctx.context,
+            ..Default::default()
+        };
+        // need to pass start_ts and ranges to check memory locks for replica read
+        if need_check_locks_in_replica_read(&ctx.context) {
+            snap_ctx.start_ts = ctx.txn_start_ts;
+            for r in &ctx.ranges {
+                let start_key = txn_types::Key::from_raw(r.get_start());
+                let end_key = txn_types::Key::from_raw(r.get_end());
+                let mut key_range = kvrpcpb::KeyRange::default();
+                key_range.set_start_key(start_key.into_encoded());
+                key_range.set_end_key(end_key.into_encoded());
+                snap_ctx.key_ranges.push(key_range);
+            }
+        }
+        kv::snapshot(engine, snap_ctx).map_err(Error::from)
     }
+
     /// The real implementation of handling a unary request.
     ///
     /// It first retrieves a snapshot, then builds the `RequestHandler` over the snapshot and
@@ -372,11 +399,10 @@ impl<E: Engine> Endpoint<E> {
 
         // Safety: spawning this function using a `FuturePool` ensures that a TLS engine
         // exists.
-        let snapshot = unsafe {
-            with_tls_engine(|engine| Self::async_snapshot(engine, &tracker.req_ctx.context))
-        }
-        .trace_async(tipb::Event::TiKvCoprGetSnapshot as u32)
-        .await?;
+        let snapshot =
+            unsafe { with_tls_engine(|engine| Self::async_snapshot(engine, &tracker.req_ctx)) }
+                .trace_async(tipb::Event::TiKvCoprGetSnapshot as u32)
+                .await?;
         // When snapshot is retrieved, deadline may exceed.
         tracker.on_snapshot_finished();
         tracker.req_ctx.deadline.check()?;
@@ -409,7 +435,7 @@ impl<E: Engine> Endpoint<E> {
         let mut storage_stats = Statistics::default();
         handler.collect_scan_statistics(&mut storage_stats);
         tracker.collect_storage_statistics(storage_stats);
-        let exec_details = tracker.get_exec_details();
+        let (exec_details, exec_details_v2) = tracker.get_exec_details();
         tracker.on_finish_all_items();
 
         let mut resp = match result {
@@ -420,6 +446,7 @@ impl<E: Engine> Endpoint<E> {
             Err(e) => make_error_response(e),
         };
         resp.set_exec_details(exec_details);
+        resp.set_exec_details_v2(exec_details_v2);
         Ok(resp)
     }
 
@@ -435,7 +462,7 @@ impl<E: Engine> Endpoint<E> {
         let priority = req_ctx.context.get_priority();
         let task_id = req_ctx.build_task_id();
         // box the tracker so that moving it is cheap.
-        let tracker = Box::new(Tracker::new(req_ctx));
+        let tracker = Box::new(Tracker::new(req_ctx, self.slow_log_threshold));
 
         let res = self
             .read_pool
@@ -470,7 +497,7 @@ impl<E: Engine> Endpoint<E> {
         async move {
             let mut resp = match result_of_future {
                 Err(e) => make_error_response(e),
-                Ok(handle_fut) => handle_fut.await.unwrap_or_else(|e| make_error_response(e)),
+                Ok(handle_fut) => handle_fut.await.unwrap_or_else(make_error_response),
             };
             if let Some(collector) = collector {
                 let span_sets = collector.collect();
@@ -505,7 +532,7 @@ impl<E: Engine> Endpoint<E> {
             // Safety: spawning this function using a `FuturePool` ensures that a TLS engine
             // exists.
             let snapshot = unsafe {
-                with_tls_engine(|engine| Self::async_snapshot(engine, &tracker.req_ctx.context))
+                with_tls_engine(|engine| Self::async_snapshot(engine, &tracker.req_ctx))
             }
             .await?;
             // When snapshot is retrieved, deadline may exceed.
@@ -517,19 +544,27 @@ impl<E: Engine> Endpoint<E> {
             tracker.on_begin_all_items();
 
             loop {
-                tracker.on_begin_item();
+                let result = {
+                    tracker.on_begin_item();
+                    let perf_statistics_instant = PerfStatisticsInstant::new();
 
-                let result = handler.handle_streaming_request();
-                let mut storage_stats = Statistics::default();
-                handler.collect_scan_statistics(&mut storage_stats);
+                    let result = handler.handle_streaming_request();
 
-                tracker.on_finish_item(Some(storage_stats));
-                let exec_details = tracker.get_item_exec_details();
+                    let mut storage_stats = Statistics::default();
+                    handler.collect_scan_statistics(&mut storage_stats);
+                    let perf_statistics = perf_statistics_instant.delta();
+                    tracker.on_finish_item(Some(storage_stats), perf_statistics);
+
+                    result
+                };
+
+                let (exec_details, exec_details_v2) = tracker.get_item_exec_details();
 
                 match result {
                     Err(e) => {
                         let mut resp = make_error_response(e);
                         resp.set_exec_details(exec_details);
+                        resp.set_exec_details_v2(exec_details_v2);
                         yield resp;
                         break;
                     },
@@ -537,6 +572,7 @@ impl<E: Engine> Endpoint<E> {
                     Ok((Some(mut resp), finished)) => {
                         COPR_RESP_SIZE.inc_by(resp.data.len() as i64);
                         resp.set_exec_details(exec_details);
+                        resp.set_exec_details_v2(exec_details_v2);
                         yield resp;
                         if finished {
                             break;
@@ -560,7 +596,7 @@ impl<E: Engine> Endpoint<E> {
         let (tx, rx) = mpsc::channel::<Result<coppb::Response>>(self.stream_channel_size);
         let priority = req_ctx.context.get_priority();
         let task_id = req_ctx.build_task_id();
-        let tracker = Box::new(Tracker::new(req_ctx));
+        let tracker = Box::new(Tracker::new(req_ctx, self.slow_log_threshold));
 
         self.read_pool
             .spawn(
@@ -655,6 +691,7 @@ mod tests {
     use crate::read_pool::ReadPool;
     use crate::storage::kv::RocksEngine;
     use crate::storage::TestEngineBuilder;
+    use engine_rocks::PerfLevel;
     use protobuf::Message;
     use txn_types::{Key, LockType};
 
@@ -809,7 +846,12 @@ mod tests {
             engine,
         ));
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
 
         // a normal request
         let handler_builder =
@@ -824,13 +866,14 @@ mod tests {
             Box::new(|_, _: &_| Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed()));
         let outdated_req_ctx = ReqContext::new(
             ReqTag::test,
-            kvrpcpb::Context::default(),
-            &[],
+            Default::default(),
+            Vec::new(),
             Duration::from_secs(0),
             None,
             None,
             TimeStamp::max(),
             None,
+            PerfLevel::EnableCount,
         );
         assert!(block_on(cop.handle_unary_request(outdated_req_ctx, handler_builder)).is_err());
     }
@@ -843,7 +886,12 @@ mod tests {
             engine,
         ));
         let cm = ConcurrencyManager::new(1.into());
-        let mut cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let mut cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
         cop.recursion_limit = 100;
 
         let req = {
@@ -877,7 +925,12 @@ mod tests {
             engine,
         ));
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
 
         let mut req = coppb::Request::default();
         req.set_tp(9999);
@@ -894,7 +947,12 @@ mod tests {
             engine,
         ));
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
 
         let mut req = coppb::Request::default();
         req.set_tp(REQ_TYPE_DAG);
@@ -934,7 +992,12 @@ mod tests {
         );
 
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
 
         let (tx, rx) = mpsc::channel();
 
@@ -976,7 +1039,12 @@ mod tests {
             engine,
         ));
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
 
         let handler_builder =
             Box::new(|_, _: &_| Ok(UnaryFixture::new(Err(box_err!("foo"))).into_boxed()));
@@ -995,7 +1063,12 @@ mod tests {
             engine,
         ));
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
 
         // Fail immediately
         let handler_builder =
@@ -1027,8 +1100,8 @@ mod tests {
         .collect::<Result<Vec<_>>>()
         .unwrap();
         assert_eq!(resp_vec.len(), 6);
-        for i in 0..5 {
-            assert_eq!(resp_vec[i].get_data(), [1, 2, i as u8]);
+        for (i, resp) in resp_vec.iter().enumerate().take(5) {
+            assert_eq!(resp.get_data(), [1, 2, i as u8]);
         }
         assert_eq!(resp_vec[5].get_data().len(), 0);
         assert!(!resp_vec[5].get_other_error().is_empty());
@@ -1042,7 +1115,12 @@ mod tests {
             engine,
         ));
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
 
         let handler_builder = Box::new(|_, _: &_| Ok(StreamFixture::new(vec![]).into_boxed()));
         let resp_vec = block_on_stream(
@@ -1064,7 +1142,12 @@ mod tests {
             engine,
         ));
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&Config::default(), read_pool.handle(), cm);
+        let cop = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            read_pool.handle(),
+            cm,
+            PerfLevel::EnableCount,
+        );
 
         // handler returns `finished == true` should not be called again.
         let counter = Arc::new(atomic::AtomicIsize::new(0));
@@ -1161,6 +1244,7 @@ mod tests {
             },
             read_pool.handle(),
             cm,
+            PerfLevel::EnableCount,
         );
 
         let counter = Arc::new(atomic::AtomicIsize::new(0));
@@ -1220,13 +1304,14 @@ mod tests {
             ReadableDuration::millis((PAYLOAD_SMALL + PAYLOAD_LARGE) as u64 * 2);
 
         let cm = ConcurrencyManager::new(1.into());
-        let cop = Endpoint::<RocksEngine>::new(&config, read_pool.handle(), cm);
+        let cop =
+            Endpoint::<RocksEngine>::new(&config, read_pool.handle(), cm, PerfLevel::EnableCount);
 
         let (tx, rx) = std::sync::mpsc::channel();
 
         // A request that requests execution details.
         let mut req_with_exec_detail = ReqContext::default_for_test();
-        req_with_exec_detail.context.set_handle_time(true);
+        req_with_exec_detail.context.set_record_time_stat(true);
 
         {
             let mut wait_time: i64 = 0;
@@ -1263,19 +1348,27 @@ mod tests {
             let resp = &rx.recv().unwrap()[0];
             assert!(resp.get_other_error().is_empty());
             assert_ge!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_SMALL - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                resp.get_exec_details().get_handle_time().get_wait_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time - HANDLE_ERROR_MS - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp.get_exec_details().get_handle_time().get_wait_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             wait_time += PAYLOAD_SMALL - SNAPSHOT_DURATION_MS;
@@ -1284,19 +1377,27 @@ mod tests {
             let resp = &rx.recv().unwrap()[0];
             assert!(!resp.get_other_error().is_empty());
             assert_ge!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_LARGE - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                resp.get_exec_details().get_handle_time().get_wait_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time - HANDLE_ERROR_MS - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp.get_exec_details().get_handle_time().get_wait_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
         }
@@ -1336,11 +1437,15 @@ mod tests {
             let resp = &rx.recv().unwrap()[0];
             assert!(resp.get_other_error().is_empty());
             assert_ge!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_SMALL - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
 
@@ -1348,11 +1453,15 @@ mod tests {
             let resp = &rx.recv().unwrap()[0];
             assert!(!resp.get_other_error().is_empty());
             assert_ge!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_LARGE - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
         }
@@ -1407,19 +1516,27 @@ mod tests {
             let resp = &rx.recv().unwrap()[0];
             assert!(resp.get_other_error().is_empty());
             assert_ge!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_LARGE - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp.get_exec_details().get_handle_time().get_process_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                resp.get_exec_details().get_handle_time().get_wait_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time - HANDLE_ERROR_MS - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp.get_exec_details().get_handle_time().get_wait_ms(),
+                resp.get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             wait_time += PAYLOAD_LARGE - SNAPSHOT_DURATION_MS;
@@ -1431,23 +1548,29 @@ mod tests {
             assert_ge!(
                 resp[0]
                     .get_exec_details()
-                    .get_handle_time()
-                    .get_process_ms(),
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_SMALL - COARSE_ERROR_MS
             );
             assert_lt!(
                 resp[0]
                     .get_exec_details()
-                    .get_handle_time()
-                    .get_process_ms(),
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                resp[0].get_exec_details().get_handle_time().get_wait_ms(),
+                resp[0]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time - HANDLE_ERROR_MS - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp[0].get_exec_details().get_handle_time().get_wait_ms(),
+                resp[0]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
 
@@ -1455,23 +1578,29 @@ mod tests {
             assert_ge!(
                 resp[1]
                     .get_exec_details()
-                    .get_handle_time()
-                    .get_process_ms(),
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_LARGE - COARSE_ERROR_MS
             );
             assert_lt!(
                 resp[1]
                     .get_exec_details()
-                    .get_handle_time()
-                    .get_process_ms(),
+                    .get_time_detail()
+                    .get_process_wall_time_ms(),
                 PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
             assert_ge!(
-                resp[1].get_exec_details().get_handle_time().get_wait_ms(),
+                resp[1]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time - HANDLE_ERROR_MS - COARSE_ERROR_MS
             );
             assert_lt!(
-                resp[1].get_exec_details().get_handle_time().get_wait_ms(),
+                resp[1]
+                    .get_exec_details()
+                    .get_time_detail()
+                    .get_wait_wall_time_ms(),
                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
             );
         }
@@ -1500,11 +1629,9 @@ mod tests {
             ));
         });
 
-        let config = Config {
-            end_point_check_memory_locks: true,
-            ..Default::default()
-        };
-        let cop = Endpoint::<RocksEngine>::new(&config, read_pool.handle(), cm);
+        let config = Config::default();
+        let cop =
+            Endpoint::<RocksEngine>::new(&config, read_pool.handle(), cm, PerfLevel::EnableCount);
 
         let mut req = coppb::Request::default();
         req.mut_context().set_isolation_level(IsolationLevel::Si);

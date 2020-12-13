@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::{fmt, u64};
 
+use collections::HashMap;
 use engine_rocks::{set_perf_level, PerfContext, PerfLevel};
 use kvproto::kvrpcpb::KeyRange;
 use kvproto::metapb::{self, PeerRole};
@@ -13,7 +14,6 @@ use protobuf::{self, Message};
 use raft::eraftpb::{self, ConfChangeType, ConfState, MessageType};
 use raft::INVALID_INDEX;
 use raft_proto::ConfChangeI;
-use tikv_util::collections::HashMap;
 use tikv_util::time::monotonic_raw_now;
 use time::{Duration, Timespec};
 
@@ -96,16 +96,37 @@ pub fn check_key_in_region(key: &[u8], region: &metapb::Region) -> Result<()> {
 
 /// `is_first_vote_msg` checks `msg` is the first vote (or prevote) message or not. It's used for
 /// when the message is received but there is no such region in `Store::region_peers` and the
-/// region overlaps with others. In this case we should put `msg` into `pending_votes` instead of
+/// region overlaps with others. In this case we should put `msg` into `pending_msg` instead of
 /// create the peer.
 #[inline]
-pub fn is_first_vote_msg(msg: &eraftpb::Message) -> bool {
+fn is_first_vote_msg(msg: &eraftpb::Message) -> bool {
     match msg.get_msg_type() {
         MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {
             msg.get_term() == peer_storage::RAFT_INIT_LOG_TERM + 1
         }
         _ => false,
     }
+}
+
+/// `is_first_append_entry` checks `msg` is the first append message or not. This meassge is the first
+/// message that the learner peers of the new split region will receive from the leader. It's used for
+/// when the message is received but there is no such region in `Store::region_peers`. In this case we
+/// should put `msg` into `pending_msg` instead of create the peer.
+#[inline]
+fn is_first_append_entry(msg: &eraftpb::Message) -> bool {
+    match msg.get_msg_type() {
+        MessageType::MsgAppend => {
+            let ent = msg.get_entries();
+            ent.len() == 1
+                && ent[0].data.is_empty()
+                && ent[0].index == peer_storage::RAFT_INIT_LOG_INDEX + 1
+        }
+        _ => false,
+    }
+}
+
+pub fn is_first_message(msg: &eraftpb::Message) -> bool {
+    is_first_vote_msg(msg) || is_first_append_entry(msg)
 }
 
 #[inline]
@@ -888,11 +909,11 @@ mod tests {
 
     use kvproto::metapb::{self, RegionEpoch};
     use kvproto::raft_cmdpb::AdminRequest;
-    use raft::eraftpb::{ConfChangeType, Message, MessageType};
+    use raft::eraftpb::{ConfChangeType, Entry, Message, MessageType};
     use time::Duration as TimeDuration;
 
     use crate::store::peer_storage;
-    use tikv_util::time::{monotonic_now, monotonic_raw_now};
+    use tikv_util::time::monotonic_raw_now;
 
     use super::*;
 
@@ -900,20 +921,16 @@ mod tests {
     fn test_lease() {
         #[inline]
         fn sleep_test(duration: TimeDuration, lease: &Lease, state: LeaseState) {
-            // In linux, sleep uses CLOCK_MONOTONIC.
-            let monotonic_start = monotonic_now();
-            // In linux, lease uses CLOCK_MONOTONIC_RAW.
+            // In linux, lease uses CLOCK_MONOTONIC_RAW, while sleep uses CLOCK_MONOTONIC
             let monotonic_raw_start = monotonic_raw_now();
             thread::sleep(duration.to_std().unwrap());
-            let monotonic_end = monotonic_now();
-            let monotonic_raw_end = monotonic_raw_now();
-            assert_eq!(
-                lease.inspect(Some(monotonic_raw_end)),
-                state,
-                "elapsed monotonic_raw: {:?}, monotonic: {:?}",
-                monotonic_raw_end - monotonic_raw_start,
-                monotonic_end - monotonic_start
-            );
+            let mut monotonic_raw_end = monotonic_raw_now();
+            // spin wait to make sure pace is aligned with MONOTONIC_RAW clock
+            while monotonic_raw_end - monotonic_raw_start < duration {
+                thread::yield_now();
+                monotonic_raw_end = monotonic_raw_now();
+            }
+            assert_eq!(lease.inspect(Some(monotonic_raw_end)), state);
             assert_eq!(lease.inspect(None), state);
         }
 
@@ -1199,6 +1216,39 @@ mod tests {
             msg.set_msg_type(msg_type);
             msg.set_term(term);
             assert_eq!(is_first_vote_msg(&msg), is_vote);
+        }
+    }
+
+    #[test]
+    fn test_first_append_entry() {
+        let tbl = vec![
+            (
+                MessageType::MsgAppend,
+                peer_storage::RAFT_INIT_LOG_INDEX + 1,
+                true,
+            ),
+            (
+                MessageType::MsgAppend,
+                peer_storage::RAFT_INIT_LOG_INDEX,
+                false,
+            ),
+            (
+                MessageType::MsgHup,
+                peer_storage::RAFT_INIT_LOG_INDEX + 1,
+                false,
+            ),
+        ];
+
+        for (msg_type, index, is_append) in tbl {
+            let mut msg = Message::default();
+            msg.set_msg_type(msg_type);
+            let ent = {
+                let mut e = Entry::default();
+                e.set_index(index);
+                e
+            };
+            msg.set_entries(vec![ent].into());
+            assert_eq!(is_first_append_entry(&msg), is_append);
         }
     }
 

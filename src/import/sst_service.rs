@@ -3,7 +3,7 @@
 use std::f64::INFINITY;
 use std::sync::Arc;
 
-use engine_traits::{name_to_cf, KvEngine, CF_DEFAULT, CF_WRITE};
+use engine_traits::{name_to_cf, KvEngine, CF_DEFAULT};
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
 use futures::{TryFutureExt, TryStreamExt};
 use grpcio::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
@@ -184,13 +184,18 @@ where
         let timer = Instant::now_coarse();
         let importer = Arc::clone(&self.importer);
         let limiter = self.limiter.clone();
-        let sst_writer = <E as SstExt>::SstWriterBuilder::new()
-            .set_db(&self.engine)
-            .set_cf(name_to_cf(req.get_sst().get_cf_name()).unwrap())
-            .build(self.importer.get_path(req.get_sst()).to_str().unwrap())
-            .unwrap();
+        let engine = self.engine.clone();
 
         let handle_task = async move {
+            // SST writer must not be opened in gRPC threads, because it may be
+            // blocked for a long time due to IO, especially, when encryption at rest
+            // is enabled, and it leads to gRPC keepalive timeout.
+            let sst_writer = <E as SstExt>::SstWriterBuilder::new()
+                .set_db(&engine)
+                .set_cf(name_to_cf(req.get_sst().get_cf_name()).unwrap())
+                .build(importer.get_path(req.get_sst()).to_str().unwrap())
+                .unwrap();
+
             // FIXME: download() should be an async fn, to allow BR to cancel
             // a download task.
             // Unfortunately, this currently can't happen because the S3Storage
@@ -269,7 +274,7 @@ where
         cmd.mut_requests().push(ingest);
 
         let (cb, future) = paired_future_callback();
-        if let Err(e) = self.router.send_command(cmd, Callback::Write(cb)) {
+        if let Err(e) = self.router.send_command(cmd, Callback::write(cb)) {
             let mut resp = IngestResponse::default();
             resp.set_error(e.into());
             ctx.spawn(
@@ -286,6 +291,7 @@ where
                     let mut resp = IngestResponse::default();
                     let mut header = res.response.take_header();
                     if header.has_error() {
+                        pb_error_inc(label, header.get_error());
                         resp.set_error(header.take_error());
                     }
                     Ok(resp)
@@ -418,19 +424,7 @@ where
                     _ => return Err(Error::InvalidChunk),
                 };
 
-                let name = import.get_path(&meta);
-
-                let default = <E as SstExt>::SstWriterBuilder::new()
-                    .set_in_memory(true)
-                    .set_db(&engine)
-                    .set_cf(CF_DEFAULT)
-                    .build(&name.to_str().unwrap())?;
-                let write = <E as SstExt>::SstWriterBuilder::new()
-                    .set_in_memory(true)
-                    .set_db(&engine)
-                    .set_cf(CF_WRITE)
-                    .build(&name.to_str().unwrap())?;
-                let writer = match import.new_writer::<E>(default, write, meta) {
+                let writer = match import.new_writer::<E>(&engine, meta) {
                     Ok(w) => w,
                     Err(e) => {
                         error!("build writer failed {:?}", e);
@@ -463,4 +457,29 @@ where
         self.threads.spawn_ok(buf_driver);
         self.threads.spawn_ok(handle_task);
     }
+}
+
+// add error statistics from pb error response
+fn pb_error_inc(type_: &str, e: &errorpb::Error) {
+    let label = if e.has_not_leader() {
+        "not_leader"
+    } else if e.has_store_not_match() {
+        "store_not_match"
+    } else if e.has_region_not_found() {
+        "region_not_found"
+    } else if e.has_key_not_in_region() {
+        "key_not_in_range"
+    } else if e.has_epoch_not_match() {
+        "epoch_not_match"
+    } else if e.has_server_is_busy() {
+        "server_is_busy"
+    } else if e.has_stale_command() {
+        "stale_command"
+    } else if e.has_raft_entry_too_large() {
+        "raft_entry_too_large"
+    } else {
+        "unknown"
+    };
+
+    IMPORTER_ERROR_VEC.with_label_values(&[type_, label]).inc();
 }
