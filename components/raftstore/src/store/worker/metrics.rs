@@ -1,5 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
+use lazy_static::lazy_static;
 use prometheus::*;
 use prometheus_static_metric::*;
 
@@ -43,6 +44,7 @@ make_static_metric! {
         epoch,
         appiled_term,
         channel_full,
+        safe_ts,
     }
 
     pub struct ReadRejectCounter : IntCounter {
@@ -95,6 +97,12 @@ lazy_static! {
     pub static ref STALE_PEER_PENDING_DELETE_RANGE_GAUGE: Gauge = register_gauge!(
         "tikv_pending_delete_ranges_of_stale_peer",
         "Total number of tikv pending delete range of stale peer"
+    )
+    .unwrap();
+    pub static ref CLEAN_COUNTER_VEC: IntCounterVec = register_int_counter_vec!(
+        "tikv_raftstore_clean_region_count",
+        "Total number of region-worker clean range operations",
+        &["type"]
     )
     .unwrap();
     pub static ref LOCAL_READ_REJECT_VEC: IntCounterVec = register_int_counter_vec!(

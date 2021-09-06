@@ -1,6 +1,7 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::time::{Duration, Instant};
+use fail::fail_point;
 
 #[derive(Debug, Copy, Clone)]
 pub struct DeadlineError;
@@ -44,5 +45,10 @@ impl Deadline {
             return Err(DeadlineError);
         }
         Ok(())
+    }
+
+    // Returns the deadline instant of the std library.
+    pub fn to_std_instant(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.deadline.duration_since(Instant::now_coarse())
     }
 }

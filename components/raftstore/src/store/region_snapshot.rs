@@ -14,9 +14,11 @@ use engine_traits::util::check_key_in_range;
 use engine_traits::RaftEngine;
 use engine_traits::CF_RAFT;
 use engine_traits::{Error as EngineError, Iterable, Iterator};
+use fail::fail_point;
 use keys::DATA_PREFIX_KEY;
 use tikv_util::keybuilder::KeyBuilder;
 use tikv_util::metrics::CRITICAL_ERROR;
+use tikv_util::{box_err, error};
 use tikv_util::{panic_when_unexpected_key_or_data, set_panic_mark};
 
 /// Snapshot of a region.
@@ -229,14 +231,14 @@ where
             set_panic_mark();
             panic!(
                 "failed to get value of key {} in region {}: {:?}",
-                log_wrappers::Value::key(&key),
+                log_wrappers::Value::key(key),
                 self.region.get_id(),
                 e,
             );
         } else {
             error!(
                 "failed to get value of key in cf";
-                "key" => log_wrappers::Value::key(&key),
+                "key" => log_wrappers::Value::key(key),
                 "region" => self.region.get_id(),
                 "cf" => cf,
                 "error" => ?e,

@@ -1,21 +1,20 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{DecodeProperties, IndexHandles};
 use std::cmp;
 use std::collections::HashMap;
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::u64;
 
-use engine_traits::KvEngine;
-use engine_traits::Range;
-use engine_traits::{IndexHandle, MvccProperties, TableProperties, TablePropertiesCollection};
+use crate::decode_properties::{DecodeProperties, IndexHandle, IndexHandles};
+use engine_traits::{MvccProperties, Range};
 use rocksdb::{
     DBEntryType, TablePropertiesCollector, TablePropertiesCollectorFactory, TitanBlobIndex,
     UserCollectedProperties,
 };
 use tikv_util::codec::number::{self, NumberEncoder};
 use tikv_util::codec::{Error, Result};
+use tikv_util::info;
 use txn_types::{Key, Write, WriteType};
 
 use crate::mvcc_properties::*;
@@ -53,10 +52,10 @@ impl SizeProperties {
     }
 
     pub fn decode<T: DecodeProperties>(props: &T) -> Result<SizeProperties> {
-        let mut res = SizeProperties::default();
-        res.total_size = props.decode_u64(PROP_TOTAL_SIZE)?;
-        res.index_handles = props.decode_handles(PROP_SIZE_INDEX)?;
-        Ok(res)
+        Ok(SizeProperties {
+            total_size: props.decode_u64(PROP_TOTAL_SIZE)?,
+            index_handles: props.decode_handles(PROP_SIZE_INDEX)?,
+        })
     }
 }
 
@@ -92,6 +91,12 @@ impl UserProperties {
 
     pub fn encode_handles(&mut self, name: &str, handles: &IndexHandles) {
         self.encode(name, handles.encode())
+    }
+}
+
+impl Default for UserProperties {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -168,7 +173,10 @@ impl RangeProperties {
     pub fn decode<T: DecodeProperties>(props: &T) -> Result<RangeProperties> {
         match RangeProperties::decode_from_range_properties(props) {
             Ok(res) => return Ok(res),
-            Err(e) => info!("decode to RangeProperties failed with err: {:?}, try to decode to SizeProperties, maybe upgrade from v2.0 or older version?", e),
+            Err(e) => info!(
+                "decode to RangeProperties failed with err: {:?}, try to decode to SizeProperties, maybe upgrade from v2.0 or older version?",
+                e
+            ),
         }
         SizeProperties::decode(props).map(|res| res.into())
     }
@@ -180,9 +188,10 @@ impl RangeProperties {
             let klen = number::decode_u64(&mut buf)?;
             let mut k = vec![0; klen as usize];
             buf.read_exact(&mut k)?;
-            let mut offsets = RangeOffsets::default();
-            offsets.size = number::decode_u64(&mut buf)?;
-            offsets.keys = number::decode_u64(&mut buf)?;
+            let offsets = RangeOffsets {
+                size: number::decode_u64(&mut buf)?,
+                keys: number::decode_u64(&mut buf)?,
+            };
             res.offsets.push((k, offsets));
         }
         Ok(res)
@@ -294,8 +303,10 @@ impl From<SizeProperties> for RangeProperties {
     fn from(p: SizeProperties) -> RangeProperties {
         let mut res = RangeProperties::default();
         for (key, size_handle) in p.index_handles.into_map() {
-            let mut range = RangeOffsets::default();
-            range.size = size_handle.offset;
+            let range = RangeOffsets {
+                size: size_handle.offset,
+                ..Default::default()
+            };
             res.offsets.push((key, range));
         }
         res
@@ -517,15 +528,12 @@ impl TablePropertiesCollectorFactory for MvccPropertiesCollectorFactory {
     }
 }
 
-pub fn get_range_entries_and_versions<E>(
-    engine: &E,
+pub fn get_range_entries_and_versions(
+    engine: &crate::RocksEngine,
     cf: &str,
     start: &[u8],
     end: &[u8],
-) -> Option<(u64, u64)>
-where
-    E: KvEngine,
-{
+) -> Option<(u64, u64)> {
     let range = Range::new(start, end);
     let collection = match engine.get_properties_of_tables_in_range(cf, &[range]) {
         Ok(v) => v,
@@ -540,7 +548,7 @@ where
     let mut props = MvccProperties::new();
     let mut num_entries = 0;
     for (_, v) in collection.iter() {
-        let mvcc = match RocksMvccProperties::decode(&v.user_collected_properties()) {
+        let mvcc = match RocksMvccProperties::decode(v.user_collected_properties()) {
             Ok(v) => v,
             Err(_) => return None,
         };
@@ -620,7 +628,7 @@ mod tests {
             props.get_approximate_size_in_range(b"", b"k"),
             DEFAULT_PROP_SIZE_INDEX_DISTANCE / 8 * 25 + 11
         );
-        assert_eq!(props.get_approximate_keys_in_range(b"", b"k"), 11 as u64);
+        assert_eq!(props.get_approximate_keys_in_range(b"", b"k"), 11_u64);
 
         assert_eq!(props.offsets.len(), 7);
         let a = props.get(b"a".as_ref());
@@ -695,7 +703,7 @@ mod tests {
         let mut collector = RangePropertiesCollector::default();
         let mut extra_value_size: u64 = 0;
         for &(k, vlen) in &cases {
-            if handles.contains(&k) || rng.gen_range(0, 2) == 0 {
+            if handles.contains(&k) || rng.gen_range(0..2) == 0 {
                 let v = vec![0; vlen as usize - extra_value_size as usize];
                 extra_value_size = 0;
                 collector.add(k.as_bytes(), &v, DBEntryType::Put, 0, 0);

@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::*;
+use std::time::Duration;
 
 use futures::executor::block_on;
 
@@ -19,6 +19,7 @@ use raftstore::store::util::is_learner;
 use raftstore::Result;
 use test_raftstore::*;
 use tikv_util::config::ReadableDuration;
+use tikv_util::time::Instant;
 use tikv_util::HandyRwLock;
 
 fn test_simple_conf_change<T: Simulator>(cluster: &mut Cluster<T>) {
@@ -172,11 +173,13 @@ fn test_pd_conf_change<T: Simulator>(cluster: &mut Cluster<T>) {
 
     let peer2 = new_conf_change_peer(&stores[1], &pd_client);
     let engine_2 = cluster.get_engine(peer2.get_store_id());
-    assert!(engine_2
-        .c()
-        .get_value(&keys::data_key(b"k1"))
-        .unwrap()
-        .is_none());
+    assert!(
+        engine_2
+            .c()
+            .get_value(&keys::data_key(b"k1"))
+            .unwrap()
+            .is_none()
+    );
     // add new peer to first region.
     pd_client.must_add_peer(region_id, peer2.clone());
 
@@ -542,7 +545,7 @@ fn test_conf_change_safe<T: Simulator>(cluster: &mut Cluster<T>) {
 
     // Isolate the leader.
     cluster.must_transfer_leader(region_id, new_peer(1, 1));
-    cluster.add_send_filter(IsolationFilterFactory::new(1));
+    cluster.stop_node(1);
 
     // Ensure new leader is elected and it works.
     cluster.must_put(b"k1", b"v1");
@@ -556,7 +559,7 @@ fn test_conf_change_safe<T: Simulator>(cluster: &mut Cluster<T>) {
     pd_client.must_none_peer(region_id, new_peer(4, 4));
 
     // Recover the isolated peer.
-    cluster.clear_send_filters();
+    cluster.run_node(1).unwrap();
 
     // Then new node could be added.
     pd_client.must_add_peer(region_id, new_peer(4, 4));
@@ -568,7 +571,7 @@ fn test_conf_change_safe<T: Simulator>(cluster: &mut Cluster<T>) {
 
     // Isolate the leader.
     cluster.must_transfer_leader(region_id, new_peer(1, 1));
-    cluster.add_send_filter(IsolationFilterFactory::new(1));
+    cluster.stop_node(1);
 
     // Ensure new leader is elected and it works.
     cluster.must_put(b"k3", b"v3");
@@ -942,5 +945,5 @@ fn test_conf_change_fast() {
     pd_client.must_add_peer(r1, new_learner_peer(2, 2));
     pd_client.must_add_peer(r1, new_peer(2, 2));
     must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
-    assert!(timer.elapsed() < Duration::from_secs(5));
+    assert!(timer.saturating_elapsed() < Duration::from_secs(5));
 }

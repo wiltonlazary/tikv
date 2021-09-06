@@ -1,25 +1,11 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
-#![feature(min_specialization)]
-
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate quick_error;
-#[macro_use]
-extern crate serde_derive;
-extern crate hex;
-extern crate kvproto;
-#[macro_use(fail_point)]
-extern crate fail;
-
 #[allow(unused_extern_crates)]
 extern crate tikv_alloc;
-#[macro_use]
-extern crate tikv_util;
 
 mod client;
 mod feature_gate;
 pub mod metrics;
+mod tso;
 mod util;
 
 mod config;
@@ -28,8 +14,8 @@ pub use self::client::{DummyPdClient, RpcClient};
 pub use self::config::Config;
 pub use self::errors::{Error, Result};
 pub use self::feature_gate::{Feature, FeatureGate};
-pub use self::util::validate_endpoints;
-pub use self::util::RECONNECT_INTERVAL_SEC;
+pub use self::util::PdConnector;
+pub use self::util::REQUEST_RECONNECT_INTERVAL;
 
 use std::ops::Deref;
 
@@ -37,6 +23,7 @@ use futures::future::BoxFuture;
 use kvproto::metapb;
 use kvproto::pdpb;
 use kvproto::replication_modepb::{RegionReplicationStatus, ReplicationStatus};
+use pdpb::QueryStats;
 use tikv_util::time::UnixSecs;
 use txn_types::TimeStamp;
 
@@ -51,9 +38,13 @@ pub struct RegionStat {
     pub written_keys: u64,
     pub read_bytes: u64,
     pub read_keys: u64,
+    pub query_stats: QueryStats,
     pub approximate_size: u64,
     pub approximate_keys: u64,
     pub last_report_ts: UnixSecs,
+    // cpu_usage is the CPU time usage of the leader region since the last heartbeat,
+    // which is calculated by cpu_time_delta/heartbeat_reported_interval.
+    pub cpu_usage: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -161,8 +152,18 @@ pub trait PdClient: Send + Sync {
         unimplemented!();
     }
 
+    /// Gets Region which the key belongs to asynchronously.
+    fn get_region_async<'k>(&'k self, _key: &'k [u8]) -> BoxFuture<'k, Result<metapb::Region>> {
+        unimplemented!();
+    }
+
     /// Gets Region info which the key belongs to.
     fn get_region_info(&self, _key: &[u8]) -> Result<RegionInfo> {
+        unimplemented!();
+    }
+
+    /// Gets Region info which the key belongs to asynchronously.
+    fn get_region_info_async<'k>(&'k self, _key: &'k [u8]) -> BoxFuture<'k, Result<RegionInfo>> {
         unimplemented!();
     }
 
@@ -244,8 +245,8 @@ pub trait PdClient: Send + Sync {
         unimplemented!();
     }
 
-    /// Gets store state if it is not a tombstone store.
-    fn get_store_stats(&self, _store_id: u64) -> Result<pdpb::StoreStats> {
+    /// Gets store state if it is not a tombstone store asynchronously.
+    fn get_store_stats_async(&self, _store_id: u64) -> BoxFuture<'_, Result<pdpb::StoreStats>> {
         unimplemented!();
     }
 
@@ -256,6 +257,11 @@ pub trait PdClient: Send + Sync {
 
     /// Gets a timestamp from PD.
     fn get_tso(&self) -> PdFuture<TimeStamp> {
+        unimplemented!()
+    }
+
+    /// Gets the internal `FeatureGate`.
+    fn feature_gate(&self) -> &FeatureGate {
         unimplemented!()
     }
 }

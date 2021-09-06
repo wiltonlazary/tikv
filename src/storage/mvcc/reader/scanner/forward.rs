@@ -47,6 +47,9 @@ pub trait ScanPolicy<S: Snapshot> {
         cursors: &mut Cursors<S>,
         statistics: &mut Statistics,
     ) -> Result<HandleRes<Self::Output>>;
+
+    /// Returns the size of the specified output.
+    fn output_size(&mut self, output: &Self::Output) -> usize;
 }
 
 pub enum HandleRes<T> {
@@ -275,6 +278,7 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                         &mut self.statistics,
                     )? {
                         self.statistics.write.processed_keys += 1;
+                        self.statistics.processed_size += self.scan_policy.output_size(&output);
                         return Ok(Some(output));
                     }
                 }
@@ -366,6 +370,10 @@ impl<S: Snapshot> ScanPolicy<S> for LatestKvPolicy {
         let value: Option<Value> = loop {
             let write = WriteRef::parse(cursors.write.value(&mut statistics.write))?;
 
+            if !write.check_gc_fence_as_latest_version(cfg.ts) {
+                break None;
+            }
+
             match write.write_type {
                 WriteType::Put => {
                     if cfg.omit_value {
@@ -413,6 +421,10 @@ impl<S: Snapshot> ScanPolicy<S> for LatestKvPolicy {
             Some(v) => HandleRes::Return((current_user_key, v)),
             _ => HandleRes::Skip(current_user_key),
         })
+    }
+
+    fn output_size(&mut self, output: &Self::Output) -> usize {
+        output.0.len() + output.1.len()
     }
 }
 
@@ -465,6 +477,10 @@ impl<S: Snapshot> ScanPolicy<S> for LatestEntryPolicy {
             }
             let write_value = cursors.write.value(&mut statistics.write);
             let write = WriteRef::parse(write_value)?;
+
+            if !write.check_gc_fence_as_latest_version(cfg.ts) {
+                break None;
+            }
 
             match write.write_type {
                 WriteType::Put => {
@@ -521,6 +537,10 @@ impl<S: Snapshot> ScanPolicy<S> for LatestEntryPolicy {
             Some(entry) => HandleRes::Return(entry),
             _ => HandleRes::Skip(current_user_key),
         })
+    }
+
+    fn output_size(&mut self, output: &Self::Output) -> usize {
+        output.size()
     }
 }
 
@@ -616,6 +636,7 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
                     cursors.default.as_mut().unwrap(),
                     &current_user_key,
                     std::cmp::max(lock.ts, lock.for_update_ts),
+                    self.from_ts,
                     statistics,
                 )?
             } else {
@@ -655,6 +676,9 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
             }
 
             let (write_type, start_ts, short_value) = {
+                // DeltaEntryScanner only returns commit records between `from_ts` and `cfg.ts`.
+                // We can assume that it must ensure GC safepoint doesn't exceed `from_ts`, so GC
+                // fence checking can be skipped. But it's still needed when loading the old value.
                 let write_ref = WriteRef::parse(write_value)?;
                 (
                     write_ref.write_type,
@@ -708,6 +732,7 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
                     cursors.default.as_mut().unwrap(),
                     &current_user_key,
                     commit_ts,
+                    self.from_ts,
                     statistics,
                 )?
             } else {
@@ -722,6 +747,10 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
 
             return res;
         }
+    }
+
+    fn output_size(&mut self, output: &Self::Output) -> usize {
+        output.size()
     }
 }
 
@@ -756,6 +785,11 @@ where
 pub mod test_util {
     use super::*;
     use crate::storage::mvcc::Write;
+    use crate::storage::txn::tests::{
+        must_cleanup_with_gc_fence, must_commit, must_prewrite_delete, must_prewrite_lock,
+        must_prewrite_put,
+    };
+    use crate::storage::Engine;
 
     #[derive(Default)]
     pub struct EntryBuilder {
@@ -868,21 +902,124 @@ pub mod test_util {
             }
         }
     }
+
+    #[allow(clippy::type_complexity)]
+    pub fn prepare_test_data_for_check_gc_fence(
+        engine: &impl Engine,
+    ) -> (TimeStamp, Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        // Generates test data that is consistent after timestamp 40.
+
+        // PUT,   Read,  PUT
+        //  `-------------^
+        must_prewrite_put(engine, b"k1", b"v1", b"k1", 10);
+        must_commit(engine, b"k1", 10, 20);
+        // Put a record to be pointed by GC fence 50.
+        must_prewrite_put(engine, b"k1", b"v1x", b"k1", 49);
+        must_commit(engine, b"k1", 49, 50);
+        must_cleanup_with_gc_fence(engine, b"k1", 20, 0, 50, false);
+
+        // PUT,      Read
+        //  `---------^
+        must_prewrite_put(engine, b"k2", b"v2", b"k2", 11);
+        must_commit(engine, b"k2", 11, 20);
+        must_cleanup_with_gc_fence(engine, b"k2", 20, 0, 40, true);
+
+        // PUT,      Read
+        //  `-----^
+        must_prewrite_put(engine, b"k3", b"v3", b"k3", 12);
+        must_commit(engine, b"k3", 12, 20);
+        must_cleanup_with_gc_fence(engine, b"k3", 20, 0, 30, true);
+
+        // PUT,   PUT,       Read
+        //  `-----^ `----^
+        must_prewrite_put(engine, b"k4", b"v4", b"k4", 13);
+        must_commit(engine, b"k4", 13, 14);
+        must_prewrite_put(engine, b"k4", b"v4x", b"k4", 15);
+        must_commit(engine, b"k4", 15, 20);
+        must_cleanup_with_gc_fence(engine, b"k4", 14, 0, 20, false);
+        must_cleanup_with_gc_fence(engine, b"k4", 20, 0, 30, true);
+
+        // PUT,   DEL,       Read
+        //  `-----^ `----^
+        must_prewrite_put(engine, b"k5", b"v5", b"k5", 13);
+        must_commit(engine, b"k5", 13, 14);
+        must_prewrite_delete(engine, b"k5", b"v5", 15);
+        must_commit(engine, b"k5", 15, 20);
+        must_cleanup_with_gc_fence(engine, b"k5", 14, 0, 20, false);
+        must_cleanup_with_gc_fence(engine, b"k5", 20, 0, 30, true);
+
+        // PUT, LOCK, LOCK,   Read,  PUT
+        //  `-------------------------^
+        must_prewrite_put(engine, b"k6", b"v6", b"k6", 16);
+        must_commit(engine, b"k6", 16, 20);
+        must_prewrite_lock(engine, b"k6", b"k6", 25);
+        must_commit(engine, b"k6", 25, 26);
+        must_prewrite_lock(engine, b"k6", b"k6", 28);
+        must_commit(engine, b"k6", 28, 29);
+        // Put a record to be pointed by GC fence 50.
+        must_prewrite_put(engine, b"k6", b"v6x", b"k6", 49);
+        must_commit(engine, b"k6", 49, 50);
+        must_cleanup_with_gc_fence(engine, b"k6", 20, 0, 50, false);
+
+        // PUT, LOCK,   LOCK,   Read
+        //  `---------^
+        must_prewrite_put(engine, b"k7", b"v7", b"k7", 16);
+        must_commit(engine, b"k7", 16, 20);
+        must_prewrite_lock(engine, b"k7", b"k7", 25);
+        must_commit(engine, b"k7", 25, 26);
+        must_cleanup_with_gc_fence(engine, b"k7", 20, 0, 27, true);
+        must_prewrite_lock(engine, b"k7", b"k7", 28);
+        must_commit(engine, b"k7", 28, 29);
+
+        // PUT,  Read
+        //  * (GC fence ts is 0)
+        must_prewrite_put(engine, b"k8", b"v8", b"k8", 17);
+        must_commit(engine, b"k8", 17, 30);
+        must_cleanup_with_gc_fence(engine, b"k8", 30, 0, 0, true);
+
+        // PUT, LOCK,     Read
+        // `-----------^
+        must_prewrite_put(engine, b"k9", b"v9", b"k9", 18);
+        must_commit(engine, b"k9", 18, 20);
+        must_prewrite_lock(engine, b"k9", b"k9", 25);
+        must_commit(engine, b"k9", 25, 26);
+        must_cleanup_with_gc_fence(engine, b"k9", 20, 0, 27, true);
+
+        // Returns the read ts to be checked and the expected result.
+        (
+            40.into(),
+            vec![
+                (b"k1".to_vec(), Some(b"v1".to_vec())),
+                (b"k2".to_vec(), None),
+                (b"k3".to_vec(), None),
+                (b"k4".to_vec(), None),
+                (b"k5".to_vec(), None),
+                (b"k6".to_vec(), Some(b"v6".to_vec())),
+                (b"k7".to_vec(), None),
+                (b"k8".to_vec(), Some(b"v8".to_vec())),
+                (b"k9".to_vec(), None),
+            ],
+        )
+    }
 }
 
 #[cfg(test)]
 mod latest_kv_tests {
     use super::super::ScannerBuilder;
+    use super::test_util::prepare_test_data_for_check_gc_fence;
     use super::*;
-    use crate::storage::kv::{Engine, TestEngineBuilder};
-    use crate::storage::Scanner;
-
+    use crate::storage::kv::{Engine, Modify, TestEngineBuilder};
+    use crate::storage::mvcc::tests::write;
     use crate::storage::txn::tests::*;
+    use crate::storage::Scanner;
+    use engine_traits::{CF_LOCK, CF_WRITE};
+    use kvproto::kvrpcpb::Context;
 
     /// Check whether everything works as usual when `ForwardKvScanner::get()` goes out of bound.
     #[test]
     fn test_get_out_of_bound() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"value", b"a", 7);
@@ -890,11 +1027,20 @@ mod latest_kv_tests {
 
         // Generate 5 rollback for [b].
         for ts in 0..5 {
-            must_rollback(&engine, b"b", ts);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, 10.into())
             .range(None, None)
             .build()
             .unwrap();
@@ -912,6 +1058,10 @@ mod latest_kv_tests {
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(
+            statistics.processed_size,
+            Key::from_raw(b"a").len() + b"value".len()
+        );
 
         // Use 5 next and reach out of bound:
         //   a_7 b_4 b_3 b_2 b_1 b_0
@@ -920,12 +1070,14 @@ mod latest_kv_tests {
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 5);
+        assert_eq!(statistics.processed_size, 0);
 
         // Cursor remains invalid, so nothing should happen.
         assert_eq!(scanner.next().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 0);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Check whether everything works as usual when
@@ -935,20 +1087,29 @@ mod latest_kv_tests {
     #[test]
     fn test_move_next_user_key_out_of_bound_1() {
         let engine = TestEngineBuilder::new().build().unwrap();
-
+        let ctx = Context::default();
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
         must_commit(&engine, b"a", SEEK_BOUND * 2, SEEK_BOUND * 2);
 
         // Generate SEEK_BOUND / 2 rollback and 1 put for [b] .
         for ts in 0..SEEK_BOUND / 2 {
-            must_rollback(&engine, b"b", ts as u64);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
         must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND / 2);
         must_commit(&engine, b"b", SEEK_BOUND / 2, SEEK_BOUND / 2);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
             .range(None, None)
             .build()
             .unwrap();
@@ -968,6 +1129,10 @@ mod latest_kv_tests {
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(
+            statistics.processed_size,
+            Key::from_raw(b"a").len() + b"a_value".len()
+        );
 
         // Before:
         //   a_8 b_2 b_1 b_0
@@ -983,12 +1148,17 @@ mod latest_kv_tests {
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, (SEEK_BOUND / 2 + 1) as usize);
+        assert_eq!(
+            statistics.processed_size,
+            Key::from_raw(b"b").len() + b"b_value".len()
+        );
 
         // Next we should get nothing.
         assert_eq!(scanner.next().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 0);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Check whether everything works as usual when
@@ -998,6 +1168,7 @@ mod latest_kv_tests {
     #[test]
     fn test_move_next_user_key_out_of_bound_2() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
@@ -1005,13 +1176,22 @@ mod latest_kv_tests {
 
         // Generate SEEK_BOUND-1 rollback and 1 put for [b] .
         for ts in 1..SEEK_BOUND {
-            must_rollback(&engine, b"b", ts as u64);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
         must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND);
         must_commit(&engine, b"b", SEEK_BOUND, SEEK_BOUND);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
             .range(None, None)
             .build()
             .unwrap();
@@ -1031,6 +1211,10 @@ mod latest_kv_tests {
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(
+            statistics.processed_size,
+            Key::from_raw(b"a").len() + b"a_value".len()
+        );
 
         // Before:
         //   a_8 b_4 b_3 b_2 b_1
@@ -1049,12 +1233,17 @@ mod latest_kv_tests {
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, (SEEK_BOUND - 1) as usize);
+        assert_eq!(
+            statistics.processed_size,
+            Key::from_raw(b"b").len() + b"b_value".len()
+        );
 
         // Next we should get nothing.
         assert_eq!(scanner.next().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 0);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Range is left open right closed.
@@ -1080,7 +1269,7 @@ mod latest_kv_tests {
         let snapshot = engine.snapshot(Default::default()).unwrap();
 
         // Test both bound specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(Some(Key::from_raw(&[3u8])), Some(Key::from_raw(&[5u8])))
             .build()
             .unwrap();
@@ -1093,9 +1282,16 @@ mod latest_kv_tests {
             Some((Key::from_raw(&[4u8]), vec![4u8]))
         );
         assert_eq!(scanner.next().unwrap(), None);
+        assert_eq!(
+            scanner.take_statistics().processed_size,
+            Key::from_raw(&[3u8]).len()
+                + vec![3u8].len()
+                + Key::from_raw(&[4u8]).len()
+                + vec![4u8].len()
+        );
 
         // Test left bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(None, Some(Key::from_raw(&[3u8])))
             .build()
             .unwrap();
@@ -1108,9 +1304,16 @@ mod latest_kv_tests {
             Some((Key::from_raw(&[2u8]), vec![2u8]))
         );
         assert_eq!(scanner.next().unwrap(), None);
+        assert_eq!(
+            scanner.take_statistics().processed_size,
+            Key::from_raw(&[1u8]).len()
+                + vec![1u8].len()
+                + Key::from_raw(&[2u8]).len()
+                + vec![2u8].len()
+        );
 
         // Test right bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(Some(Key::from_raw(&[5u8])), None)
             .build()
             .unwrap();
@@ -1123,9 +1326,16 @@ mod latest_kv_tests {
             Some((Key::from_raw(&[6u8]), vec![6u8]))
         );
         assert_eq!(scanner.next().unwrap(), None);
+        assert_eq!(
+            scanner.take_statistics().processed_size,
+            Key::from_raw(&[5u8]).len()
+                + vec![5u8].len()
+                + Key::from_raw(&[6u8]).len()
+                + vec![6u8].len()
+        );
 
         // Test both bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot, 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, 10.into())
             .range(None, None)
             .build()
             .unwrap();
@@ -1154,6 +1364,36 @@ mod latest_kv_tests {
             Some((Key::from_raw(&[6u8]), vec![6u8]))
         );
         assert_eq!(scanner.next().unwrap(), None);
+        assert_eq!(
+            scanner.take_statistics().processed_size,
+            (1u8..=6u8)
+                .map(|k| Key::from_raw(&[k]).len() + vec![k].len())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn test_latest_kv_check_gc_fence() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+
+        let (read_ts, expected_result) = prepare_test_data_for_check_gc_fence(&engine);
+        let expected_result: Vec<_> = expected_result
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|v| (key, v)))
+            .collect();
+
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut scanner = ScannerBuilder::new(snapshot, read_ts)
+            .range(None, None)
+            .build()
+            .unwrap();
+        let result: Vec<_> = scanner
+            .scan(100, 0)
+            .unwrap()
+            .into_iter()
+            .map(|result| result.unwrap())
+            .collect();
+        assert_eq!(result, expected_result);
     }
 }
 
@@ -1161,17 +1401,20 @@ mod latest_kv_tests {
 mod latest_entry_tests {
     use super::super::ScannerBuilder;
     use super::*;
-    use crate::storage::txn::tests::{
-        must_commit, must_prewrite_delete, must_prewrite_put, must_rollback,
-    };
-    use crate::storage::{Engine, TestEngineBuilder};
+    use crate::storage::txn::tests::{must_commit, must_prewrite_delete, must_prewrite_put};
+    use crate::storage::{Engine, Modify, TestEngineBuilder};
 
-    use super::test_util::EntryBuilder;
+    use super::test_util::*;
+    use crate::storage::mvcc::tests::write;
+    use crate::storage::txn::EntryBatch;
+    use engine_traits::{CF_LOCK, CF_WRITE};
+    use kvproto::kvrpcpb::Context;
 
     /// Check whether everything works as usual when `EntryScanner::get()` goes out of bound.
     #[test]
     fn test_get_out_of_bound() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"value", b"a", 7);
@@ -1179,11 +1422,20 @@ mod latest_entry_tests {
 
         // Generate 5 rollback for [b].
         for ts in 0..5 {
-            must_rollback(&engine, b"b", ts);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, 10.into())
             .range(None, None)
             .build_entry_scanner(0.into(), false)
             .unwrap();
@@ -1202,10 +1454,12 @@ mod latest_entry_tests {
             .start_ts(7.into())
             .commit_ts(7.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(statistics.processed_size, size);
 
         // Use 5 next and reach out of bound:
         //   a_7 b_4 b_3 b_2 b_1 b_0
@@ -1214,12 +1468,14 @@ mod latest_entry_tests {
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 5);
+        assert_eq!(statistics.processed_size, 0);
 
         // Cursor remains invalid, so nothing should happen.
         assert_eq!(scanner.next_entry().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 0);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Check whether everything works as usual when
@@ -1229,6 +1485,7 @@ mod latest_entry_tests {
     #[test]
     fn test_move_next_user_key_out_of_bound_1() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
@@ -1236,13 +1493,22 @@ mod latest_entry_tests {
 
         // Generate SEEK_BOUND / 2 rollback and 1 put for [b] .
         for ts in 0..SEEK_BOUND / 2 {
-            must_rollback(&engine, b"b", ts as u64);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
         must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND / 2);
         must_commit(&engine, b"b", SEEK_BOUND / 2, SEEK_BOUND / 2);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
             .range(None, None)
             .build_entry_scanner(0.into(), false)
             .unwrap();
@@ -1261,10 +1527,12 @@ mod latest_entry_tests {
             .start_ts(16.into())
             .commit_ts(16.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(statistics.processed_size, size);
 
         // Before:
         //   a_8 b_2 b_1 b_0
@@ -1279,16 +1547,19 @@ mod latest_entry_tests {
             .start_ts(4.into())
             .commit_ts(4.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, (SEEK_BOUND / 2 + 1) as usize);
+        assert_eq!(statistics.processed_size, size);
 
         // Next we should get nothing.
         assert_eq!(scanner.next_entry().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 0);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Check whether everything works as usual when
@@ -1298,6 +1569,7 @@ mod latest_entry_tests {
     #[test]
     fn test_move_next_user_key_out_of_bound_2() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
@@ -1305,13 +1577,22 @@ mod latest_entry_tests {
 
         // Generate SEEK_BOUND-1 rollback and 1 put for [b] .
         for ts in 1..SEEK_BOUND {
-            must_rollback(&engine, b"b", ts as u64);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
         must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND);
         must_commit(&engine, b"b", SEEK_BOUND, SEEK_BOUND);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
             .range(None, None)
             .build_entry_scanner(0.into(), false)
             .unwrap();
@@ -1330,10 +1611,12 @@ mod latest_entry_tests {
             .start_ts(16.into())
             .commit_ts(16.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry));
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(statistics.processed_size, size);
 
         // Before:
         //   a_8 b_4 b_3 b_2 b_1
@@ -1351,16 +1634,19 @@ mod latest_entry_tests {
             .start_ts(8.into())
             .commit_ts(8.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, (SEEK_BOUND - 1) as usize);
+        assert_eq!(statistics.processed_size, size);
 
         // Next we should get nothing.
         assert_eq!(scanner.next_entry().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 0);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Range is left open right closed.
@@ -1386,7 +1672,7 @@ mod latest_entry_tests {
         let snapshot = engine.snapshot(Default::default()).unwrap();
 
         // Test both bound specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(Some(Key::from_raw(&[3u8])), Some(Key::from_raw(&[5u8])))
             .build_entry_scanner(0.into(), false)
             .unwrap();
@@ -1405,7 +1691,7 @@ mod latest_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), None);
 
         // Test left bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(None, Some(Key::from_raw(&[3u8])))
             .build_entry_scanner(0.into(), false)
             .unwrap();
@@ -1414,7 +1700,7 @@ mod latest_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), None);
 
         // Test right bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(Some(Key::from_raw(&[5u8])), None)
             .build_entry_scanner(0.into(), false)
             .unwrap();
@@ -1423,7 +1709,7 @@ mod latest_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), None);
 
         // Test both bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot, 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, 10.into())
             .range(None, None)
             .build_entry_scanner(0.into(), false)
             .unwrap();
@@ -1439,6 +1725,7 @@ mod latest_entry_tests {
     #[test]
     fn test_output_delete_and_after_ts() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate put for [a] at 3.
         must_prewrite_put(&engine, b"a", b"a_3", b"a", 3);
@@ -1454,7 +1741,16 @@ mod latest_entry_tests {
 
         // Generate rollbacks for [b] at 2, 3, 4.
         for ts in 2..5 {
-            must_rollback(&engine, b"b", ts);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
 
         // Generate delete for [b] at 10.
@@ -1487,7 +1783,7 @@ mod latest_entry_tests {
 
         let check = |ts: u64, after_ts: u64, output_delete, expected: Vec<&TxnEntry>| {
             let snapshot = engine.snapshot(Default::default()).unwrap();
-            let mut scanner = ScannerBuilder::new(snapshot, ts.into(), false)
+            let mut scanner = ScannerBuilder::new(snapshot, ts.into())
                 .range(None, None)
                 .build_entry_scanner(after_ts.into(), output_delete)
                 .unwrap();
@@ -1510,6 +1806,31 @@ mod latest_entry_tests {
         // Scanning entries without delete in (0, 10] should get a_7
         check(10, 0, false, vec![&entry_a_7]);
     }
+
+    #[test]
+    fn test_latest_entry_check_gc_fence() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+
+        let (read_ts, expected_result) = prepare_test_data_for_check_gc_fence(&engine);
+        let expected_result: Vec<_> = expected_result
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|v| (key, v)))
+            .collect();
+
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut scanner = ScannerBuilder::new(snapshot, read_ts)
+            .range(None, None)
+            .build_entry_scanner(0.into(), false)
+            .unwrap();
+        let mut result = EntryBatch::with_capacity(20);
+        scanner.scan_entries(&mut result).unwrap();
+        let result: Vec<_> = result
+            .drain()
+            .map(|entry| entry.into_kvpair().unwrap())
+            .collect();
+
+        assert_eq!(result, expected_result);
+    }
 }
 
 #[cfg(test)]
@@ -1517,16 +1838,19 @@ mod delta_entry_tests {
     use super::super::ScannerBuilder;
     use super::*;
     use crate::storage::txn::tests::*;
-    use crate::storage::{Engine, TestEngineBuilder};
+    use crate::storage::{Engine, Modify, TestEngineBuilder};
 
     use txn_types::{is_short_value, SHORT_VALUE_MAX_LEN};
 
-    use super::test_util::EntryBuilder;
-
+    use super::test_util::*;
+    use crate::storage::mvcc::tests::write;
+    use engine_traits::{CF_LOCK, CF_WRITE};
+    use kvproto::kvrpcpb::Context;
     /// Check whether everything works as usual when `Delta::get()` goes out of bound.
     #[test]
     fn test_get_out_of_bound() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"value", b"a", 7);
@@ -1534,11 +1858,20 @@ mod delta_entry_tests {
 
         // Generate 5 rollback for [b].
         for ts in 0..5 {
-            must_rollback(&engine, b"b", ts);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, 10.into())
             .range(None, None)
             .build_delta_scanner(0.into(), ExtraOp::Noop)
             .unwrap();
@@ -1557,10 +1890,12 @@ mod delta_entry_tests {
             .start_ts(7.into())
             .commit_ts(7.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(statistics.processed_size, size);
 
         // Use 5 next and reach out of bound:
         //   a_7 b_4 b_3 b_2 b_1 b_0
@@ -1569,12 +1904,14 @@ mod delta_entry_tests {
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 5);
+        assert_eq!(statistics.processed_size, 0);
 
         // Cursor remains invalid, so nothing should happen.
         assert_eq!(scanner.next_entry().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 0);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Check whether everything works as usual when
@@ -1584,20 +1921,29 @@ mod delta_entry_tests {
     #[test]
     fn test_move_next_user_key_out_of_bound_1() {
         let engine = TestEngineBuilder::new().build().unwrap();
-
+        let ctx = Context::default();
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
         must_commit(&engine, b"a", SEEK_BOUND * 2, SEEK_BOUND * 2);
 
         // Generate SEEK_BOUND / 2 rollback and 1 put for [b] .
         for ts in 0..SEEK_BOUND / 2 {
-            must_rollback(&engine, b"b", ts as u64);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
         must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND / 2);
         must_commit(&engine, b"b", SEEK_BOUND / 2, SEEK_BOUND / 2);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
             .range(None, None)
             .build_delta_scanner(0.into(), ExtraOp::Noop)
             .unwrap();
@@ -1616,10 +1962,12 @@ mod delta_entry_tests {
             .start_ts(16.into())
             .commit_ts(16.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(statistics.processed_size, size);
 
         // Before:
         //   a_8 b_2 b_1 b_0
@@ -1634,16 +1982,19 @@ mod delta_entry_tests {
             .start_ts(4.into())
             .commit_ts(4.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(statistics.processed_size, size);
 
         // Next we should get nothing.
         assert_eq!(scanner.next_entry().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 4);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Check whether everything works as usual when
@@ -1653,6 +2004,7 @@ mod delta_entry_tests {
     #[test]
     fn test_move_next_user_key_out_of_bound_2() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate 1 put for [a].
         must_prewrite_put(&engine, b"a", b"a_value", b"a", SEEK_BOUND * 2);
@@ -1662,13 +2014,22 @@ mod delta_entry_tests {
         // It differs from EntryScanner that this will try to fetch multiple versions of each key.
         // So in this test it needs one more next than EntryScanner.
         for ts in 1..=SEEK_BOUND {
-            must_rollback(&engine, b"b", ts as u64);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
         must_prewrite_put(&engine, b"b", b"b_value", b"a", SEEK_BOUND + 1);
         must_commit(&engine, b"b", SEEK_BOUND + 1, SEEK_BOUND + 1);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, (SEEK_BOUND * 2).into())
             .range(None, None)
             .build_delta_scanner(8.into(), ExtraOp::Noop)
             .unwrap();
@@ -1687,10 +2048,12 @@ mod delta_entry_tests {
             .start_ts(16.into())
             .commit_ts(16.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry));
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(statistics.processed_size, size);
 
         // Before:
         //   a_8 b_4 b_3 b_2 b_1
@@ -1708,16 +2071,19 @@ mod delta_entry_tests {
             .start_ts(9.into())
             .commit_ts(9.into())
             .build_commit(WriteType::Put, true);
+        let size = entry.size();
         assert_eq!(scanner.next_entry().unwrap(), Some(entry),);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 0);
         assert_eq!(statistics.write.next, 1);
+        assert_eq!(statistics.processed_size, size);
 
         // Next we should get nothing.
         assert_eq!(scanner.next_entry().unwrap(), None);
         let statistics = scanner.take_statistics();
         assert_eq!(statistics.write.seek, 1);
         assert_eq!(statistics.write.next, (SEEK_BOUND - 1) as usize);
+        assert_eq!(statistics.processed_size, 0);
     }
 
     /// Range is left open right closed.
@@ -1743,7 +2109,7 @@ mod delta_entry_tests {
         let snapshot = engine.snapshot(Default::default()).unwrap();
 
         // Test both bound specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(Some(Key::from_raw(&[3u8])), Some(Key::from_raw(&[5u8])))
             .build_delta_scanner(4.into(), ExtraOp::Noop)
             .unwrap();
@@ -1762,7 +2128,7 @@ mod delta_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), None);
 
         // Test left bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(None, Some(Key::from_raw(&[3u8])))
             .build_delta_scanner(4.into(), ExtraOp::Noop)
             .unwrap();
@@ -1771,7 +2137,7 @@ mod delta_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), None);
 
         // Test right bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot.clone(), 10.into())
             .range(Some(Key::from_raw(&[5u8])), None)
             .build_delta_scanner(4.into(), ExtraOp::Noop)
             .unwrap();
@@ -1780,7 +2146,7 @@ mod delta_entry_tests {
         assert_eq!(scanner.next_entry().unwrap(), None);
 
         // Test both bound not specified.
-        let mut scanner = ScannerBuilder::new(snapshot, 10.into(), false)
+        let mut scanner = ScannerBuilder::new(snapshot, 10.into())
             .range(None, None)
             .build_delta_scanner(4.into(), ExtraOp::Noop)
             .unwrap();
@@ -1865,7 +2231,7 @@ mod delta_entry_tests {
         let expected_entries = |from_key: &[u8], to_key: &[u8], from_ts: u64, to_ts: u64| {
             test_data
                 .iter()
-                .filter(|(key, _, _)| *key >= from_key && (to_key.is_empty() || *key < to_key))
+                .filter(|(key, ..)| *key >= from_key && (to_key.is_empty() || *key < to_key))
                 .map(|(key, lock, writes)| {
                     let mut entries_of_key = vec![];
 
@@ -1873,7 +2239,7 @@ mod delta_entry_tests {
                         let max_commit_ts = writes
                             .last()
                             .cloned()
-                            .map(|(_, commit_ts, _, _)| commit_ts)
+                            .map(|(_, commit_ts, ..)| commit_ts)
                             .unwrap_or(0);
                         let for_update_ts = std::cmp::max(*ts, max_commit_ts + 1);
 
@@ -1950,7 +2316,7 @@ mod delta_entry_tests {
                         commit_ts - 1,
                         true,
                     ),
-                    WriteType::Rollback => must_rollback(&engine, key, start_ts),
+                    WriteType::Rollback => must_rollback(&engine, key, start_ts, false),
                 }
                 if *write_type != WriteType::Rollback {
                     must_commit(&engine, key, start_ts, commit_ts);
@@ -1962,7 +2328,7 @@ mod delta_entry_tests {
                 let max_commit_ts = writes
                     .last()
                     .cloned()
-                    .map(|(_, commit_ts, _, _)| commit_ts)
+                    .map(|(_, commit_ts, ..)| commit_ts)
                     .unwrap_or(0);
                 let for_update_ts = std::cmp::max(*ts, max_commit_ts + 1);
                 must_acquire_pessimistic_lock(&engine, key, key, *ts, for_update_ts);
@@ -2000,16 +2366,13 @@ mod delta_entry_tests {
             } else {
                 Some(Key::from_raw(to_key))
             };
-            let mut scanner = ScannerBuilder::new(
-                engine.snapshot(Default::default()).unwrap(),
-                to_ts.into(),
-                false,
-            )
-            .hint_min_ts(Some(from_ts.into()))
-            .hint_max_ts(Some(to_ts.into()))
-            .range(from_key, to_key)
-            .build_delta_scanner(from_ts.into(), ExtraOp::Noop)
-            .unwrap();
+            let mut scanner =
+                ScannerBuilder::new(engine.snapshot(Default::default()).unwrap(), to_ts.into())
+                    .hint_min_ts(Some(from_ts.into()))
+                    .hint_max_ts(Some(to_ts.into()))
+                    .range(from_key, to_key)
+                    .build_delta_scanner(from_ts.into(), ExtraOp::Noop)
+                    .unwrap();
 
             let mut actual = vec![];
             while let Some(entry) = scanner.next_entry().unwrap() {
@@ -2042,6 +2405,7 @@ mod delta_entry_tests {
     #[test]
     fn test_output_old_value() {
         let engine = TestEngineBuilder::new().build().unwrap();
+        let ctx = Context::default();
 
         // Generate put for [a] at 1.
         must_prewrite_put(&engine, b"a", b"a_1", b"a", 1);
@@ -2060,7 +2424,16 @@ mod delta_entry_tests {
 
         // Generate rollbacks for [b] at 6, 7, 8.
         for ts in 6..9 {
-            must_rollback(&engine, b"b", ts);
+            let modifies = vec![
+                // ts is rather small, so it is ok to `as u8`
+                Modify::Put(
+                    CF_WRITE,
+                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    vec![b'R', ts as u8],
+                ),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+            ];
+            write(&engine, &ctx, modifies);
         }
 
         // Generate delete for [b] at 10.
@@ -2070,6 +2443,12 @@ mod delta_entry_tests {
         // Generate put for [b] at 15.
         must_acquire_pessimistic_lock(&engine, b"b", b"b", 9, 15);
         must_pessimistic_prewrite_put(&engine, b"b", b"b_15", b"b", 9, 15, true);
+
+        must_prewrite_put(&engine, b"c", b"c_4", b"c", 4);
+        must_commit(&engine, b"c", 4, 6);
+        must_acquire_pessimistic_lock(&engine, b"c", b"c", 5, 15);
+        must_pessimistic_prewrite_put(&engine, b"c", b"c_5", b"c", 5, 15, true);
+        must_cleanup(&engine, b"c", 20, 0);
 
         let entry_a_1 = EntryBuilder::default()
             .key(b"a")
@@ -2109,10 +2488,24 @@ mod delta_entry_tests {
             .start_ts(9.into())
             .for_update_ts(15.into())
             .build_prewrite(LockType::Put, true);
+        let entry_c_4 = EntryBuilder::default()
+            .key(b"c")
+            .value(b"c_4")
+            .start_ts(4.into())
+            .commit_ts(6.into())
+            .build_commit(WriteType::Put, true);
+        let entry_c_5 = EntryBuilder::default()
+            .key(b"c")
+            .value(b"c_5")
+            .primary(b"c")
+            .start_ts(5.into())
+            .for_update_ts(15.into())
+            .old_value(b"c_4")
+            .build_prewrite(LockType::Put, true);
 
         let check = |after_ts: u64, expected: Vec<&TxnEntry>| {
             let snapshot = engine.snapshot(Default::default()).unwrap();
-            let mut scanner = ScannerBuilder::new(snapshot, TimeStamp::max(), false)
+            let mut scanner = ScannerBuilder::new(snapshot, TimeStamp::max())
                 .range(None, None)
                 .build_delta_scanner(after_ts.into(), ExtraOp::ReadOldValue)
                 .unwrap();
@@ -2124,9 +2517,9 @@ mod delta_entry_tests {
         };
 
         // Scanning entries in (10, max] should get all prewrites
-        check(10, vec![&entry_a_5, &entry_b_15]);
-        // Scanning entries include delete in (7, max] should get a_5, b_10 and b_15
-        check(7, vec![&entry_a_5, &entry_b_15, &entry_b_10]);
+        check(10, vec![&entry_a_5, &entry_b_15, &entry_c_5]);
+        // Scanning entries include delete in (7, max] should get a_5, b_10, b_15 and c_5
+        check(7, vec![&entry_a_5, &entry_b_15, &entry_b_10, &entry_c_5]);
         // Scanning entries in (0, max] should get a_1, a_3, a_5, b_2, b_10, and b_15
         check(
             0,
@@ -2137,7 +2530,118 @@ mod delta_entry_tests {
                 &entry_b_15,
                 &entry_b_10,
                 &entry_b_2,
+                &entry_c_5,
+                &entry_c_4,
             ],
         );
+    }
+
+    #[test]
+    fn test_old_value_check_gc_fence() {
+        let engine = TestEngineBuilder::new().build().unwrap();
+        prepare_test_data_for_check_gc_fence(&engine);
+
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut scanner = ScannerBuilder::new(snapshot, TimeStamp::max())
+            .range(None, None)
+            .build_delta_scanner(40.into(), ExtraOp::ReadOldValue)
+            .unwrap();
+        let entries: Vec<_> = std::iter::from_fn(|| scanner.next_entry().unwrap()).collect();
+        let expected_entries_1 = vec![
+            EntryBuilder::default()
+                .key(b"k1")
+                .value(b"v1x")
+                .primary(b"k1")
+                .start_ts(49.into())
+                .commit_ts(50.into())
+                .old_value(b"v1")
+                .build_commit(WriteType::Put, true),
+            EntryBuilder::default()
+                .key(b"k6")
+                .value(b"v6x")
+                .primary(b"k6")
+                .start_ts(49.into())
+                .commit_ts(50.into())
+                .old_value(b"v6")
+                .build_commit(WriteType::Put, true),
+        ];
+        assert_eq!(entries, expected_entries_1);
+
+        // Lock all the keys at 55 and check again.
+        for i in b'1'..=b'8' {
+            let key = &[b'k', i];
+            let value = &[b'v', i, b'x', b'x'];
+            must_prewrite_put(&engine, key, value, b"k1", 55);
+        }
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut scanner = ScannerBuilder::new(snapshot, TimeStamp::max())
+            .range(None, None)
+            .build_delta_scanner(40.into(), ExtraOp::ReadOldValue)
+            .unwrap();
+        let entries: Vec<_> = std::iter::from_fn(|| scanner.next_entry().unwrap()).collect();
+
+        // Shortcut for generating the expected result at current time.
+        let build_entry = |k, v, old_value| {
+            let mut b = EntryBuilder::default();
+            b.key(k).value(v).primary(b"k1").start_ts(55.into());
+            if let Some(ov) = old_value {
+                b.old_value(ov);
+            }
+            b.build_prewrite(LockType::Put, true)
+        };
+
+        let expected_entries_2 = vec![
+            build_entry(b"k1", b"v1xx", Some(b"v1x")),
+            expected_entries_1[0].clone(),
+            build_entry(b"k2", b"v2xx", None),
+            build_entry(b"k3", b"v3xx", None),
+            build_entry(b"k4", b"v4xx", None),
+            build_entry(b"k5", b"v5xx", None),
+            build_entry(b"k6", b"v6xx", Some(b"v6x")),
+            expected_entries_1[1].clone(),
+            build_entry(b"k7", b"v7xx", None),
+            build_entry(b"k8", b"v8xx", Some(b"v8")),
+        ];
+        assert_eq!(entries, expected_entries_2);
+
+        // Commit all the locks and check again.
+        for i in b'1'..=b'8' {
+            let key = &[b'k', i];
+            must_commit(&engine, key, 55, 56);
+        }
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut scanner = ScannerBuilder::new(snapshot, TimeStamp::max())
+            .range(None, None)
+            .build_delta_scanner(40.into(), ExtraOp::ReadOldValue)
+            .unwrap();
+        let entries: Vec<_> = std::iter::from_fn(|| scanner.next_entry().unwrap()).collect();
+
+        // Shortcut for generating the expected result at current time.
+        let build_entry = |k, v, old_value| {
+            let mut b = EntryBuilder::default();
+            b.key(k)
+                .value(v)
+                .primary(b"k1")
+                .start_ts(55.into())
+                .commit_ts(56.into());
+            if let Some(ov) = old_value {
+                b.old_value(ov);
+            }
+            b.build_commit(WriteType::Put, true)
+        };
+
+        let expected_entries_2 = vec![
+            build_entry(b"k1", b"v1xx", Some(b"v1x")),
+            expected_entries_1[0].clone(),
+            build_entry(b"k2", b"v2xx", None),
+            build_entry(b"k3", b"v3xx", None),
+            build_entry(b"k4", b"v4xx", None),
+            build_entry(b"k5", b"v5xx", None),
+            build_entry(b"k6", b"v6xx", Some(b"v6x")),
+            expected_entries_1[1].clone(),
+            build_entry(b"k7", b"v7xx", None),
+            build_entry(b"k8", b"v8xx", Some(b"v8")),
+        ];
+        assert_eq!(entries, expected_entries_2);
     }
 }

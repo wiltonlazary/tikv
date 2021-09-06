@@ -12,11 +12,13 @@ extern crate encryption;
 extern crate tikv_util;
 extern crate pd_client;
 
+mod backup;
 mod config;
 mod coprocessor;
 mod import;
 mod pd;
 mod raftstore;
+mod resource_metering;
 mod server;
 mod server_encryption;
 mod storage;

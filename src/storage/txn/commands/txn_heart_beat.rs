@@ -2,9 +2,12 @@
 
 use crate::storage::kv::WriteData;
 use crate::storage::lock_manager::LockManager;
-use crate::storage::mvcc::{Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn};
+use crate::storage::mvcc::{
+    Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader,
+};
 use crate::storage::txn::commands::{
-    Command, CommandExt, ResponsePolicy, TypedCommand, WriteCommand, WriteContext, WriteResult,
+    Command, CommandExt, ReaderWithStats, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
+    WriteResult,
 };
 use crate::storage::txn::Result;
 use crate::storage::{ProcessResult, Snapshot, TxnStatus};
@@ -39,13 +42,12 @@ impl CommandExt for TxnHeartBeat {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
-    fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(self, snapshot: S, mut context: WriteContext<'_, L>) -> Result<WriteResult> {
         // TxnHeartBeat never remove locks. No need to wake up waiters.
-        let mut txn = MvccTxn::new(
-            snapshot,
-            self.start_ts,
-            !self.ctx.get_not_fill_cache(),
-            context.concurrency_manager,
+        let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
+        let mut reader = ReaderWithStats::new(
+            SnapshotReader::new(self.start_ts, snapshot, !self.ctx.get_not_fill_cache()),
+            &mut context.statistics,
         );
         fail_point!("txn_heart_beat", |err| Err(
             crate::storage::mvcc::Error::from(crate::storage::mvcc::txn::make_txn_error(
@@ -56,7 +58,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
             .into()
         ));
 
-        let lock = match txn.reader.load_lock(&self.primary_key)? {
+        let lock = match reader.load_lock(&self.primary_key)? {
             Some(mut lock) if lock.ts == self.start_ts => {
                 if lock.ttl < self.advise_ttl {
                     lock.ttl = self.advise_ttl;
@@ -65,7 +67,6 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
                 lock
             }
             _ => {
-                context.statistics.add(&txn.take_statistics());
                 return Err(MvccError::from(MvccErrorInner::TxnNotFound {
                     start_ts: self.start_ts,
                     key: self.primary_key.into_raw()?,
@@ -74,11 +75,11 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for TxnHeartBeat {
             }
         };
 
-        context.statistics.add(&txn.take_statistics());
         let pr = ProcessResult::TxnStatus {
             txn_status: TxnStatus::uncommitted(lock, false),
         };
-        let write_data = WriteData::from_modifies(txn.into_modifies());
+        let mut write_data = WriteData::from_modifies(txn.into_modifies());
+        write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
             ctx: self.ctx,
             to_be_write: write_data,
@@ -159,18 +160,20 @@ pub mod tests {
             start_ts,
             advise_ttl,
         };
-        assert!(command
-            .process_write(
-                snapshot,
-                WriteContext {
-                    lock_mgr: &DummyLockManager,
-                    concurrency_manager: cm,
-                    extra_op: Default::default(),
-                    statistics: &mut Default::default(),
-                    async_apply_prewrite: false,
-                },
-            )
-            .is_err());
+        assert!(
+            command
+                .process_write(
+                    snapshot,
+                    WriteContext {
+                        lock_mgr: &DummyLockManager,
+                        concurrency_manager: cm,
+                        extra_op: Default::default(),
+                        statistics: &mut Default::default(),
+                        async_apply_prewrite: false,
+                    },
+                )
+                .is_err()
+        );
     }
 
     #[test]

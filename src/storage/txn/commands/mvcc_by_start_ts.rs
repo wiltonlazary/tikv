@@ -23,7 +23,7 @@ impl CommandExt for MvccByStartTs {
     ctx!();
     tag!(start_ts_mvcc);
     ts!(start_ts);
-    command_method!(readonly, bool, true);
+    property!(readonly);
 
     fn write_bytes(&self) -> usize {
         0
@@ -38,12 +38,11 @@ impl<S: Snapshot> ReadCommand<S> for MvccByStartTs {
             snapshot,
             Some(ScanMode::Forward),
             !self.ctx.get_not_fill_cache(),
-            self.ctx.get_isolation_level(),
         );
         match reader.seek_ts(self.start_ts)? {
             Some(key) => {
                 let result = find_mvcc_infos_by_key(&mut reader, &key, TimeStamp::max());
-                statistics.add(reader.get_statistics());
+                statistics.add(&reader.statistics);
                 let (lock, writes, values) = result?;
                 Ok(ProcessResult::MvccStartTs {
                     mvcc: Some((

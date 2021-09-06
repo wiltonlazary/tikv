@@ -7,10 +7,15 @@ use time::Duration as TimeDuration;
 
 use crate::{coprocessor, Result};
 use batch_system::Config as BatchSystemConfig;
-use configuration::{ConfigChange, ConfigManager, ConfigValue, Configuration};
-use engine_rocks::config as rocks_config;
-use engine_rocks::PerfLevel;
+use engine_traits::config as engine_config;
+use engine_traits::PerfLevel;
+use lazy_static::lazy_static;
+use online_config::{ConfigChange, ConfigManager, ConfigValue, OnlineConfig};
+use prometheus::register_gauge_vec;
+use serde::{Deserialize, Serialize};
+use serde_with::with_prefix;
 use tikv_util::config::{ReadableDuration, ReadableSize, VersionTrack};
+use tikv_util::{box_err, info, warn};
 
 lazy_static! {
     pub static ref CONFIG_RAFTSTORE_GAUGE: prometheus::GaugeVec = register_gauge_vec!(
@@ -23,34 +28,34 @@ lazy_static! {
 
 with_prefix!(prefix_apply "apply-");
 with_prefix!(prefix_store "store-");
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Configuration)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
     // minimizes disruption when a partitioned node rejoins the cluster by using a two phase election.
-    #[config(skip)]
+    #[online_config(skip)]
     pub prevote: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub raftdb_path: String,
 
     // store capacity. 0 means no limit.
-    #[config(skip)]
+    #[online_config(skip)]
     pub capacity: ReadableSize,
 
     // raft_base_tick_interval is a base tick interval (ms).
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub raft_base_tick_interval: ReadableDuration,
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub raft_heartbeat_ticks: usize,
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub raft_election_timeout_ticks: usize,
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub raft_min_election_timeout_ticks: usize,
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub raft_max_election_timeout_ticks: usize,
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub raft_max_size_per_msg: ReadableSize,
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub raft_max_inflight_msgs: usize,
     // When the entry exceed the max size, reject to propose it.
     pub raft_entry_max_size: ReadableSize,
@@ -67,7 +72,7 @@ pub struct Config {
     // Old Raft logs could be reserved if `raft_log_gc_threshold` is not reached.
     // GC them after ticks `raft_log_reserve_max_ticks` times.
     #[doc(hidden)]
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub raft_log_reserve_max_ticks: usize,
     // Old logs in Raft engine needs to be purged peridically.
     pub raft_engine_purge_interval: ReadableDuration,
@@ -97,7 +102,7 @@ pub struct Config {
     pub lock_cf_compact_interval: ReadableDuration,
     pub lock_cf_compact_bytes_threshold: ReadableSize,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub notify_capacity: usize,
     pub messages_per_tick: usize,
 
@@ -114,34 +119,34 @@ pub struct Config {
     pub abnormal_leader_missing_duration: ReadableDuration,
     pub peer_stale_state_check_interval: ReadableDuration,
 
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub leader_transfer_max_log_lag: u64,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub snap_apply_batch_size: ReadableSize,
 
     // Interval (ms) to check region whether the data is consistent.
     pub consistency_check_interval: ReadableDuration,
 
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub report_region_flow_interval: ReadableDuration,
 
     // The lease provided by a successfully proposed and applied entry.
     pub raft_store_max_leader_lease: ReadableDuration,
 
     // Right region derive origin region id when split.
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub right_derive_when_split: bool,
 
     pub allow_remove_leader: bool,
 
     /// Max log gap allowed to propose merge.
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub merge_max_log_gap: u64,
     /// Interval to re-propose merge.
     pub merge_check_tick_interval: ReadableDuration,
 
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub use_delete_range: bool,
 
     pub cleanup_import_sst_interval: ReadableDuration,
@@ -149,43 +154,75 @@ pub struct Config {
     /// Maximum size of every local read task batch.
     pub local_read_batch_size: u64,
 
-    #[config(skip)]
+    #[online_config(skip)]
     #[serde(flatten, with = "prefix_apply")]
     pub apply_batch_system: BatchSystemConfig,
 
-    #[config(skip)]
+    #[online_config(skip)]
     #[serde(flatten, with = "prefix_store")]
     pub store_batch_system: BatchSystemConfig,
 
-    #[config(skip)]
+    #[online_config(skip)]
+    pub store_io_pool_size: usize,
+
+    #[online_config(skip)]
+    pub store_io_notify_capacity: usize,
+
+    #[online_config(skip)]
     pub future_poll_size: usize,
-    #[config(hidden)]
+    #[online_config(skip)]
     pub hibernate_regions: bool,
-    pub hibernate_timeout: ReadableDuration,
     #[doc(hidden)]
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub dev_assert: bool,
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub apply_yield_duration: ReadableDuration,
+
+    #[serde(with = "engine_config::perf_level_serde")]
+    #[online_config(skip)]
+    pub perf_level: PerfLevel,
+
+    #[doc(hidden)]
+    #[online_config(skip)]
+    /// When TiKV memory usage reaches `memory_usage_high_water` it will try to limit memory
+    /// increasing. For raftstore layer entries will be evicted from entry cache, if they
+    /// utilize memory more than `evict_cache_on_memory_ratio` * total.
+    ///
+    /// Set it to 0 can disable cache evict.
+    // By default it's 0.2. So for different system memory capacity, cache evict happens:
+    // * system=8G,  memory_usage_limit=6G,  evict=1.2G
+    // * system=16G, memory_usage_limit=12G, evict=2.4G
+    // * system=32G, memory_usage_limit=24G, evict=4.8G
+    pub evict_cache_on_memory_ratio: f64,
+
+    pub cmd_batch: bool,
+
+    // When the size of raft db writebatch exceeds this value, write will be triggered.
+    pub raft_write_size_limit: ReadableSize,
+
+    pub waterfall_metrics: bool,
+
+    pub io_reschedule_concurrent_max_count: usize,
+    pub io_reschedule_hotpot_duration: ReadableDuration,
 
     // Deprecated! These configuration has been moved to Coprocessor.
     // They are preserved for compatibility check.
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[config(skip)]
+    #[online_config(skip)]
     pub region_max_size: ReadableSize,
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[config(skip)]
+    #[online_config(skip)]
     pub region_split_size: ReadableSize,
     // Deprecated! The time to clean stale peer safely can be decided based on RocksDB snapshot sequence number.
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[config(skip)]
+    #[online_config(skip)]
     pub clean_stale_peer_delay: ReadableDuration,
-    #[serde(with = "rocks_config::perf_level_serde")]
-    #[config(skip)]
-    pub perf_level: PerfLevel,
+
+    // Interval to inspect the latency of raftstore for slow store detection.
+    pub inspect_interval: ReadableDuration,
 }
 
 impl Default for Config {
@@ -224,11 +261,11 @@ impl Default for Config {
             snap_mgr_gc_tick_interval: ReadableDuration::minutes(1),
             snap_gc_timeout: ReadableDuration::hours(4),
             messages_per_tick: 4096,
-            max_peer_down_duration: ReadableDuration::minutes(5),
+            max_peer_down_duration: ReadableDuration::minutes(10),
             max_leader_missing_duration: ReadableDuration::hours(2),
             abnormal_leader_missing_duration: ReadableDuration::minutes(10),
             peer_stale_state_check_interval: ReadableDuration::minutes(5),
-            leader_transfer_max_log_lag: 10,
+            leader_transfer_max_log_lag: 128,
             snap_apply_batch_size: ReadableSize::mb(10),
             lock_cf_compact_interval: ReadableDuration::minutes(10),
             lock_cf_compact_bytes_threshold: ReadableSize::mb(256),
@@ -240,23 +277,31 @@ impl Default for Config {
             right_derive_when_split: true,
             allow_remove_leader: false,
             merge_max_log_gap: 10,
-            merge_check_tick_interval: ReadableDuration::secs(10),
+            merge_check_tick_interval: ReadableDuration::secs(2),
             use_delete_range: false,
             cleanup_import_sst_interval: ReadableDuration::minutes(10),
             local_read_batch_size: 1024,
             apply_batch_system: BatchSystemConfig::default(),
             store_batch_system: BatchSystemConfig::default(),
+            store_io_pool_size: 2,
+            store_io_notify_capacity: 40960,
             future_poll_size: 1,
             hibernate_regions: true,
-            hibernate_timeout: ReadableDuration::minutes(10),
             dev_assert: false,
             apply_yield_duration: ReadableDuration::millis(500),
+            perf_level: PerfLevel::EnableTime,
+            evict_cache_on_memory_ratio: 0.2,
+            cmd_batch: true,
+            raft_write_size_limit: ReadableSize::mb(1),
+            waterfall_metrics: false,
+            io_reschedule_concurrent_max_count: 4,
+            io_reschedule_hotpot_duration: ReadableDuration::secs(5),
 
             // They are preserved for compatibility check.
             region_max_size: ReadableSize(0),
             region_split_size: ReadableSize(0),
             clean_stale_peer_delay: ReadableDuration::minutes(0),
-            perf_level: PerfLevel::Disable,
+            inspect_interval: ReadableDuration::millis(500),
         }
     }
 }
@@ -333,6 +378,16 @@ impl Config {
             ));
         }
 
+        let tick = self.raft_base_tick_interval.as_millis() as u64;
+        if lease > election_timeout - tick {
+            return Err(box_err!(
+                "lease {} ms should not be greater than election timeout {} ms - 1 tick({} ms)",
+                lease,
+                election_timeout,
+                tick
+            ));
+        }
+
         if self.merge_max_log_gap >= self.raft_log_gc_count_limit {
             return Err(box_err!(
                 "merge log gap {} should be less than log gc limit {}.",
@@ -394,18 +449,47 @@ impl Config {
         if self.apply_batch_system.pool_size == 0 {
             return Err(box_err!("apply-pool-size should be greater than 0"));
         }
-        if self.apply_batch_system.max_batch_size == 0 {
-            return Err(box_err!("apply-max-batch-size should be greater than 0"));
+        if let Some(size) = self.apply_batch_system.max_batch_size {
+            if size == 0 {
+                return Err(box_err!("apply-max-batch-size should be greater than 0"));
+            }
+        } else {
+            self.apply_batch_system.max_batch_size = Some(256);
         }
         if self.store_batch_system.pool_size == 0 {
             return Err(box_err!("store-pool-size should be greater than 0"));
         }
-        if self.store_batch_system.max_batch_size == 0 {
-            return Err(box_err!("store-max-batch-size should be greater than 0"));
+        if self.store_batch_system.low_priority_pool_size > 0 {
+            // The store thread pool doesn't need a low-priority thread currently.
+            self.store_batch_system.low_priority_pool_size = 0;
+        }
+        if let Some(size) = self.store_batch_system.max_batch_size {
+            if size == 0 {
+                return Err(box_err!("store-max-batch-size should be greater than 0"));
+            }
+        } else if self.hibernate_regions {
+            self.store_batch_system.max_batch_size = Some(256);
+        } else {
+            self.store_batch_system.max_batch_size = Some(1024);
         }
         if self.future_poll_size == 0 {
             return Err(box_err!("future-poll-size should be greater than 0."));
         }
+
+        // Avoid hibernated peer being reported as down peer.
+        if self.hibernate_regions {
+            self.max_peer_down_duration = std::cmp::max(
+                self.max_peer_down_duration,
+                self.peer_stale_state_check_interval * 2,
+            );
+        }
+
+        if self.evict_cache_on_memory_ratio < 0.0 {
+            return Err(box_err!(
+                "evict_cache_on_memory_ratio must be greater than 0"
+            ));
+        }
+
         Ok(())
     }
 
@@ -565,16 +649,22 @@ impl Config {
             .set(self.local_read_batch_size as f64);
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["apply_max_batch_size"])
-            .set(self.apply_batch_system.max_batch_size as f64);
+            .set(self.apply_batch_system.max_batch_size() as f64);
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["apply_pool_size"])
             .set(self.apply_batch_system.pool_size as f64);
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["store_max_batch_size"])
-            .set(self.store_batch_system.max_batch_size as f64);
+            .set(self.store_batch_system.max_batch_size() as f64);
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["store_pool_size"])
             .set(self.store_batch_system.pool_size as f64);
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["store_io_pool_size"])
+            .set((self.store_io_pool_size as i32).into());
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["store_io_notify_capacity"])
+            .set((self.store_io_notify_capacity as i32).into());
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["future_poll_size"])
             .set(self.future_poll_size as f64);
@@ -582,8 +672,20 @@ impl Config {
             .with_label_values(&["hibernate_regions"])
             .set((self.hibernate_regions as i32).into());
         CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["hibernate_timeout"])
-            .set(self.hibernate_timeout.0.as_secs_f64());
+            .with_label_values(&["cmd_batch"])
+            .set((self.cmd_batch as i32).into());
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["raft_write_size_limit"])
+            .set(self.raft_write_size_limit.0 as f64);
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["waterfall_metrics"])
+            .set((self.waterfall_metrics as i32).into());
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["io_reschedule_concurrent_max_count"])
+            .set((self.io_reschedule_concurrent_max_count as i32).into());
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["io_reschedule_hotpot_duration"])
+            .set(self.io_reschedule_hotpot_duration.as_secs() as f64);
     }
 
     fn write_change_into_metrics(change: ConfigChange) {
@@ -713,7 +815,7 @@ mod tests {
         assert!(cfg.validate().is_err());
 
         cfg = Config::new();
-        cfg.apply_batch_system.max_batch_size = 0;
+        cfg.apply_batch_system.max_batch_size = Some(0);
         assert!(cfg.validate().is_err());
 
         cfg = Config::new();
@@ -721,7 +823,48 @@ mod tests {
         assert!(cfg.validate().is_err());
 
         cfg = Config::new();
+        cfg.store_batch_system.max_batch_size = Some(0);
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.store_batch_system.pool_size = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.hibernate_regions = true;
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.store_batch_system.max_batch_size, Some(256));
+        assert_eq!(cfg.apply_batch_system.max_batch_size, Some(256));
+
+        cfg = Config::new();
+        cfg.hibernate_regions = false;
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.store_batch_system.max_batch_size, Some(1024));
+        assert_eq!(cfg.apply_batch_system.max_batch_size, Some(256));
+
+        cfg = Config::new();
+        cfg.hibernate_regions = true;
+        cfg.store_batch_system.max_batch_size = Some(123);
+        cfg.apply_batch_system.max_batch_size = Some(234);
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.store_batch_system.max_batch_size, Some(123));
+        assert_eq!(cfg.apply_batch_system.max_batch_size, Some(234));
+
+        cfg = Config::new();
         cfg.future_poll_size = 0;
         assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.raft_base_tick_interval = ReadableDuration::secs(1);
+        cfg.raft_election_timeout_ticks = 11;
+        cfg.raft_store_max_leader_lease = ReadableDuration::secs(11);
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.hibernate_regions = true;
+        cfg.max_peer_down_duration = ReadableDuration::minutes(5);
+        cfg.peer_stale_state_check_interval = ReadableDuration::minutes(5);
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.max_peer_down_duration, ReadableDuration::minutes(10));
     }
 }

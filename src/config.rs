@@ -16,7 +16,6 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::usize;
 
-use configuration::{ConfigChange, ConfigManager, ConfigValue, Configuration, Result as CfgResult};
 use engine_rocks::config::{self as rocks_config, BlobRunMode, CompressionType, LogLevel};
 use engine_rocks::properties::MvccPropertiesCollectorFactory;
 use engine_rocks::raw::{
@@ -30,52 +29,60 @@ use engine_rocks::util::{
 };
 use engine_rocks::{
     RaftDBLogger, RangePropertiesCollectorFactory, RocksEngine, RocksEventListener,
-    RocksSstPartitionerFactory, RocksdbLogger, DEFAULT_PROP_KEYS_INDEX_DISTANCE,
-    DEFAULT_PROP_SIZE_INDEX_DISTANCE,
+    RocksSstPartitionerFactory, RocksdbLogger, TtlPropertiesCollectorFactory,
+    DEFAULT_PROP_KEYS_INDEX_DISTANCE, DEFAULT_PROP_SIZE_INDEX_DISTANCE,
 };
 use engine_traits::{CFOptionsExt, ColumnFamilyOptions as ColumnFamilyOptionsTrait, DBOptionsExt};
-use engine_traits::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_VER_DEFAULT, CF_WRITE};
+use engine_traits::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
+use file_system::IOPriority;
 use keys::region_raft_prefix_len;
+use online_config::{ConfigChange, ConfigManager, ConfigValue, OnlineConfig, Result as CfgResult};
 use pd_client::Config as PdConfig;
 use raft_log_engine::RaftEngineConfig as RawRaftEngineConfig;
 use raft_log_engine::RaftLogEngine;
 use raftstore::coprocessor::{Config as CopConfig, RegionInfoAccessor};
 use raftstore::store::Config as RaftstoreConfig;
 use raftstore::store::{CompactionGuardGeneratorFactory, SplitConfig};
+use resource_metering::Config as ResourceMeteringConfig;
 use security::SecurityConfig;
 use tikv_util::config::{
-    self, LogFormat, OptionReadableSize, ReadableDuration, ReadableSize, TomlWriter, GB, MB,
+    self, LogFormat, OptionReadableSize, ReadableDuration, ReadableSize, TomlWriter, GIB, MIB,
 };
-use tikv_util::sys::sys_quota::SysQuota;
+use tikv_util::sys::SysQuota;
 use tikv_util::time::duration_to_sec;
 use tikv_util::yatp_pool;
 
+use crate::coprocessor_v2::Config as CoprocessorV2Config;
 use crate::import::Config as ImportConfig;
 use crate::server::gc_worker::GcConfig;
 use crate::server::gc_worker::WriteCompactionFilterFactory;
 use crate::server::lock_manager::Config as PessimisticTxnConfig;
+use crate::server::ttl::TTLCompactionFilterFactory;
 use crate::server::Config as ServerConfig;
 use crate::server::CONFIG_ROCKSDB_GAUGE;
 use crate::storage::config::{Config as StorageConfig, DEFAULT_DATA_DIR};
 
 pub const DEFAULT_ROCKSDB_SUB_DIR: &str = "db";
 
-const LOCKCF_MIN_MEM: usize = 256 * MB as usize;
-const LOCKCF_MAX_MEM: usize = GB as usize;
-const RAFT_MIN_MEM: usize = 256 * MB as usize;
-const RAFT_MAX_MEM: usize = 2 * GB as usize;
+/// By default, block cache size will be set to 45% of system memory.
+pub const BLOCK_CACHE_RATE: f64 = 0.45;
+/// By default, TiKV will try to limit memory usage to 75% of system memory.
+pub const MEMORY_USAGE_LIMIT_RATE: f64 = 0.75;
+
+const LOCKCF_MIN_MEM: usize = 256 * MIB as usize;
+const LOCKCF_MAX_MEM: usize = GIB as usize;
+const RAFT_MIN_MEM: usize = 256 * MIB as usize;
+const RAFT_MAX_MEM: usize = 2 * GIB as usize;
 const LAST_CONFIG_FILE: &str = "last_tikv.toml";
 const TMP_CONFIG_FILE: &str = "tmp_tikv.toml";
-const MAX_BLOCK_SIZE: usize = 32 * MB as usize;
+const MAX_BLOCK_SIZE: usize = 32 * MIB as usize;
 
-fn memory_mb_for_cf(is_raft_db: bool, cf: &str) -> usize {
-    let total_mem = SysQuota::new().memory_limit_in_bytes();
+fn memory_limit_for_cf(is_raft_db: bool, cf: &str, total_mem: u64) -> ReadableSize {
     let (ratio, min, max) = match (is_raft_db, cf) {
         (true, CF_DEFAULT) => (0.02, RAFT_MIN_MEM, RAFT_MAX_MEM),
         (false, CF_DEFAULT) => (0.25, 0, usize::MAX),
         (false, CF_LOCK) => (0.02, LOCKCF_MIN_MEM, LOCKCF_MAX_MEM),
         (false, CF_WRITE) => (0.15, 0, usize::MAX),
-        (false, CF_VER_DEFAULT) => (0.25, 0, usize::MAX),
         _ => unreachable!(),
     };
     let mut size = (total_mem as f64 * ratio) as usize;
@@ -84,37 +91,37 @@ fn memory_mb_for_cf(is_raft_db: bool, cf: &str) -> usize {
     } else if size > max {
         size = max;
     }
-    size / MB as usize
+    ReadableSize::mb(size as u64 / MIB)
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Configuration)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct TitanCfConfig {
-    #[config(skip)]
+    #[online_config(skip)]
     pub min_blob_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub blob_file_compression: CompressionType,
-    #[config(skip)]
+    #[online_config(skip)]
     pub blob_cache_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub min_gc_batch_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub max_gc_batch_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub discardable_ratio: f64,
-    #[config(skip)]
+    #[online_config(skip)]
     pub sample_ratio: f64,
-    #[config(skip)]
+    #[online_config(skip)]
     pub merge_small_file_threshold: ReadableSize,
     pub blob_run_mode: BlobRunMode,
-    #[config(skip)]
+    #[online_config(skip)]
     pub level_merge: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub range_merge: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub max_sorted_runs: i32,
-    #[config(skip)]
+    #[online_config(skip)]
     pub gc_merge_rewrite: bool,
 }
 
@@ -158,75 +165,98 @@ impl TitanCfConfig {
     }
 }
 
-fn get_background_job_limit(
-    default_background_jobs: i32,
-    default_background_flushes: i32,
-    default_sub_compactions: u32,
-    default_background_gc: i32,
-) -> (i32, i32, u32, i32) {
-    let cpu_num = SysQuota::new().cpu_cores_quota();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BackgroundJobLimits {
+    max_background_jobs: u32,
+    max_background_flushes: u32,
+    max_sub_compactions: u32,
+    max_titan_background_gc: u32,
+}
+
+const KVDB_DEFAULT_BACKGROUND_JOB_LIMITS: BackgroundJobLimits = BackgroundJobLimits {
+    max_background_jobs: 10,
+    max_background_flushes: 4,
+    max_sub_compactions: 3,
+    max_titan_background_gc: 4,
+};
+
+const RAFTDB_DEFAULT_BACKGROUND_JOB_LIMITS: BackgroundJobLimits = BackgroundJobLimits {
+    max_background_jobs: 4,
+    max_background_flushes: 1,
+    max_sub_compactions: 2,
+    max_titan_background_gc: 4,
+};
+
+fn get_background_job_limits_impl(
+    cpu_num: u32,
+    defaults: &BackgroundJobLimits,
+) -> BackgroundJobLimits {
     // At the minimum, we should have two background jobs: one for flush and one for compaction.
     // Otherwise, the number of background jobs should not exceed cpu_num - 1.
     // By default, rocksdb assign (max_background_jobs / 4) threads dedicated for flush, and
     // the rest shared by flush and compaction.
-    let max_background_jobs: i32 =
-        cmp::max(2, cmp::min(default_background_jobs, (cpu_num - 1.0) as i32));
-    // Scale flush threads proportionally to background jobs. Also make sure the number of flush
+    let max_background_jobs = cmp::max(2, cmp::min(defaults.max_background_jobs, cpu_num));
+    // Scale flush threads proportionally to cpu cores. Also make sure the number of flush
     // threads doesn't exceed total jobs.
-    let max_background_flushes: i32 = cmp::min(
-        cmp::max(default_background_flushes, max_background_jobs / 4),
-        max_background_jobs - 1,
+    let max_background_flushes = cmp::min(
+        (max_background_jobs + 2) / 3,
+        defaults.max_background_flushes,
     );
     // Cap max_sub_compactions to allow at least two compactions.
     let max_compactions = max_background_jobs - max_background_flushes;
     let max_sub_compactions: u32 = cmp::max(
         1,
-        cmp::min(default_sub_compactions, (max_compactions - 1) as u32),
+        cmp::min(defaults.max_sub_compactions, (max_compactions - 1) as u32),
     );
     // Maximum background GC threads for Titan
-    let max_background_gc: i32 = cmp::min(default_background_gc, cpu_num as i32);
+    let max_titan_background_gc = cmp::min(defaults.max_titan_background_gc, cpu_num);
 
-    (
+    BackgroundJobLimits {
         max_background_jobs,
         max_background_flushes,
         max_sub_compactions,
-        max_background_gc,
-    )
+        max_titan_background_gc,
+    }
+}
+
+fn get_background_job_limits(defaults: &BackgroundJobLimits) -> BackgroundJobLimits {
+    let cpu_num = cmp::max(SysQuota::cpu_cores_quota() as u32, 1);
+    get_background_job_limits_impl(cpu_num, defaults)
 }
 
 macro_rules! cf_config {
     ($name:ident) => {
-        #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Configuration)]
+        #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
         #[serde(default)]
         #[serde(rename_all = "kebab-case")]
         pub struct $name {
-            #[config(skip)]
+            #[online_config(skip)]
             pub block_size: ReadableSize,
             pub block_cache_size: ReadableSize,
-            #[config(skip)]
+            #[online_config(skip)]
             pub disable_block_cache: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub cache_index_and_filter_blocks: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub pin_l0_filter_and_index_blocks: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub use_bloom_filter: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub optimize_filters_for_hits: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub whole_key_filtering: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub bloom_filter_bits_per_key: i32,
-            #[config(skip)]
+            #[online_config(skip)]
             pub block_based_bloom_filter: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub read_amp_bytes_per_bit: u32,
             #[serde(with = "rocks_config::compression_type_level_serde")]
-            #[config(skip)]
+            #[online_config(skip)]
             pub compression_per_level: [DBCompressionType; 7],
             pub write_buffer_size: ReadableSize,
             pub max_write_buffer_number: i32,
-            #[config(skip)]
+            #[online_config(skip)]
             pub min_write_buffer_number_to_merge: i32,
             pub max_bytes_for_level_base: ReadableSize,
             pub target_file_size_base: ReadableSize,
@@ -235,34 +265,42 @@ macro_rules! cf_config {
             pub level0_stop_writes_trigger: i32,
             pub max_compaction_bytes: ReadableSize,
             #[serde(with = "rocks_config::compaction_pri_serde")]
-            #[config(skip)]
+            #[online_config(skip)]
             pub compaction_pri: CompactionPriority,
-            #[config(skip)]
+            #[online_config(skip)]
             pub dynamic_level_bytes: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub num_levels: i32,
             pub max_bytes_for_level_multiplier: i32,
             #[serde(with = "rocks_config::compaction_style_serde")]
-            #[config(skip)]
+            #[online_config(skip)]
             pub compaction_style: DBCompactionStyle,
             pub disable_auto_compactions: bool,
+            pub disable_write_stall: bool,
             pub soft_pending_compaction_bytes_limit: ReadableSize,
             pub hard_pending_compaction_bytes_limit: ReadableSize,
-            #[config(skip)]
+            #[online_config(skip)]
             pub force_consistency_checks: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub prop_size_index_distance: u64,
-            #[config(skip)]
+            #[online_config(skip)]
             pub prop_keys_index_distance: u64,
-            #[config(skip)]
+            #[online_config(skip)]
             pub enable_doubly_skiplist: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub enable_compaction_guard: bool,
-            #[config(skip)]
+            #[online_config(skip)]
             pub compaction_guard_min_output_file_size: ReadableSize,
-            #[config(skip)]
+            #[online_config(skip)]
             pub compaction_guard_max_output_file_size: ReadableSize,
-            #[config(submodule)]
+            #[serde(with = "rocks_config::compression_type_serde")]
+            #[online_config(skip)]
+            pub bottommost_level_compression: DBCompressionType,
+            #[online_config(skip)]
+            pub bottommost_zstd_compression_dict_size: i32,
+            #[online_config(skip)]
+            pub bottommost_zstd_compression_sample_size: i32,
+            #[online_config(submodule)]
             pub titan: TitanCfConfig,
         }
 
@@ -362,6 +400,9 @@ macro_rules! write_into_metrics {
             .with_label_values(&[$tag, "disable_auto_compactions"])
             .set(($cf.disable_auto_compactions as i32).into());
         $metrics
+            .with_label_values(&[$tag, "disable_write_stall"])
+            .set(($cf.disable_write_stall as i32).into());
+        $metrics
             .with_label_values(&[$tag, "soft_pending_compaction_bytes_limit"])
             .set($cf.soft_pending_compaction_bytes_limit.0 as f64);
         $metrics
@@ -426,6 +467,16 @@ macro_rules! build_cf_opt {
         assert!($opt.compression_per_level.len() >= $opt.num_levels as usize);
         let compression_per_level = $opt.compression_per_level[..$opt.num_levels as usize].to_vec();
         cf_opts.compression_per_level(compression_per_level.as_slice());
+        cf_opts.bottommost_compression($opt.bottommost_level_compression);
+        // To set for bottommost level sst compression. The first 3 parameters refer to the
+        // default value in `CompressionOptions` in `rocksdb/include/rocksdb/advanced_options.h`.
+        cf_opts.set_bottommost_level_compression_options(
+            -14,   /* window_bits */
+            32767, /* level */
+            0,     /* strategy */
+            $opt.bottommost_zstd_compression_dict_size,
+            $opt.bottommost_zstd_compression_sample_size,
+        );
         cf_opts.set_write_buffer_size($opt.write_buffer_size.0);
         cf_opts.set_max_write_buffer_number($opt.max_write_buffer_number);
         cf_opts.set_min_write_buffer_number_to_merge($opt.min_write_buffer_number_to_merge);
@@ -440,6 +491,7 @@ macro_rules! build_cf_opt {
         cf_opts.set_max_bytes_for_level_multiplier($opt.max_bytes_for_level_multiplier);
         cf_opts.set_compaction_style($opt.compaction_style);
         cf_opts.set_disable_auto_compactions($opt.disable_auto_compactions);
+        cf_opts.set_disable_write_stall($opt.disable_write_stall);
         cf_opts.set_soft_pending_compaction_bytes_limit($opt.soft_pending_compaction_bytes_limit.0);
         cf_opts.set_hard_pending_compaction_bytes_limit($opt.hard_pending_compaction_bytes_limit.0);
         cf_opts.set_optimize_filters_for_hits($opt.optimize_filters_for_hits);
@@ -469,9 +521,11 @@ cf_config!(DefaultCfConfig);
 
 impl Default for DefaultCfConfig {
     fn default() -> DefaultCfConfig {
+        let total_mem = SysQuota::memory_limit_in_bytes();
+
         DefaultCfConfig {
             block_size: ReadableSize::kb(64),
-            block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_DEFAULT) as u64),
+            block_cache_size: memory_limit_for_cf(false, CF_DEFAULT, total_mem),
             disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
@@ -505,7 +559,8 @@ impl Default for DefaultCfConfig {
             max_bytes_for_level_multiplier: 10,
             compaction_style: DBCompactionStyle::Level,
             disable_auto_compactions: false,
-            soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
+            disable_write_stall: false,
+            soft_pending_compaction_bytes_limit: ReadableSize::gb(192),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             force_consistency_checks: false,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
@@ -515,6 +570,9 @@ impl Default for DefaultCfConfig {
             compaction_guard_min_output_file_size: ReadableSize::mb(8),
             compaction_guard_max_output_file_size: ReadableSize::mb(128),
             titan: TitanCfConfig::default(),
+            bottommost_level_compression: DBCompressionType::Zstd,
+            bottommost_zstd_compression_dict_size: 0,
+            bottommost_zstd_compression_sample_size: 0,
         }
     }
 }
@@ -524,6 +582,7 @@ impl DefaultCfConfig {
         &self,
         cache: &Option<Cache>,
         region_info_accessor: Option<&RegionInfoAccessor>,
+        enable_ttl: bool,
     ) -> ColumnFamilyOptions {
         let mut cf_opts = build_cf_opt!(self, CF_DEFAULT, cache, region_info_accessor);
         let f = Box::new(RangePropertiesCollectorFactory {
@@ -531,6 +590,18 @@ impl DefaultCfConfig {
             prop_keys_index_distance: self.prop_keys_index_distance,
         });
         cf_opts.add_table_properties_collector_factory("tikv.range-properties-collector", f);
+        if enable_ttl {
+            cf_opts.add_table_properties_collector_factory(
+                "tikv.ttl-properties-collector",
+                Box::new(TtlPropertiesCollectorFactory {}),
+            );
+            cf_opts
+                .set_compaction_filter_factory(
+                    "ttl_compaction_filter_factory",
+                    Box::new(TTLCompactionFilterFactory {}) as Box<dyn CompactionFilterFactory>,
+                )
+                .unwrap();
+        }
         cf_opts.set_titandb_options(&self.titan.build_opts());
         cf_opts
     }
@@ -540,12 +611,17 @@ cf_config!(WriteCfConfig);
 
 impl Default for WriteCfConfig {
     fn default() -> WriteCfConfig {
+        let total_mem = SysQuota::memory_limit_in_bytes();
+
         // Setting blob_run_mode=read_only effectively disable Titan.
-        let mut titan = TitanCfConfig::default();
-        titan.blob_run_mode = BlobRunMode::ReadOnly;
+        let titan = TitanCfConfig {
+            blob_run_mode: BlobRunMode::ReadOnly,
+            ..Default::default()
+        };
+
         WriteCfConfig {
             block_size: ReadableSize::kb(64),
-            block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_WRITE) as u64),
+            block_cache_size: memory_limit_for_cf(false, CF_WRITE, total_mem),
             disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
@@ -579,7 +655,8 @@ impl Default for WriteCfConfig {
             max_bytes_for_level_multiplier: 10,
             compaction_style: DBCompactionStyle::Level,
             disable_auto_compactions: false,
-            soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
+            disable_write_stall: false,
+            soft_pending_compaction_bytes_limit: ReadableSize::gb(192),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             force_consistency_checks: false,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
@@ -589,6 +666,9 @@ impl Default for WriteCfConfig {
             compaction_guard_min_output_file_size: ReadableSize::mb(8),
             compaction_guard_max_output_file_size: ReadableSize::mb(128),
             titan,
+            bottommost_level_compression: DBCompressionType::Zstd,
+            bottommost_zstd_compression_dict_size: 0,
+            bottommost_zstd_compression_sample_size: 0,
         }
     }
 }
@@ -630,12 +710,17 @@ cf_config!(LockCfConfig);
 
 impl Default for LockCfConfig {
     fn default() -> LockCfConfig {
+        let total_mem = SysQuota::memory_limit_in_bytes();
+
         // Setting blob_run_mode=read_only effectively disable Titan.
-        let mut titan = TitanCfConfig::default();
-        titan.blob_run_mode = BlobRunMode::ReadOnly;
+        let titan = TitanCfConfig {
+            blob_run_mode: BlobRunMode::ReadOnly,
+            ..Default::default()
+        };
+
         LockCfConfig {
             block_size: ReadableSize::kb(16),
-            block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_LOCK) as u64),
+            block_cache_size: memory_limit_for_cf(false, CF_LOCK, total_mem),
             disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
@@ -661,7 +746,8 @@ impl Default for LockCfConfig {
             max_bytes_for_level_multiplier: 10,
             compaction_style: DBCompactionStyle::Level,
             disable_auto_compactions: false,
-            soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
+            disable_write_stall: false,
+            soft_pending_compaction_bytes_limit: ReadableSize::gb(192),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             force_consistency_checks: false,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
@@ -671,6 +757,9 @@ impl Default for LockCfConfig {
             compaction_guard_min_output_file_size: ReadableSize::mb(8),
             compaction_guard_max_output_file_size: ReadableSize::mb(128),
             titan,
+            bottommost_level_compression: DBCompressionType::Disable,
+            bottommost_zstd_compression_dict_size: 0,
+            bottommost_zstd_compression_sample_size: 0,
         }
     }
 }
@@ -699,8 +788,10 @@ cf_config!(RaftCfConfig);
 impl Default for RaftCfConfig {
     fn default() -> RaftCfConfig {
         // Setting blob_run_mode=read_only effectively disable Titan.
-        let mut titan = TitanCfConfig::default();
-        titan.blob_run_mode = BlobRunMode::ReadOnly;
+        let titan = TitanCfConfig {
+            blob_run_mode: BlobRunMode::ReadOnly,
+            ..Default::default()
+        };
         RaftCfConfig {
             block_size: ReadableSize::kb(16),
             block_cache_size: ReadableSize::mb(128),
@@ -729,7 +820,8 @@ impl Default for RaftCfConfig {
             max_bytes_for_level_multiplier: 10,
             compaction_style: DBCompactionStyle::Level,
             disable_auto_compactions: false,
-            soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
+            disable_write_stall: false,
+            soft_pending_compaction_bytes_limit: ReadableSize::gb(192),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             force_consistency_checks: false,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
@@ -739,6 +831,9 @@ impl Default for RaftCfConfig {
             compaction_guard_min_output_file_size: ReadableSize::mb(8),
             compaction_guard_max_output_file_size: ReadableSize::mb(128),
             titan,
+            bottommost_level_compression: DBCompressionType::Disable,
+            bottommost_zstd_compression_dict_size: 0,
+            bottommost_zstd_compression_sample_size: 0,
         }
     }
 }
@@ -752,77 +847,6 @@ impl RaftCfConfig {
             .set_prefix_extractor("NoopSliceTransform", f)
             .unwrap();
         cf_opts.set_memtable_prefix_bloom_size_ratio(0.1);
-        cf_opts.set_titandb_options(&self.titan.build_opts());
-        cf_opts
-    }
-}
-
-cf_config!(VersionCfConfig);
-
-impl Default for VersionCfConfig {
-    fn default() -> VersionCfConfig {
-        VersionCfConfig {
-            block_size: ReadableSize::kb(64),
-            block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_VER_DEFAULT) as u64),
-            disable_block_cache: false,
-            cache_index_and_filter_blocks: true,
-            pin_l0_filter_and_index_blocks: true,
-            use_bloom_filter: true,
-            optimize_filters_for_hits: true,
-            whole_key_filtering: true,
-            bloom_filter_bits_per_key: 10,
-            block_based_bloom_filter: false,
-            read_amp_bytes_per_bit: 0,
-            compression_per_level: [
-                DBCompressionType::No,
-                DBCompressionType::No,
-                DBCompressionType::Lz4,
-                DBCompressionType::Lz4,
-                DBCompressionType::Lz4,
-                DBCompressionType::Zstd,
-                DBCompressionType::Zstd,
-            ],
-            write_buffer_size: ReadableSize::mb(128),
-            max_write_buffer_number: 5,
-            min_write_buffer_number_to_merge: 1,
-            max_bytes_for_level_base: ReadableSize::mb(512),
-            target_file_size_base: ReadableSize::mb(8),
-            level0_file_num_compaction_trigger: 4,
-            level0_slowdown_writes_trigger: 20,
-            level0_stop_writes_trigger: 36,
-            max_compaction_bytes: ReadableSize::gb(2),
-            compaction_pri: CompactionPriority::MinOverlappingRatio,
-            dynamic_level_bytes: true,
-            num_levels: 7,
-            max_bytes_for_level_multiplier: 10,
-            compaction_style: DBCompactionStyle::Level,
-            disable_auto_compactions: false,
-            soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
-            hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
-            force_consistency_checks: false,
-            prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
-            prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
-            enable_doubly_skiplist: true,
-            enable_compaction_guard: false,
-            compaction_guard_min_output_file_size: ReadableSize::mb(8),
-            compaction_guard_max_output_file_size: ReadableSize::mb(128),
-            titan: TitanCfConfig::default(),
-        }
-    }
-}
-
-impl VersionCfConfig {
-    pub fn build_opt(
-        &self,
-        cache: &Option<Cache>,
-        region_info_accessor: Option<&RegionInfoAccessor>,
-    ) -> ColumnFamilyOptions {
-        let mut cf_opts = build_cf_opt!(self, CF_VER_DEFAULT, cache, region_info_accessor);
-        let f = Box::new(RangePropertiesCollectorFactory {
-            prop_size_index_distance: self.prop_size_index_distance,
-            prop_keys_index_distance: self.prop_keys_index_distance,
-        });
-        cf_opts.add_table_properties_collector_factory("tikv.range-properties-collector", f);
         cf_opts.set_titandb_options(&self.titan.build_opts());
         cf_opts
     }
@@ -869,91 +893,94 @@ impl TitanDBConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Configuration)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct DbConfig {
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_level: LogLevel,
     #[serde(with = "rocks_config::recovery_mode_serde")]
-    #[config(skip)]
+    #[online_config(skip)]
     pub wal_recovery_mode: DBRecoveryMode,
-    #[config(skip)]
+    #[online_config(skip)]
     pub wal_dir: String,
-    #[config(skip)]
+    #[online_config(skip)]
     pub wal_ttl_seconds: u64,
-    #[config(skip)]
+    #[online_config(skip)]
     pub wal_size_limit: ReadableSize,
     pub max_total_wal_size: ReadableSize,
     pub max_background_jobs: i32,
     pub max_background_flushes: i32,
-    #[config(skip)]
+    #[online_config(skip)]
     pub max_manifest_file_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub create_if_missing: bool,
     pub max_open_files: i32,
-    #[config(skip)]
+    #[online_config(skip)]
     pub enable_statistics: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub stats_dump_period: ReadableDuration,
     pub compaction_readahead_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_max_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_roll_time: ReadableDuration,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_keep_log_file_num: u64,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_dir: String,
     pub rate_bytes_per_sec: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub rate_limiter_refill_period: ReadableDuration,
     #[serde(with = "rocks_config::rate_limiter_mode_serde")]
-    #[config(skip)]
+    #[online_config(skip)]
     pub rate_limiter_mode: DBRateLimiterMode,
-    #[config(skip)]
-    pub auto_tuned: bool,
+    // deprecated. use rate_limiter_auto_tuned.
+    #[online_config(skip)]
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
+    pub auto_tuned: Option<bool>,
+    pub rate_limiter_auto_tuned: bool,
     pub bytes_per_sync: ReadableSize,
     pub wal_bytes_per_sync: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub max_sub_compactions: u32,
     pub writable_file_max_buffer_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub use_direct_io_for_flush_and_compaction: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub enable_pipelined_write: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub enable_multi_batch_write: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub enable_unordered_write: bool,
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub defaultcf: DefaultCfConfig,
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub writecf: WriteCfConfig,
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub lockcf: LockCfConfig,
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub raftcf: RaftCfConfig,
-    #[config(submodule)]
-    pub ver_defaultcf: VersionCfConfig,
-    #[config(skip)]
+    #[online_config(skip)]
     pub titan: TitanDBConfig,
 }
 
 impl Default for DbConfig {
     fn default() -> DbConfig {
-        let (max_background_jobs, max_background_flushes, max_sub_compactions, max_background_gc) =
-            get_background_job_limit(8, 2, 3, 4);
-        let mut titan_config = TitanDBConfig::default();
-        titan_config.max_background_gc = max_background_gc;
+        let bg_job_limits = get_background_job_limits(&KVDB_DEFAULT_BACKGROUND_JOB_LIMITS);
+        let titan_config = TitanDBConfig {
+            max_background_gc: bg_job_limits.max_titan_background_gc as i32,
+            ..Default::default()
+        };
         DbConfig {
             wal_recovery_mode: DBRecoveryMode::PointInTime,
             wal_dir: "".to_owned(),
             wal_ttl_seconds: 0,
             wal_size_limit: ReadableSize::kb(0),
             max_total_wal_size: ReadableSize::gb(4),
-            max_background_jobs,
-            max_background_flushes,
+            max_background_jobs: bg_job_limits.max_background_jobs as i32,
+            max_background_flushes: bg_job_limits.max_background_flushes as i32,
             max_manifest_file_size: ReadableSize::mb(128),
             create_if_missing: true,
             max_open_files: 40960,
@@ -968,10 +995,11 @@ impl Default for DbConfig {
             rate_bytes_per_sec: ReadableSize::gb(10),
             rate_limiter_refill_period: ReadableDuration::millis(100),
             rate_limiter_mode: DBRateLimiterMode::WriteOnly,
-            auto_tuned: true,
+            auto_tuned: None, // deprecated
+            rate_limiter_auto_tuned: true,
             bytes_per_sync: ReadableSize::mb(1),
             wal_bytes_per_sync: ReadableSize::kb(512),
-            max_sub_compactions,
+            max_sub_compactions: bg_job_limits.max_sub_compactions as u32,
             writable_file_max_buffer_size: ReadableSize::mb(1),
             use_direct_io_for_flush_and_compaction: false,
             enable_pipelined_write: true,
@@ -981,7 +1009,6 @@ impl Default for DbConfig {
             writecf: WriteCfConfig::default(),
             lockcf: LockCfConfig::default(),
             raftcf: RaftCfConfig::default(),
-            ver_defaultcf: VersionCfConfig::default(),
             titan: titan_config,
         }
     }
@@ -1011,19 +1038,19 @@ impl DbConfig {
         opts.set_log_file_time_to_roll(self.info_log_roll_time.as_secs());
         opts.set_keep_log_file_num(self.info_log_keep_log_file_num);
         if self.rate_bytes_per_sec.0 > 0 {
-            if self.auto_tuned {
+            if self.rate_limiter_auto_tuned {
                 opts.set_writeampbasedratelimiter_with_auto_tuned(
                     self.rate_bytes_per_sec.0 as i64,
                     (self.rate_limiter_refill_period.as_millis() * 1000) as i64,
                     self.rate_limiter_mode,
-                    self.auto_tuned,
+                    self.rate_limiter_auto_tuned,
                 );
             } else {
                 opts.set_ratelimiter_with_auto_tuned(
                     self.rate_bytes_per_sec.0 as i64,
                     (self.rate_limiter_refill_period.as_millis() * 1000) as i64,
                     self.rate_limiter_mode,
-                    self.auto_tuned,
+                    self.rate_limiter_auto_tuned,
                 );
             }
         }
@@ -1054,11 +1081,13 @@ impl DbConfig {
         &self,
         cache: &Option<Cache>,
         region_info_accessor: Option<&RegionInfoAccessor>,
+        enable_ttl: bool,
     ) -> Vec<CFOptions<'_>> {
         vec![
             CFOptions::new(
                 CF_DEFAULT,
-                self.defaultcf.build_opt(cache, region_info_accessor),
+                self.defaultcf
+                    .build_opt(cache, region_info_accessor, enable_ttl),
             ),
             CFOptions::new(CF_LOCK, self.lockcf.build_opt(cache)),
             CFOptions::new(
@@ -1067,10 +1096,6 @@ impl DbConfig {
             ),
             // TODO: remove CF_RAFT.
             CFOptions::new(CF_RAFT, self.raftcf.build_opt(cache)),
-            CFOptions::new(
-                CF_VER_DEFAULT,
-                self.ver_defaultcf.build_opt(cache, region_info_accessor),
-            ),
         ]
     }
 
@@ -1079,7 +1104,6 @@ impl DbConfig {
         self.lockcf.validate()?;
         self.writecf.validate()?;
         self.raftcf.validate()?;
-        self.ver_defaultcf.validate()?;
         self.titan.validate()?;
         if self.enable_unordered_write {
             if self.titan.enabled {
@@ -1097,7 +1121,6 @@ impl DbConfig {
         write_into_metrics!(self.lockcf, CF_LOCK, CONFIG_ROCKSDB_GAUGE);
         write_into_metrics!(self.writecf, CF_WRITE, CONFIG_ROCKSDB_GAUGE);
         write_into_metrics!(self.raftcf, CF_RAFT, CONFIG_ROCKSDB_GAUGE);
-        write_into_metrics!(self.ver_defaultcf, CF_VER_DEFAULT, CONFIG_ROCKSDB_GAUGE);
     }
 }
 
@@ -1105,9 +1128,11 @@ cf_config!(RaftDefaultCfConfig);
 
 impl Default for RaftDefaultCfConfig {
     fn default() -> RaftDefaultCfConfig {
+        let total_mem = SysQuota::memory_limit_in_bytes();
+
         RaftDefaultCfConfig {
             block_size: ReadableSize::kb(64),
-            block_cache_size: ReadableSize::mb(memory_mb_for_cf(true, CF_DEFAULT) as u64),
+            block_cache_size: memory_limit_for_cf(true, CF_DEFAULT, total_mem),
             disable_block_cache: false,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks: true,
@@ -1141,7 +1166,8 @@ impl Default for RaftDefaultCfConfig {
             max_bytes_for_level_multiplier: 10,
             compaction_style: DBCompactionStyle::Level,
             disable_auto_compactions: false,
-            soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
+            disable_write_stall: false,
+            soft_pending_compaction_bytes_limit: ReadableSize::gb(192),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             force_consistency_checks: false,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
@@ -1151,6 +1177,9 @@ impl Default for RaftDefaultCfConfig {
             compaction_guard_min_output_file_size: ReadableSize::mb(8),
             compaction_guard_max_output_file_size: ReadableSize::mb(128),
             titan: TitanCfConfig::default(),
+            bottommost_level_compression: DBCompressionType::Disable,
+            bottommost_zstd_compression_dict_size: 0,
+            bottommost_zstd_compression_sample_size: 0,
         }
     }
 }
@@ -1172,75 +1201,76 @@ impl RaftDefaultCfConfig {
 // When construct Options, options.env is set to same singleton Env::Default() object.
 // So total max_background_jobs = max(rocksdb.max_background_jobs, raftdb.max_background_jobs)
 // But each instance will limit their background jobs according to their own max_background_jobs
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Configuration)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RaftDbConfig {
     #[serde(with = "rocks_config::recovery_mode_serde")]
-    #[config(skip)]
+    #[online_config(skip)]
     pub wal_recovery_mode: DBRecoveryMode,
-    #[config(skip)]
+    #[online_config(skip)]
     pub wal_dir: String,
-    #[config(skip)]
+    #[online_config(skip)]
     pub wal_ttl_seconds: u64,
-    #[config(skip)]
+    #[online_config(skip)]
     pub wal_size_limit: ReadableSize,
     pub max_total_wal_size: ReadableSize,
     pub max_background_jobs: i32,
     pub max_background_flushes: i32,
-    #[config(skip)]
+    #[online_config(skip)]
     pub max_manifest_file_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub create_if_missing: bool,
     pub max_open_files: i32,
-    #[config(skip)]
+    #[online_config(skip)]
     pub enable_statistics: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub stats_dump_period: ReadableDuration,
     pub compaction_readahead_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_max_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_roll_time: ReadableDuration,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_keep_log_file_num: u64,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_dir: String,
-    #[config(skip)]
+    #[online_config(skip)]
     pub info_log_level: LogLevel,
-    #[config(skip)]
+    #[online_config(skip)]
     pub max_sub_compactions: u32,
     pub writable_file_max_buffer_size: ReadableSize,
-    #[config(skip)]
+    #[online_config(skip)]
     pub use_direct_io_for_flush_and_compaction: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub enable_pipelined_write: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub enable_unordered_write: bool,
-    #[config(skip)]
+    #[online_config(skip)]
     pub allow_concurrent_memtable_write: bool,
     pub bytes_per_sync: ReadableSize,
     pub wal_bytes_per_sync: ReadableSize,
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub defaultcf: RaftDefaultCfConfig,
-    #[config(skip)]
+    #[online_config(skip)]
     pub titan: TitanDBConfig,
 }
 
 impl Default for RaftDbConfig {
     fn default() -> RaftDbConfig {
-        let (max_background_jobs, max_background_flushes, max_sub_compactions, max_background_gc) =
-            get_background_job_limit(4, 1, 2, 4);
-        let mut titan_config = TitanDBConfig::default();
-        titan_config.max_background_gc = max_background_gc;
+        let bg_job_limits = get_background_job_limits(&RAFTDB_DEFAULT_BACKGROUND_JOB_LIMITS);
+        let titan_config = TitanDBConfig {
+            max_background_gc: bg_job_limits.max_titan_background_gc as i32,
+            ..Default::default()
+        };
         RaftDbConfig {
             wal_recovery_mode: DBRecoveryMode::PointInTime,
             wal_dir: "".to_owned(),
             wal_ttl_seconds: 0,
             wal_size_limit: ReadableSize::kb(0),
             max_total_wal_size: ReadableSize::gb(4),
-            max_background_jobs,
-            max_background_flushes,
+            max_background_jobs: bg_job_limits.max_background_jobs as i32,
+            max_background_flushes: bg_job_limits.max_background_flushes as i32,
             max_manifest_file_size: ReadableSize::mb(20),
             create_if_missing: true,
             max_open_files: 40960,
@@ -1252,7 +1282,7 @@ impl Default for RaftDbConfig {
             info_log_keep_log_file_num: 10,
             info_log_dir: "".to_owned(),
             info_log_level: LogLevel::Info,
-            max_sub_compactions,
+            max_sub_compactions: bg_job_limits.max_sub_compactions as u32,
             writable_file_max_buffer_size: ReadableSize::mb(1),
             use_direct_io_for_flush_and_compaction: false,
             enable_pipelined_write: true,
@@ -1421,6 +1451,20 @@ impl DBConfigManger {
         Ok(())
     }
 
+    fn set_rate_limiter_auto_tuned(
+        &self,
+        rate_limiter_auto_tuned: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut opt = self.db.as_inner().get_db_options();
+        opt.set_auto_tuned(rate_limiter_auto_tuned)?;
+        // double check the new state
+        let new_auto_tuned = opt.get_auto_tuned();
+        if new_auto_tuned.is_none() || new_auto_tuned.unwrap() != rate_limiter_auto_tuned {
+            return Err("fail to set rate_limiter_auto_tuned".into());
+        }
+        Ok(())
+    }
+
     fn set_max_background_jobs(&self, max_background_jobs: i32) -> Result<(), Box<dyn Error>> {
         let opt = self.db.as_inner().get_db_options();
         if max_background_jobs < opt.get_max_background_jobs() {
@@ -1451,7 +1495,6 @@ impl DBConfigManger {
             | (DBType::Kv, CF_WRITE)
             | (DBType::Kv, CF_LOCK)
             | (DBType::Kv, CF_RAFT)
-            | (DBType::Kv, CF_VER_DEFAULT)
             | (DBType::Raft, CF_DEFAULT) => Ok(()),
             _ => Err(format!("invalid cf {:?} for db {:?}", cf, self.db_type).into()),
         }
@@ -1469,7 +1512,7 @@ impl ConfigManager for DBConfigManger {
                 let cf_name = &cf_name[..(cf_name.len() - 2)];
                 if let Some(v) = cf_change.remove("block_cache_size") {
                     // currently we can't modify block_cache_size via set_options_cf
-                    self.set_block_cache_size(&cf_name, v.into())?;
+                    self.set_block_cache_size(cf_name, v.into())?;
                 }
                 if let Some(ConfigValue::Module(titan_change)) = cf_change.remove("titan") {
                     for (name, value) in titan_change {
@@ -1479,7 +1522,7 @@ impl ConfigManager for DBConfigManger {
                 if !cf_change.is_empty() {
                     let cf_change = config_value_to_string(cf_change.into_iter().collect());
                     let cf_change_slice = config_to_slice(&cf_change);
-                    self.set_cf_config(&cf_name, &cf_change_slice)?;
+                    self.set_cf_config(cf_name, &cf_change_slice)?;
                 }
             }
         }
@@ -1490,6 +1533,14 @@ impl ConfigManager for DBConfigManger {
         {
             let rate_bytes_per_sec: ReadableSize = rate_bytes_config.1.into();
             self.set_rate_bytes_per_sec(rate_bytes_per_sec.0 as i64)?;
+        }
+
+        if let Some(rate_bytes_config) = change
+            .drain_filter(|(name, _)| name == "rate_limiter_auto_tuned")
+            .next()
+        {
+            let rate_limiter_auto_tuned: bool = rate_bytes_config.1.into();
+            self.set_rate_limiter_auto_tuned(rate_limiter_auto_tuned)?;
         }
 
         if let Some(background_jobs_config) = change
@@ -1651,7 +1702,7 @@ const UNIFIED_READPOOL_MIN_CONCURRENCY: usize = 4;
 // FIXME: Use macros to generate it if yatp is used elsewhere besides readpool.
 impl Default for UnifiedReadPoolConfig {
     fn default() -> UnifiedReadPoolConfig {
-        let cpu_num = SysQuota::new().cpu_cores_quota();
+        let cpu_num = SysQuota::cpu_cores_quota();
         let mut concurrency = (cpu_num * 0.8) as usize;
         concurrency = cmp::max(UNIFIED_READPOOL_MIN_CONCURRENCY, concurrency);
         Self {
@@ -1722,7 +1773,7 @@ macro_rules! readpool_config {
 
         impl $struct_name {
             /// Builds configurations for low, normal and high priority pools.
-            pub fn to_yatp_pool_configs(&self) -> Vec<yatp_pool::Config> {
+            pub fn to_yatp_pool_configs(self) -> Vec<yatp_pool::Config> {
                 vec![
                     yatp_pool::Config {
                         workers: self.low_concurrency,
@@ -1907,7 +1958,7 @@ readpool_config!(StorageReadPoolConfig, storage_read_pool_test, "storage");
 
 impl Default for StorageReadPoolConfig {
     fn default() -> Self {
-        let cpu_num = SysQuota::new().cpu_cores_quota();
+        let cpu_num = SysQuota::cpu_cores_quota();
         let mut concurrency = (cpu_num * 0.5) as usize;
         concurrency = cmp::max(DEFAULT_STORAGE_READPOOL_MIN_CONCURRENCY, concurrency);
         concurrency = cmp::min(DEFAULT_STORAGE_READPOOL_MAX_CONCURRENCY, concurrency);
@@ -1934,7 +1985,7 @@ readpool_config!(
 
 impl Default for CoprReadPoolConfig {
     fn default() -> Self {
-        let cpu_num = SysQuota::new().cpu_cores_quota();
+        let cpu_num = SysQuota::cpu_cores_quota();
         let mut concurrency = (cpu_num * 0.8) as usize;
         concurrency = cmp::max(DEFAULT_COPROCESSOR_READPOOL_MIN_CONCURRENCY, concurrency);
         Self {
@@ -2127,12 +2178,13 @@ mod readpool_tests {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Configuration)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct BackupConfig {
     pub num_threads: usize,
     pub batch_size: usize,
+    pub sst_max_size: ReadableSize,
 }
 
 impl BackupConfig {
@@ -2149,119 +2201,218 @@ impl BackupConfig {
 
 impl Default for BackupConfig {
     fn default() -> Self {
-        let cpu_num = SysQuota::new().cpu_cores_quota();
+        let default_coprocessor = CopConfig::default();
+        let cpu_num = SysQuota::cpu_cores_quota();
         Self {
             // use at most 75% of vCPU by default
             num_threads: (cpu_num * 0.75).clamp(1.0, 32.0) as usize,
             batch_size: 8,
+            sst_max_size: default_coprocessor.region_max_size,
         }
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Configuration)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct CdcConfig {
     pub min_ts_interval: ReadableDuration,
-    pub old_value_cache_size: usize,
     pub hibernate_regions_compatible: bool,
+    // TODO(hi-rustin): Consider resizing the thread pool based on `incremental_scan_threads`.
+    #[online_config(skip)]
+    pub incremental_scan_threads: usize,
+    pub incremental_scan_concurrency: usize,
+    pub incremental_scan_speed_limit: ReadableSize,
+    pub sink_memory_quota: ReadableSize,
+    pub old_value_cache_memory_quota: ReadableSize,
+    // Deprecated! preserved for compatibility check.
+    #[online_config(skip)]
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
+    pub old_value_cache_size: usize,
 }
 
 impl Default for CdcConfig {
     fn default() -> Self {
         Self {
             min_ts_interval: ReadableDuration::secs(1),
-            old_value_cache_size: 1024,
             hibernate_regions_compatible: true,
+            // 4 threads for incremental scan.
+            incremental_scan_threads: 4,
+            // At most 6 concurrent running tasks.
+            incremental_scan_concurrency: 6,
+            // TiCDC requires a SSD, the typical write speed of SSD
+            // is more than 500MB/s, so 128MB/s is enough.
+            incremental_scan_speed_limit: ReadableSize::mb(128),
+            // 512MB memory for CDC sink.
+            sink_memory_quota: ReadableSize::mb(512),
+            // 512MB memory for old value cache.
+            old_value_cache_memory_quota: ReadableSize::mb(512),
+            // Deprecated! preserved for compatibility check.
+            old_value_cache_size: 0,
         }
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Configuration)]
+impl CdcConfig {
+    pub fn validate(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.min_ts_interval.is_zero() {
+            return Err("cdc.min-ts-interval can't be 0".into());
+        }
+        if self.incremental_scan_threads == 0 {
+            return Err("cdc.incremental-scan-threads can't be 0".into());
+        }
+        if self.incremental_scan_concurrency < self.incremental_scan_threads {
+            return Err(
+                "cdc.incremental-scan-concurrency must be larger than cdc.incremental-scan-threads"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+pub struct ResolvedTsConfig {
+    #[online_config(skip)]
+    pub enable: bool,
+    pub advance_ts_interval: ReadableDuration,
+    #[online_config(skip)]
+    pub scan_lock_pool_size: usize,
+}
+
+impl ResolvedTsConfig {
+    fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if self.advance_ts_interval.is_zero() {
+            return Err("resolved-ts.advance-ts-interval can't be zero".into());
+        }
+        if self.scan_lock_pool_size == 0 {
+            return Err("resolved-ts.scan-lock-pool-size can't be zero".into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for ResolvedTsConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            advance_ts_interval: ReadableDuration::secs(1),
+            scan_lock_pool_size: 2,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct TiKvConfig {
     #[doc(hidden)]
     #[serde(skip_serializing)]
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub cfg_path: String,
 
-    #[config(skip)]
+    #[online_config(skip)]
     #[serde(with = "log_level_serde")]
     pub log_level: slog::Level,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub log_file: String,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub log_format: LogFormat,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub slow_log_file: String,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub slow_log_threshold: ReadableDuration,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub log_rotation_timespan: ReadableDuration,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub log_rotation_size: ReadableSize,
 
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub panic_when_unexpected_key_or_data: bool,
 
-    #[config(skip)]
+    #[online_config(skip)]
+    pub enable_io_snoop: bool,
+
+    #[online_config(skip)]
+    pub abort_on_panic: bool,
+
+    #[doc(hidden)]
+    #[online_config(skip)]
+    pub memory_usage_limit: OptionReadableSize,
+
+    #[doc(hidden)]
+    #[online_config(skip)]
+    pub memory_usage_high_water: f64,
+
+    #[online_config(skip)]
     pub readpool: ReadPoolConfig,
 
-    #[config(skip)]
+    #[online_config(submodule)]
     pub server: ServerConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub storage: StorageConfig,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub pd: PdConfig,
 
-    #[config(hidden)]
+    #[online_config(hidden)]
     pub metric: MetricConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     #[serde(rename = "raftstore")]
     pub raft_store: RaftstoreConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub coprocessor: CopConfig,
 
-    #[config(submodule)]
+    #[online_config(skip)]
+    pub coprocessor_v2: CoprocessorV2Config,
+
+    #[online_config(submodule)]
     pub rocksdb: DbConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub raftdb: RaftDbConfig,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub raft_engine: RaftEngineConfig,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub security: SecurityConfig,
 
-    #[config(skip)]
+    #[online_config(skip)]
     pub import: ImportConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub backup: BackupConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub pessimistic_txn: PessimisticTxnConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub gc: GcConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub split: SplitConfig,
 
-    #[config(submodule)]
+    #[online_config(submodule)]
     pub cdc: CdcConfig,
+
+    #[online_config(submodule)]
+    pub resolved_ts: ResolvedTsConfig,
+
+    #[online_config(submodule)]
+    pub resource_metering: ResourceMeteringConfig,
 }
 
 impl Default for TiKvConfig {
@@ -2276,11 +2427,16 @@ impl Default for TiKvConfig {
             log_rotation_timespan: ReadableDuration::hours(24),
             log_rotation_size: ReadableSize::mb(300),
             panic_when_unexpected_key_or_data: false,
+            enable_io_snoop: true,
+            abort_on_panic: false,
+            memory_usage_limit: OptionReadableSize(None),
+            memory_usage_high_water: 0.9,
             readpool: ReadPoolConfig::default(),
             server: ServerConfig::default(),
             metric: MetricConfig::default(),
             raft_store: RaftstoreConfig::default(),
             coprocessor: CopConfig::default(),
+            coprocessor_v2: CoprocessorV2Config::default(),
             pd: PdConfig::default(),
             rocksdb: DbConfig::default(),
             raftdb: RaftDbConfig::default(),
@@ -2293,6 +2449,8 @@ impl Default for TiKvConfig {
             gc: GcConfig::default(),
             split: SplitConfig::default(),
             cdc: CdcConfig::default(),
+            resolved_ts: ResolvedTsConfig::default(),
+            resource_metering: ResourceMeteringConfig::default(),
         }
     }
 }
@@ -2302,8 +2460,6 @@ impl TiKvConfig {
     pub fn validate(&mut self) -> Result<(), Box<dyn Error>> {
         self.readpool.validate()?;
         self.storage.validate()?;
-
-        self.raft_store.region_split_check_diff = self.coprocessor.region_split_size / 16;
 
         if self.cfg_path.is_empty() {
             self.cfg_path = Path::new(&self.storage.data_dir)
@@ -2316,50 +2472,52 @@ impl TiKvConfig {
         let default_raftdb_path = config::canonicalize_sub_path(&self.storage.data_dir, "raft")?;
         if self.raft_store.raftdb_path.is_empty() {
             self.raft_store.raftdb_path = default_raftdb_path;
-        } else if self.raft_store.raftdb_path != default_raftdb_path
-            && RocksEngine::exists(&self.raft_store.raftdb_path)
-        {
+        } else {
             self.raft_store.raftdb_path = config::canonicalize_path(&self.raft_store.raftdb_path)?;
         }
 
         let default_er_path = config::canonicalize_sub_path(&self.storage.data_dir, "raft-engine")?;
         if self.raft_engine.config.dir.is_empty() {
             self.raft_engine.config.dir = default_er_path;
-        } else if self.raft_engine.config.dir != default_er_path
-            && RaftLogEngine::exists(&self.raft_engine.config.dir)
-        {
+        } else {
             self.raft_engine.config.dir = config::canonicalize_path(&self.raft_engine.config.dir)?;
+        }
+        if self.raft_engine.config.dir == self.raft_store.raftdb_path {
+            return Err("raft_engine.config.dir can't be same as raft_store.raftdb_path".into());
         }
 
         let kv_db_path =
             config::canonicalize_sub_path(&self.storage.data_dir, DEFAULT_ROCKSDB_SUB_DIR)?;
 
         if kv_db_path == self.raft_store.raftdb_path {
-            return Err("raft_store.raftdb_path can not same with storage.data_dir/db".into());
+            return Err("raft_store.raftdb_path can't be same as storage.data_dir/db".into());
         }
-        if !self.raft_engine.enable {
-            if RocksEngine::exists(&kv_db_path)
-                && !RocksEngine::exists(&self.raft_store.raftdb_path)
-            {
-                return Err("default rocksdb exist, but raftdb not exist".into());
-            }
-            if !RocksEngine::exists(&kv_db_path)
-                && RocksEngine::exists(&self.raft_store.raftdb_path)
-            {
-                return Err("default rocksdb not exist, but raftdb exist".into());
-            }
+
+        let kv_db_wal_path = if self.rocksdb.wal_dir.is_empty() {
+            config::canonicalize_path(&kv_db_path)?
         } else {
-            if RocksEngine::exists(&kv_db_path)
-                && !RaftLogEngine::exists(&self.raft_engine.config.dir)
-                && !RocksEngine::exists(&self.raft_store.raftdb_path)
-            {
-                return Err("default rocksdb exist, but raftdb and raft engine not exist".into());
-            }
-            if !RocksEngine::exists(&kv_db_path)
-                && RaftLogEngine::exists(&self.raft_engine.config.dir)
-            {
-                return Err("default rocksdb not exist, but raft engine exist".into());
-            }
+            config::canonicalize_path(&self.rocksdb.wal_dir)?
+        };
+        let raft_db_wal_path = if self.raftdb.wal_dir.is_empty() {
+            config::canonicalize_path(&self.raft_store.raftdb_path)?
+        } else {
+            config::canonicalize_path(&self.raftdb.wal_dir)?
+        };
+        if kv_db_wal_path == raft_db_wal_path {
+            return Err("raftdb.wal_dir can't be same as rocksdb.wal_dir".into());
+        }
+
+        if RocksEngine::exists(&kv_db_path)
+            && !RocksEngine::exists(&self.raft_store.raftdb_path)
+            && !RaftLogEngine::exists(&self.raft_engine.config.dir)
+        {
+            return Err("default rocksdb exists, but raftdb and raft engine doesn't exist".into());
+        }
+        if !RocksEngine::exists(&kv_db_path)
+            && (RocksEngine::exists(&self.raft_store.raftdb_path)
+                || RaftLogEngine::exists(&self.raft_engine.config.dir))
+        {
+            return Err("default rocksdb doesn't exist, but raftdb or raft engine exists".into());
         }
 
         // Check blob file dir is empty when titan is disabled
@@ -2394,8 +2552,10 @@ impl TiKvConfig {
         }
 
         if self.raft_store.hibernate_regions && !self.cdc.hibernate_regions_compatible {
-            warn!("raftstore.hibernate-regions was enabled but cdc.hibernate-regions-compatible \
-                was disabled, hibernate regions may be broken up if you want to deploy a cdc cluster");
+            warn!(
+                "raftstore.hibernate-regions was enabled but cdc.hibernate-regions-compatible \
+                was disabled, hibernate regions may be broken up if you want to deploy a cdc cluster"
+            );
         }
 
         self.rocksdb.validate()?;
@@ -2408,8 +2568,74 @@ impl TiKvConfig {
         self.security.validate()?;
         self.import.validate()?;
         self.backup.validate()?;
+        self.cdc.validate()?;
         self.pessimistic_txn.validate()?;
         self.gc.validate()?;
+        self.resolved_ts.validate()?;
+        self.resource_metering.validate()?;
+
+        if self.storage.flow_control.enable {
+            // using raftdb write stall to control memtables as a safety net
+            self.raftdb.defaultcf.level0_slowdown_writes_trigger = 10000;
+            self.raftdb.defaultcf.level0_stop_writes_trigger = 10000;
+            self.raftdb.defaultcf.soft_pending_compaction_bytes_limit = ReadableSize(0);
+            self.raftdb.defaultcf.hard_pending_compaction_bytes_limit = ReadableSize(0);
+
+            self.rocksdb.defaultcf.disable_write_stall = true;
+            self.rocksdb.writecf.disable_write_stall = true;
+            self.rocksdb.lockcf.disable_write_stall = true;
+            self.rocksdb.raftcf.disable_write_stall = true;
+        }
+
+        if let Some(memory_usage_limit) = self.memory_usage_limit.0 {
+            let total = SysQuota::memory_limit_in_bytes();
+            if memory_usage_limit.0 > total {
+                // Explicitly exceeds system memory capacity is not allowed.
+                return Err(format!(
+                    "memory_usage_limit is greater than system memory capacity {}",
+                    total
+                )
+                .into());
+            }
+        } else {
+            // Adjust `memory_usage_limit` if necessary.
+            if self.storage.block_cache.shared {
+                if let Some(cap) = self.storage.block_cache.capacity.0 {
+                    let limit = (cap.0 as f64 / BLOCK_CACHE_RATE * MEMORY_USAGE_LIMIT_RATE) as u64;
+                    self.memory_usage_limit.0 = Some(ReadableSize(limit));
+                } else {
+                    self.memory_usage_limit =
+                        OptionReadableSize(Some(Self::suggested_memory_usage_limit()));
+                }
+            } else {
+                let cap = self.rocksdb.defaultcf.block_cache_size.0
+                    + self.rocksdb.writecf.block_cache_size.0
+                    + self.rocksdb.lockcf.block_cache_size.0
+                    + self.raftdb.defaultcf.block_cache_size.0;
+                let limit = (cap as f64 / BLOCK_CACHE_RATE * MEMORY_USAGE_LIMIT_RATE) as u64;
+                self.memory_usage_limit.0 = Some(ReadableSize(limit));
+            }
+        }
+
+        let mut limit = self.memory_usage_limit.0.unwrap();
+        let total = ReadableSize(SysQuota::memory_limit_in_bytes());
+        if limit.0 > total.0 {
+            warn!(
+                "memory_usage_limit:{:?} > total:{:?}, fallback to total",
+                limit, total,
+            );
+            self.memory_usage_limit.0 = Some(total);
+            limit = total;
+        }
+
+        let default = Self::suggested_memory_usage_limit();
+        if limit.0 > default.0 {
+            warn!(
+                "memory_usage_limit:{:?} > recommanded:{:?}, maybe page cache isn't enough",
+                limit, default,
+            );
+        }
+
         Ok(())
     }
 
@@ -2489,6 +2715,13 @@ impl TiKvConfig {
                 "raft_store.clean_stale_peer_delay",
             );
         }
+        if self.rocksdb.auto_tuned.is_some() {
+            warn!(
+                "deprecated configuration, {} is no longer used and ignored, please use {}.",
+                "rocksdb.auto_tuned", "rocksdb.rate_limiter_auto_tuned",
+            );
+            self.rocksdb.auto_tuned = None;
+        }
         // When shared block cache is enabled, if its capacity is set, it overrides individual
         // block cache sizes. Otherwise use the sum of block cache size of all column families
         // as the shared cache size.
@@ -2500,6 +2733,19 @@ impl TiKvConfig {
                     + self.rocksdb.lockcf.block_cache_size.0
                     + self.raftdb.defaultcf.block_cache_size.0,
             });
+        }
+        if self.backup.sst_max_size.0 < default_coprocessor.region_max_size.0 / 10 {
+            warn!(
+                "override backup.sst-max-size with min sst-max-size, {:?}",
+                default_coprocessor.region_max_size / 10
+            );
+            self.backup.sst_max_size = default_coprocessor.region_max_size / 10;
+        } else if self.backup.sst_max_size.0 > default_coprocessor.region_max_size.0 * 2 {
+            warn!(
+                "override backup.sst-max-size with max sst-max-size, {:?}",
+                default_coprocessor.region_max_size * 2
+            );
+            self.backup.sst_max_size = default_coprocessor.region_max_size * 2;
         }
 
         self.readpool.adjust_use_unified_pool();
@@ -2539,16 +2785,24 @@ impl TiKvConfig {
             }
         }
 
-        if last_cfg.raft_store.raftdb_path != self.raft_store.raftdb_path {
+        if last_cfg.raft_store.raftdb_path != self.raft_store.raftdb_path
+            && !last_cfg.raft_engine.enable
+        {
             return Err(format!(
-                "raft dir have been changed, former raft dir is '{}', \
-                 current raft dir is '{}', please check if it is expected.",
+                "raft db dir have been changed, former is '{}', \
+                 current is '{}', please check if it is expected.",
                 last_cfg.raft_store.raftdb_path, self.raft_store.raftdb_path
             ));
         }
-        if last_cfg.raft_engine.enable
-            && self.raft_engine.enable
-            && last_cfg.raft_engine.config.dir != self.raft_engine.config.dir
+        if last_cfg.raftdb.wal_dir != self.raftdb.wal_dir && !last_cfg.raft_engine.enable {
+            return Err(format!(
+                "raft db wal dir have been changed, former is '{}', \
+                 current is '{}', please check if it is expected.",
+                last_cfg.raftdb.wal_dir, self.raftdb.wal_dir
+            ));
+        }
+        if last_cfg.raft_engine.config.dir != self.raft_engine.config.dir
+            && last_cfg.raft_engine.enable
         {
             return Err(format!(
                 "raft engine dir have been changed, former is '{}', \
@@ -2556,8 +2810,10 @@ impl TiKvConfig {
                 last_cfg.raft_engine.config.dir, self.raft_engine.config.dir
             ));
         }
-        if last_cfg.raft_engine.enable && !self.raft_engine.enable {
-            return Err("raft engine can't be disabled after switched on.".to_owned());
+        if last_cfg.storage.enable_ttl && !self.storage.enable_ttl {
+            return Err("can't disable ttl on a ttl instance".to_owned());
+        } else if !last_cfg.storage.enable_ttl && self.storage.enable_ttl {
+            return Err("can't enable ttl on a non-ttl instance".to_owned());
         }
 
         Ok(())
@@ -2605,6 +2861,12 @@ impl TiKvConfig {
         cfg.storage.data_dir = tmp.path().display().to_string();
         cfg.cfg_path = tmp.path().join(LAST_CONFIG_FILE).display().to_string();
         Ok((cfg, tmp))
+    }
+
+    fn suggested_memory_usage_limit() -> ReadableSize {
+        let total = SysQuota::memory_limit_in_bytes();
+        // Reserve some space for page cache. The
+        ReadableSize((total as f64 * MEMORY_USAGE_LIMIT_RATE) as u64)
     }
 }
 
@@ -2685,7 +2947,7 @@ pub fn write_config<P: AsRef<Path>>(path: P, content: &[u8]) -> CfgResult<()> {
                 "failed to get parent path of config file: {}",
                 path.as_ref().display()
             )
-            .into())
+            .into());
         }
     };
     {
@@ -2747,8 +3009,12 @@ fn to_config_change(change: HashMap<String, String>) -> CfgResult<ConfigChange> 
     }
     let mut res = HashMap::new();
     for (name, value) in change {
-        let fields: Vec<_> = name.as_str().split('.').collect();
-        let fields: Vec<_> = fields.into_iter().map(|s| s.to_owned()).rev().collect();
+        let fields: Vec<_> = name
+            .as_str()
+            .split('.')
+            .map(|s| s.to_owned())
+            .rev()
+            .collect();
         helper(fields, &mut res, &TIKVCONFIG_TYPED, value)?;
     }
     Ok(res)
@@ -2769,6 +3035,7 @@ fn to_change_value(v: &str, typed: &ConfigValue) -> CfgResult<ConfigValue> {
         ConfigValue::Usize(_) => ConfigValue::from(v.parse::<usize>()?),
         ConfigValue::Bool(_) => ConfigValue::from(v.parse::<bool>()?),
         ConfigValue::BlobRunMode(_) => ConfigValue::from(v.parse::<BlobRunMode>()?),
+        ConfigValue::IOPriority(_) => ConfigValue::from(v.parse::<IOPriority>()?),
         ConfigValue::String(_) => ConfigValue::String(v.to_owned()),
         _ => unreachable!(),
     };
@@ -2797,7 +3064,8 @@ fn to_toml_encode(change: HashMap<String, String>) -> CfgResult<HashMap<String, 
                         | ConfigValue::Size(_)
                         | ConfigValue::OptionSize(_)
                         | ConfigValue::String(_)
-                        | ConfigValue::BlobRunMode(_) => Ok(true),
+                        | ConfigValue::BlobRunMode(_)
+                        | ConfigValue::IOPriority(_) => Ok(true),
                         _ => Ok(false),
                     }
                 }
@@ -2805,11 +3073,15 @@ fn to_toml_encode(change: HashMap<String, String>) -> CfgResult<HashMap<String, 
         } else {
             Err("failed to get field".to_owned().into())
         }
-    };
+    }
     let mut dst = HashMap::new();
     for (name, value) in change {
-        let fields: Vec<_> = name.as_str().split('.').collect();
-        let fields: Vec<_> = fields.into_iter().map(|s| s.to_owned()).rev().collect();
+        let fields: Vec<_> = name
+            .as_str()
+            .split('.')
+            .map(|s| s.to_owned())
+            .rev()
+            .collect();
         if helper(fields, &TIKVCONFIG_TYPED)? {
             dst.insert(name.replace("_", "-"), format!("\"{}\"", value));
         } else {
@@ -2838,6 +3110,9 @@ pub enum Module {
     PessimisticTxn,
     Gc,
     Split,
+    CDC,
+    ResolvedTs,
+    ResourceMetering,
     Unknown(String),
 }
 
@@ -2860,6 +3135,9 @@ impl From<&str> for Module {
             "backup" => Module::Backup,
             "pessimistic_txn" => Module::PessimisticTxn,
             "gc" => Module::Gc,
+            "cdc" => Module::CDC,
+            "resolved_ts" => Module::ResolvedTs,
+            "resource_metering" => Module::ResourceMetering,
             n => Module::Unknown(n.to_owned()),
         }
     }
@@ -2954,16 +3232,21 @@ impl ConfigController {
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
     use tempfile::Builder;
 
     use super::*;
+    use crate::server::ttl::TTLCheckerTask;
     use crate::storage::config::StorageConfigManger;
+    use crate::storage::txn::flow_controller::FlowController;
     use engine_rocks::raw_util::new_engine_opt;
     use engine_traits::DBOptions as DBOptionsTrait;
     use raft_log_engine::RecoveryMode;
     use raftstore::coprocessor::region_info_accessor::MockRegionInfoProvider;
     use slog::Level;
     use std::sync::Arc;
+    use std::time::Duration;
+    use tikv_util::worker::{dummy_scheduler, ReceiverWrapper};
 
     #[test]
     fn test_check_critical_cfg_with() {
@@ -3145,6 +3428,7 @@ mod tests {
         incoming.coprocessor.region_split_keys = 10000;
         incoming.gc.max_write_bytes_per_sec = ReadableSize::mb(100);
         incoming.rocksdb.defaultcf.block_cache_size = ReadableSize::mb(500);
+        incoming.storage.io_rate_limit.import_priority = file_system::IOPriority::High;
         let diff = old.diff(&incoming);
         let mut change = HashMap::new();
         change.insert(
@@ -3155,6 +3439,10 @@ mod tests {
         change.insert(
             "rocksdb.defaultcf.block-cache-size".to_owned(),
             "500MB".to_owned(),
+        );
+        change.insert(
+            "storage.io-rate-limit.import-priority".to_owned(),
+            "high".to_owned(),
         );
         let res = to_config_change(change).unwrap();
         assert_eq!(diff, res);
@@ -3224,15 +3512,31 @@ mod tests {
         );
     }
 
-    fn new_engines(cfg: TiKvConfig) -> (RocksEngine, ConfigController) {
+    fn new_engines(
+        cfg: TiKvConfig,
+    ) -> (
+        RocksEngine,
+        ConfigController,
+        ReceiverWrapper<TTLCheckerTask>,
+        Arc<FlowController>,
+    ) {
         let engine = RocksEngine::from_db(Arc::new(
             new_engine_opt(
                 &cfg.storage.data_dir,
                 cfg.rocksdb.build_opt(),
-                cfg.rocksdb
-                    .build_cf_opts(&cfg.storage.block_cache.build_shared_cache(), None),
+                cfg.rocksdb.build_cf_opts(
+                    &cfg.storage.block_cache.build_shared_cache(),
+                    None,
+                    cfg.storage.enable_ttl,
+                ),
             )
             .unwrap(),
+        ));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let flow_controller = Arc::new(FlowController::new(
+            &cfg.storage.flow_control,
+            engine.clone(),
+            rx,
         ));
 
         let (shared, cfg_controller) = (cfg.storage.block_cache.shared, ConfigController::new(cfg));
@@ -3240,11 +3544,125 @@ mod tests {
             Module::Rocksdb,
             Box::new(DBConfigManger::new(engine.clone(), DBType::Kv, shared)),
         );
+        let (scheduler, receiver) = dummy_scheduler();
         cfg_controller.register(
             Module::Storage,
-            Box::new(StorageConfigManger::new(engine.clone(), shared)),
+            Box::new(StorageConfigManger::new(
+                engine.clone(),
+                shared,
+                scheduler,
+                flow_controller.clone(),
+            )),
         );
-        (engine, cfg_controller)
+        (engine, cfg_controller, receiver, flow_controller)
+    }
+
+    #[test]
+    fn test_change_flow_control() {
+        let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+        cfg.validate().unwrap();
+        let (db, cfg_controller, _, flow_controller) = new_engines(cfg);
+
+        assert_eq!(
+            db.get_options_cf(CF_DEFAULT)
+                .unwrap()
+                .get_disable_write_stall(),
+            true
+        );
+        assert_eq!(flow_controller.enabled(), true);
+        cfg_controller
+            .update_config("storage.flow-control.enable", "false")
+            .unwrap();
+        assert_eq!(
+            db.get_options_cf(CF_DEFAULT)
+                .unwrap()
+                .get_disable_write_stall(),
+            false
+        );
+        assert_eq!(flow_controller.enabled(), false);
+        cfg_controller
+            .update_config("storage.flow-control.enable", "true")
+            .unwrap();
+        assert_eq!(
+            db.get_options_cf(CF_DEFAULT)
+                .unwrap()
+                .get_disable_write_stall(),
+            true
+        );
+        assert_eq!(flow_controller.enabled(), true);
+    }
+
+    #[test]
+    fn test_change_resolved_ts_config() {
+        use crossbeam::channel;
+
+        pub struct TestConfigManager(channel::Sender<ConfigChange>);
+        impl ConfigManager for TestConfigManager {
+            fn dispatch(&mut self, change: ConfigChange) -> online_config::Result<()> {
+                self.0.send(change).unwrap();
+                Ok(())
+            }
+        }
+
+        let (cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+        let cfg_controller = ConfigController::new(cfg);
+        let (tx, rx) = channel::unbounded();
+        cfg_controller.register(Module::ResolvedTs, Box::new(TestConfigManager(tx)));
+
+        // Return error if try to update not support config or unknow config
+        assert!(
+            cfg_controller
+                .update_config("resolved-ts.enable", "false")
+                .is_err()
+        );
+        assert!(
+            cfg_controller
+                .update_config("resolved-ts.scan-lock-pool-size", "10")
+                .is_err()
+        );
+        assert!(
+            cfg_controller
+                .update_config("resolved-ts.xxx", "false")
+                .is_err()
+        );
+
+        let mut resolved_ts_cfg = cfg_controller.get_current().resolved_ts;
+        // Default value
+        assert_eq!(
+            resolved_ts_cfg.advance_ts_interval,
+            ReadableDuration::secs(1)
+        );
+
+        // Update `advance-ts-interval` to 100ms
+        cfg_controller
+            .update_config("resolved-ts.advance-ts-interval", "100ms")
+            .unwrap();
+        resolved_ts_cfg.update(rx.recv().unwrap());
+        assert_eq!(
+            resolved_ts_cfg.advance_ts_interval,
+            ReadableDuration::millis(100)
+        );
+
+        // Return error if try to update `advance-ts-interval` to an invalid value
+        assert!(
+            cfg_controller
+                .update_config("resolved-ts.advance-ts-interval", "0m")
+                .is_err()
+        );
+        assert_eq!(
+            resolved_ts_cfg.advance_ts_interval,
+            ReadableDuration::millis(100)
+        );
+
+        // Update `advance-ts-interval` to 3s
+        cfg_controller
+            .update_config("resolved-ts.advance-ts-interval", "3s")
+            .unwrap();
+        resolved_ts_cfg.update(rx.recv().unwrap());
+        assert_eq!(
+            resolved_ts_cfg.advance_ts_interval,
+            ReadableDuration::secs(3)
+        );
     }
 
     #[test]
@@ -3256,10 +3674,10 @@ mod tests {
         cfg.rocksdb.defaultcf.target_file_size_base = ReadableSize::mb(64);
         cfg.rocksdb.defaultcf.block_cache_size = ReadableSize::mb(8);
         cfg.rocksdb.rate_bytes_per_sec = ReadableSize::mb(64);
-        cfg.rocksdb.auto_tuned = false;
+        cfg.rocksdb.rate_limiter_auto_tuned = false;
         cfg.storage.block_cache.shared = false;
         cfg.validate().unwrap();
-        let (db, cfg_controller) = new_engines(cfg);
+        let (db, cfg_controller, ..) = new_engines(cfg);
 
         // update max_background_jobs
         assert_eq!(db.get_db_options().get_max_background_jobs(), 4);
@@ -3319,9 +3737,34 @@ mod tests {
 
         // Can not update block cache through storage module
         // when shared block cache is disabled
-        assert!(cfg_controller
-            .update_config("storage.block-cache.capacity", "512MB")
-            .is_err());
+        assert!(
+            cfg_controller
+                .update_config("storage.block-cache.capacity", "512MB")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_change_rate_limiter_auto_tuned() {
+        let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+        // vanilla limiter does not support dynamically changing auto-tuned mode.
+        cfg.rocksdb.rate_limiter_auto_tuned = true;
+        cfg.validate().unwrap();
+        let (db, cfg_controller, ..) = new_engines(cfg);
+
+        // update rate_limiter_auto_tuned
+        assert_eq!(
+            db.get_db_options().get_rate_limiter_auto_tuned().unwrap(),
+            true
+        );
+
+        cfg_controller
+            .update_config("rocksdb.rate_limiter_auto_tuned", "false")
+            .unwrap();
+        assert_eq!(
+            db.get_db_options().get_rate_limiter_auto_tuned().unwrap(),
+            false
+        );
     }
 
     #[test]
@@ -3329,12 +3772,14 @@ mod tests {
         let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
         cfg.storage.block_cache.shared = true;
         cfg.validate().unwrap();
-        let (db, cfg_controller) = new_engines(cfg);
+        let (db, cfg_controller, ..) = new_engines(cfg);
 
         // Can not update shared block cache through rocksdb module
-        assert!(cfg_controller
-            .update_config("rocksdb.defaultcf.block-cache-size", "256MB")
-            .is_err());
+        assert!(
+            cfg_controller
+                .update_config("rocksdb.defaultcf.block-cache-size", "256MB")
+                .is_err()
+        );
 
         cfg_controller
             .update_config("storage.block-cache.capacity", "256MB")
@@ -3365,6 +3810,23 @@ mod tests {
         assert_eq!(diff.len(), 1);
         assert_eq!(diff[0].0.as_str(), "blob_run_mode");
         assert_eq!(diff[0].1.as_str(), "kFallback");
+    }
+
+    #[test]
+    fn test_change_ttl_check_poll_interval() {
+        let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+        cfg.storage.block_cache.shared = true;
+        cfg.validate().unwrap();
+        let (_, cfg_controller, mut rx, _) = new_engines(cfg);
+
+        // Can not update shared block cache through rocksdb module
+        cfg_controller
+            .update_config("storage.ttl_check_poll_interval", "10s")
+            .unwrap();
+        match rx.recv() {
+            None => unreachable!(),
+            Some(TTLCheckerTask::UpdatePollInterval(d)) => assert_eq!(d, Duration::from_secs(10)),
+        }
     }
 
     #[test]
@@ -3482,9 +3944,11 @@ mod tests {
     fn test_compaction_guard() {
         // Test comopaction guard disabled.
         {
-            let mut config = DefaultCfConfig::default();
-            config.target_file_size_base = ReadableSize::mb(16);
-            config.enable_compaction_guard = false;
+            let config = DefaultCfConfig {
+                target_file_size_base: ReadableSize::mb(16),
+                enable_compaction_guard: false,
+                ..Default::default()
+            };
             let provider = Some(MockRegionInfoProvider::new(vec![]));
             let cf_opts = build_cf_opt!(config, CF_DEFAULT, None /*cache*/, provider);
             assert_eq!(
@@ -3494,9 +3958,11 @@ mod tests {
         }
         // Test compaction guard enabled but region info provider is missing.
         {
-            let mut config = DefaultCfConfig::default();
-            config.target_file_size_base = ReadableSize::mb(16);
-            config.enable_compaction_guard = true;
+            let config = DefaultCfConfig {
+                target_file_size_base: ReadableSize::mb(16),
+                enable_compaction_guard: true,
+                ..Default::default()
+            };
             let provider: Option<MockRegionInfoProvider> = None;
             let cf_opts = build_cf_opt!(config, CF_DEFAULT, None /*cache*/, provider);
             assert_eq!(
@@ -3506,11 +3972,13 @@ mod tests {
         }
         // Test compaction guard enabled.
         {
-            let mut config = DefaultCfConfig::default();
-            config.target_file_size_base = ReadableSize::mb(16);
-            config.enable_compaction_guard = true;
-            config.compaction_guard_min_output_file_size = ReadableSize::mb(4);
-            config.compaction_guard_max_output_file_size = ReadableSize::mb(64);
+            let config = DefaultCfConfig {
+                target_file_size_base: ReadableSize::mb(16),
+                enable_compaction_guard: true,
+                compaction_guard_min_output_file_size: ReadableSize::mb(4),
+                compaction_guard_max_output_file_size: ReadableSize::mb(64),
+                ..Default::default()
+            };
             let provider = Some(MockRegionInfoProvider::new(vec![]));
             let cf_opts = build_cf_opt!(config, CF_DEFAULT, None /*cache*/, provider);
             assert_eq!(
@@ -3518,5 +3986,273 @@ mod tests {
                 cf_opts.get_target_file_size_base()
             );
         }
+    }
+
+    #[test]
+    fn test_validate_tikv_config() {
+        let mut cfg = TiKvConfig::default();
+        let default_region_split_check_diff = cfg.raft_store.region_split_check_diff.0;
+        cfg.raft_store.region_split_check_diff.0 += 1;
+        assert!(cfg.validate().is_ok());
+        assert_eq!(
+            cfg.raft_store.region_split_check_diff.0,
+            default_region_split_check_diff + 1
+        );
+
+        // Test validating memory_usage_limit when it's greater than max.
+        cfg.memory_usage_limit.0 = Some(ReadableSize(SysQuota::memory_limit_in_bytes() * 2));
+        assert!(cfg.validate().is_err());
+
+        // Test memory_usage_limit is based on block cache size if it's not configured.
+        cfg.memory_usage_limit = OptionReadableSize(None);
+        cfg.storage.block_cache.capacity.0 = Some(ReadableSize(3 * GIB));
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.memory_usage_limit.0.unwrap(), ReadableSize(5 * GIB));
+
+        // Test memory_usage_limit will fallback to system memory capacity with huge block cache.
+        cfg.memory_usage_limit = OptionReadableSize(None);
+        let system = SysQuota::memory_limit_in_bytes();
+        cfg.storage.block_cache.capacity.0 = Some(ReadableSize(system * 3 / 4));
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.memory_usage_limit.0.unwrap(), ReadableSize(system));
+    }
+
+    #[test]
+    fn test_validate_tikv_wal_config() {
+        let tmp_path = tempfile::Builder::new().tempdir().unwrap().into_path();
+        macro_rules! tmp_path_string_generate {
+            ($base:expr, $($sub:expr),+) => {{
+                let mut path: ::std::path::PathBuf = $base.clone();
+                $(
+                    path.push($sub);
+                )*
+                String::from(path.to_str().unwrap())
+            }}
+        }
+
+        {
+            let mut cfg = TiKvConfig::default();
+            assert!(cfg.validate().is_ok());
+        }
+
+        {
+            let mut cfg = TiKvConfig::default();
+            cfg.storage.data_dir = tmp_path_string_generate!(tmp_path, "data");
+            cfg.raft_store.raftdb_path = tmp_path_string_generate!(tmp_path, "data", "db");
+            assert!(!cfg.validate().is_ok());
+        }
+
+        {
+            let mut cfg = TiKvConfig::default();
+            cfg.storage.data_dir = tmp_path_string_generate!(tmp_path, "data", "kvdb");
+            cfg.raft_store.raftdb_path =
+                tmp_path_string_generate!(tmp_path, "data", "raftdb", "db");
+            cfg.rocksdb.wal_dir = tmp_path_string_generate!(tmp_path, "data", "raftdb", "db");
+            assert!(!cfg.validate().is_ok());
+        }
+
+        {
+            let mut cfg = TiKvConfig::default();
+            cfg.storage.data_dir = tmp_path_string_generate!(tmp_path, "data", "kvdb");
+            cfg.raft_store.raftdb_path =
+                tmp_path_string_generate!(tmp_path, "data", "raftdb", "db");
+            cfg.raftdb.wal_dir = tmp_path_string_generate!(tmp_path, "data", "kvdb", "db");
+            assert!(!cfg.validate().is_ok());
+        }
+
+        {
+            let mut cfg = TiKvConfig::default();
+            cfg.rocksdb.wal_dir = tmp_path_string_generate!(tmp_path, "data", "wal");
+            cfg.raftdb.wal_dir = tmp_path_string_generate!(tmp_path, "data", "wal");
+            assert!(!cfg.validate().is_ok());
+        }
+
+        {
+            let mut cfg = TiKvConfig::default();
+            cfg.storage.data_dir = tmp_path_string_generate!(tmp_path, "data", "kvdb");
+            cfg.raft_store.raftdb_path =
+                tmp_path_string_generate!(tmp_path, "data", "raftdb", "db");
+            cfg.rocksdb.wal_dir = tmp_path_string_generate!(tmp_path, "data", "kvdb", "db");
+            cfg.raftdb.wal_dir = tmp_path_string_generate!(tmp_path, "data", "raftdb", "db");
+            assert!(cfg.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_background_job_limits() {
+        assert_eq!(
+            get_background_job_limits_impl(1 /*cpu_num*/, &KVDB_DEFAULT_BACKGROUND_JOB_LIMITS),
+            BackgroundJobLimits {
+                max_background_jobs: 2,
+                max_background_flushes: 1,
+                max_sub_compactions: 1,
+                max_titan_background_gc: 1,
+            }
+        );
+        assert_eq!(
+            get_background_job_limits_impl(2 /*cpu_num*/, &KVDB_DEFAULT_BACKGROUND_JOB_LIMITS),
+            BackgroundJobLimits {
+                max_background_jobs: 2,
+                max_background_flushes: 1,
+                max_sub_compactions: 1,
+                max_titan_background_gc: 2,
+            }
+        );
+        assert_eq!(
+            get_background_job_limits_impl(4 /*cpu_num*/, &KVDB_DEFAULT_BACKGROUND_JOB_LIMITS),
+            BackgroundJobLimits {
+                max_background_jobs: 4,
+                max_background_flushes: 2,
+                max_sub_compactions: 1,
+                max_titan_background_gc: 4,
+            }
+        );
+        assert_eq!(
+            get_background_job_limits_impl(8 /*cpu_num*/, &KVDB_DEFAULT_BACKGROUND_JOB_LIMITS),
+            BackgroundJobLimits {
+                max_background_jobs: 8,
+                max_background_flushes: 3,
+                max_sub_compactions: 3,
+                max_titan_background_gc: 4,
+            }
+        );
+        assert_eq!(
+            get_background_job_limits_impl(
+                16, /*cpu_num*/
+                &KVDB_DEFAULT_BACKGROUND_JOB_LIMITS
+            ),
+            BackgroundJobLimits {
+                max_background_jobs: 10,
+                max_background_flushes: 4,
+                max_sub_compactions: 3,
+                max_titan_background_gc: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_config_template_is_valid() {
+        let template_config = std::include_str!("../etc/config-template.toml")
+            .lines()
+            .map(|l| l.strip_prefix('#').unwrap_or(l))
+            .join("\n");
+
+        let mut cfg: TiKvConfig = toml::from_str(&template_config).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn test_config_template_no_superfluous_keys() {
+        let template_config = std::include_str!("../etc/config-template.toml")
+            .lines()
+            .map(|l| l.strip_prefix('#').unwrap_or(l))
+            .join("\n");
+
+        let mut deserializer = toml::Deserializer::new(&template_config);
+        let mut unrecognized_keys = Vec::new();
+        let _: TiKvConfig = serde_ignored::deserialize(&mut deserializer, |key| {
+            unrecognized_keys.push(key.to_string())
+        })
+        .unwrap();
+
+        // Don't use `is_empty()` so we see which keys are superfluous on failure.
+        assert_eq!(unrecognized_keys, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_config_template_matches_default() {
+        let template_config = std::include_str!("../etc/config-template.toml")
+            .lines()
+            .map(|l| l.strip_prefix('#').unwrap_or(l))
+            .join("\n");
+
+        let mut cfg: TiKvConfig = toml::from_str(&template_config).unwrap();
+        let mut default_cfg = TiKvConfig::default();
+
+        // Some default values are computed based on the environment.
+        // Because we can't set config values for these in `config-template.toml`, we will handle
+        // them manually.
+        cfg.readpool.unified.max_thread_count = default_cfg.readpool.unified.max_thread_count;
+        cfg.readpool.storage.high_concurrency = default_cfg.readpool.storage.high_concurrency;
+        cfg.readpool.storage.normal_concurrency = default_cfg.readpool.storage.normal_concurrency;
+        cfg.readpool.storage.low_concurrency = default_cfg.readpool.storage.low_concurrency;
+        cfg.readpool.coprocessor.high_concurrency =
+            default_cfg.readpool.coprocessor.high_concurrency;
+        cfg.readpool.coprocessor.normal_concurrency =
+            default_cfg.readpool.coprocessor.normal_concurrency;
+        cfg.readpool.coprocessor.low_concurrency = default_cfg.readpool.coprocessor.low_concurrency;
+        cfg.server.grpc_memory_pool_quota = default_cfg.server.grpc_memory_pool_quota;
+        cfg.server.background_thread_count = default_cfg.server.background_thread_count;
+        cfg.server.end_point_max_concurrency = default_cfg.server.end_point_max_concurrency;
+        cfg.storage.scheduler_worker_pool_size = default_cfg.storage.scheduler_worker_pool_size;
+        cfg.rocksdb.max_background_jobs = default_cfg.rocksdb.max_background_jobs;
+        cfg.rocksdb.max_background_flushes = default_cfg.rocksdb.max_background_flushes;
+        cfg.rocksdb.max_sub_compactions = default_cfg.rocksdb.max_sub_compactions;
+        cfg.rocksdb.titan.max_background_gc = default_cfg.rocksdb.titan.max_background_gc;
+        cfg.raftdb.max_background_jobs = default_cfg.raftdb.max_background_jobs;
+        cfg.raftdb.max_background_flushes = default_cfg.raftdb.max_background_flushes;
+        cfg.raftdb.max_sub_compactions = default_cfg.raftdb.max_sub_compactions;
+        cfg.raftdb.titan.max_background_gc = default_cfg.raftdb.titan.max_background_gc;
+        cfg.backup.num_threads = default_cfg.backup.num_threads;
+
+        // There is another set of config values that we can't directly compare:
+        // When the default values are `None`, but are then resolved to `Some(_)` later on.
+        default_cfg.readpool.storage.adjust_use_unified_pool();
+        default_cfg.readpool.coprocessor.adjust_use_unified_pool();
+        default_cfg.security.redact_info_log = Some(false);
+
+        // Other special cases.
+        cfg.pd.retry_max_count = default_cfg.pd.retry_max_count; // Both -1 and isize::MAX are the same.
+        cfg.storage.block_cache.capacity = OptionReadableSize(None); // Either `None` and a value is computed or `Some(_)` fixed value.
+        cfg.memory_usage_limit = OptionReadableSize(None);
+        cfg.coprocessor_v2.coprocessor_plugin_directory = None; // Default is `None`, which is represented by not setting the key.
+
+        assert_eq!(cfg, default_cfg);
+    }
+
+    #[test]
+    fn test_cdc() {
+        let content = r#"
+            [cdc]
+        "#;
+        let mut cfg: TiKvConfig = toml::from_str(content).unwrap();
+        cfg.validate().unwrap();
+
+        // old-value-cache-size is deprecated, 0 must not report error.
+        let content = r#"
+            [cdc]
+            old-value-cache-size = 0
+        "#;
+        let mut cfg: TiKvConfig = toml::from_str(content).unwrap();
+        cfg.validate().unwrap();
+
+        let content = r#"
+            [cdc]
+            min-ts-interval = "0s"
+        "#;
+        let mut cfg: TiKvConfig = toml::from_str(content).unwrap();
+        cfg.validate().unwrap_err();
+
+        let content = r#"
+            [cdc]
+            incremental-scan-threads = 0
+        "#;
+        let mut cfg: TiKvConfig = toml::from_str(content).unwrap();
+        cfg.validate().unwrap_err();
+
+        let content = r#"
+            [cdc]
+            incremental-scan-concurrency = 0
+        "#;
+        let mut cfg: TiKvConfig = toml::from_str(content).unwrap();
+        cfg.validate().unwrap_err();
+
+        let content = r#"
+            [cdc]
+            incremental-scan-concurrency = 1
+            incremental-scan-threads = 2
+        "#;
+        let mut cfg: TiKvConfig = toml::from_str(content).unwrap();
+        cfg.validate().unwrap_err();
     }
 }

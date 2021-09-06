@@ -3,12 +3,12 @@
 use protobuf::Message;
 use std::convert::TryFrom;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fail::fail_point;
 use kvproto::coprocessor::KeyRange;
 use tidb_query_datatype::{EvalType, FieldTypeAccessor};
-use tikv_util::deadline::Deadline;
+use tikv_util::{deadline::Deadline, time::Instant};
 use tipb::StreamResponse;
 use tipb::{self, ExecType, ExecutorExecutionSummary, FieldType};
 use tipb::{Chunk, DagRequest, EncodeType, SelectResponse};
@@ -16,6 +16,8 @@ use yatp::task::future::reschedule;
 
 use super::interface::{BatchExecutor, ExecuteStats};
 use super::*;
+
+use tidb_query_common::execute_stats::ExecSummary;
 use tidb_query_common::metrics::*;
 use tidb_query_common::storage::{IntervalRange, Storage};
 use tidb_query_common::Result;
@@ -75,30 +77,30 @@ impl BatchExecutorsRunner<()> {
             match ed.get_tp() {
                 ExecType::TypeTableScan => {
                     let descriptor = ed.get_tbl_scan();
-                    BatchTableScanExecutor::check_supported(&descriptor)
+                    BatchTableScanExecutor::check_supported(descriptor)
                         .map_err(|e| other_err!("BatchTableScanExecutor: {}", e))?;
                 }
                 ExecType::TypeIndexScan => {
                     let descriptor = ed.get_idx_scan();
-                    BatchIndexScanExecutor::check_supported(&descriptor)
+                    BatchIndexScanExecutor::check_supported(descriptor)
                         .map_err(|e| other_err!("BatchIndexScanExecutor: {}", e))?;
                 }
                 ExecType::TypeSelection => {
                     let descriptor = ed.get_selection();
-                    BatchSelectionExecutor::check_supported(&descriptor)
+                    BatchSelectionExecutor::check_supported(descriptor)
                         .map_err(|e| other_err!("BatchSelectionExecutor: {}", e))?;
                 }
                 ExecType::TypeAggregation | ExecType::TypeStreamAgg
                     if ed.get_aggregation().get_group_by().is_empty() =>
                 {
                     let descriptor = ed.get_aggregation();
-                    BatchSimpleAggregationExecutor::check_supported(&descriptor)
+                    BatchSimpleAggregationExecutor::check_supported(descriptor)
                         .map_err(|e| other_err!("BatchSimpleAggregationExecutor: {}", e))?;
                 }
                 ExecType::TypeAggregation => {
                     let descriptor = ed.get_aggregation();
-                    if BatchFastHashAggregationExecutor::check_supported(&descriptor).is_err() {
-                        BatchSlowHashAggregationExecutor::check_supported(&descriptor)
+                    if BatchFastHashAggregationExecutor::check_supported(descriptor).is_err() {
+                        BatchSlowHashAggregationExecutor::check_supported(descriptor)
                             .map_err(|e| other_err!("BatchSlowHashAggregationExecutor: {}", e))?;
                     }
                 }
@@ -106,13 +108,13 @@ impl BatchExecutorsRunner<()> {
                     // Note: We won't check whether the source of stream aggregation is in order.
                     //       It is undefined behavior if the source is unordered.
                     let descriptor = ed.get_aggregation();
-                    BatchStreamAggregationExecutor::check_supported(&descriptor)
+                    BatchStreamAggregationExecutor::check_supported(descriptor)
                         .map_err(|e| other_err!("BatchStreamAggregationExecutor: {}", e))?;
                 }
                 ExecType::TypeLimit => {}
                 ExecType::TypeTopN => {
                     let descriptor = ed.get_top_n();
-                    BatchTopNExecutor::check_supported(&descriptor)
+                    BatchTopNExecutor::check_supported(descriptor)
                         .map_err(|e| other_err!("BatchTopNExecutor: {}", e))?;
                 }
                 ExecType::TypeJoin => {
@@ -126,6 +128,9 @@ impl BatchExecutorsRunner<()> {
                 }
                 ExecType::TypeExchangeReceiver => {
                     other_err!("ExchangeReceiver executor not implemented");
+                }
+                ExecType::TypeProjection => {
+                    other_err!("Projection executor not implemented");
                 }
             }
         }
@@ -156,6 +161,9 @@ pub fn build_executors<S: Storage + 'static>(
 
     let mut executor: Box<dyn BatchExecutor<StorageStats = S::Statistics>>;
     let mut summary_slot_index = 0;
+    // Limit executor use this flag to check if its src is table/index scan.
+    // Performance enhancement for plan like: limit 1 -> table/index scan.
+    let mut is_src_scan_executor = true;
 
     match first_ed.get_tp() {
         ExecType::TypeTableScan => {
@@ -164,6 +172,7 @@ pub fn build_executors<S: Storage + 'static>(
             let mut descriptor = first_ed.take_tbl_scan();
             let columns_info = descriptor.take_columns().into();
             let primary_column_ids = descriptor.take_primary_column_ids();
+            let primary_prefix_column_ids = descriptor.take_primary_prefix_column_ids();
 
             executor = Box::new(
                 BatchTableScanExecutor::new(
@@ -174,6 +183,7 @@ pub fn build_executors<S: Storage + 'static>(
                     primary_column_ids,
                     descriptor.get_desc(),
                     is_scanned_range_aware,
+                    primary_prefix_column_ids,
                 )?
                 .collect_summary(summary_slot_index),
             );
@@ -237,8 +247,7 @@ pub fn build_executors<S: Storage + 'static>(
                 )
             }
             ExecType::TypeAggregation => {
-                if BatchFastHashAggregationExecutor::check_supported(&ed.get_aggregation()).is_ok()
-                {
+                if BatchFastHashAggregationExecutor::check_supported(ed.get_aggregation()).is_ok() {
                     EXECUTOR_COUNT_METRICS.batch_fast_hash_aggr.inc();
 
                     Box::new(
@@ -281,8 +290,12 @@ pub fn build_executors<S: Storage + 'static>(
                 EXECUTOR_COUNT_METRICS.batch_limit.inc();
 
                 Box::new(
-                    BatchLimitExecutor::new(executor, ed.get_limit().get_limit() as usize)?
-                        .collect_summary(summary_slot_index),
+                    BatchLimitExecutor::new(
+                        executor,
+                        ed.get_limit().get_limit() as usize,
+                        is_src_scan_executor,
+                    )?
+                    .collect_summary(summary_slot_index),
                 )
             }
             ExecType::TypeTopN => {
@@ -316,6 +329,7 @@ pub fn build_executors<S: Storage + 'static>(
             }
         };
         executor = new_executor;
+        is_src_scan_executor = false;
     }
 
     Ok(executor)
@@ -370,8 +384,8 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
             config,
             collect_exec_summary,
             exec_stats,
-            encode_type,
             stream_row_limit,
+            encode_type,
         })
     }
 
@@ -389,7 +403,7 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
 
         let mut time_slice_start = Instant::now();
         loop {
-            let time_slice_len = time_slice_start.elapsed();
+            let time_slice_len = time_slice_start.saturating_elapsed();
             // Check whether we should yield from the execution
             if time_slice_len > MAX_TIME_SLICE {
                 reschedule().await;
@@ -445,10 +459,6 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
 
                 sel_resp.set_warnings(warnings.warnings.into());
                 sel_resp.set_warning_count(warnings.warning_cnt as i64);
-
-                // In case of this function is called multiple times.
-                self.exec_stats.clear();
-
                 return Ok(sel_resp);
             }
 
@@ -499,6 +509,13 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
 
     pub fn can_be_cached(&self) -> bool {
         self.out_most_executor.can_be_cached()
+    }
+
+    pub fn collect_scan_summary(&mut self, dest: &mut ExecSummary) {
+        // Get the first executor which is always the scan executor
+        if let Some(exec_stat) = self.exec_stats.summary_per_executor.first() {
+            dest.clone_from(exec_stat);
+        }
     }
 
     fn internal_handle_request(

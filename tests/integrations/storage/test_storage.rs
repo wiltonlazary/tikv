@@ -1,5 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::iter::repeat;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -477,17 +478,19 @@ fn test_txn_store_scan_lock() {
         vec![Some((b"k1", b"v1")), None, None, None, None],
     );
 
-    store.scan_locks_ok(10, b"", 1, vec![lock(b"p1", b"p1", 5)]);
+    store.scan_locks_ok(10, b"", b"", 1, vec![lock(b"p1", b"p1", 5)]);
 
     store.scan_locks_ok(
         10,
         b"s",
+        b"",
         2,
         vec![lock(b"s1", b"p1", 5), lock(b"s2", b"p2", 10)],
     );
 
     store.scan_locks_ok(
         10,
+        b"",
         b"",
         0,
         vec![
@@ -500,6 +503,7 @@ fn test_txn_store_scan_lock() {
 
     store.scan_locks_ok(
         10,
+        b"",
         b"",
         100,
         vec![
@@ -537,7 +541,7 @@ fn test_txn_store_resolve_lock() {
     store.get_none(b"s1", 30);
     store.get_ok(b"p2", 20, b"v10");
     store.get_ok(b"s2", 30, b"v10");
-    store.scan_locks_ok(30, b"", 100, vec![]);
+    store.scan_locks_ok(30, b"", b"", 100, vec![]);
 }
 
 fn test_txn_store_resolve_lock_batch(key_prefix_len: usize, n: usize) {
@@ -584,7 +588,7 @@ fn test_txn_store_resolve_lock_in_a_batch() {
     store.get_none(b"s1", 30);
     store.get_ok(b"p2", 30, b"v10");
     store.get_ok(b"s2", 30, b"v10");
-    store.scan_locks_ok(30, b"", 100, vec![]);
+    store.scan_locks_ok(30, b"", b"", 100, vec![]);
 }
 
 #[test]
@@ -670,14 +674,20 @@ pub fn test_txn_store_gc_multiple_keys_cluster_storage(n: usize, prefix: String)
     let (mut cluster, mut store) =
         AssertionStorage::new_raft_storage_with_store_count(3, prefix.as_str());
     let keys: Vec<String> = (0..n).map(|i| format!("{}{}", prefix, i)).collect();
-    for k in &keys {
-        store.put_ok_for_cluster(&mut cluster, k.as_bytes(), b"v1", 5, 10);
-        store.put_ok_for_cluster(&mut cluster, k.as_bytes(), b"v2", 15, 20);
+    if !keys.is_empty() {
+        store.batch_put_ok_for_cluster(&mut cluster, &keys, repeat(b"v1" as &[u8]), 5, 10);
+        store.batch_put_ok_for_cluster(&mut cluster, &keys, repeat(b"v2" as &[u8]), 15, 20);
     }
 
+    let mut last_region = cluster.get_region(b"");
+    store.gc_ok_for_cluster(&mut cluster, b"", 30);
     for k in &keys {
         // clear data whose commit_ts < 30
-        store.gc_ok_for_cluster(&mut cluster, k.as_bytes(), 30);
+        let region = cluster.get_region(k.as_bytes());
+        if last_region != region {
+            store.gc_ok_for_cluster(&mut cluster, k.as_bytes(), 30);
+            last_region = region;
+        }
     }
 
     for k in &keys {
@@ -850,7 +860,7 @@ struct Oracle {
 impl Oracle {
     fn new() -> Oracle {
         Oracle {
-            ts: AtomicUsize::new(1 as usize),
+            ts: AtomicUsize::new(1_usize),
         }
     }
 
@@ -866,8 +876,8 @@ fn inc<E: Engine>(store: &SyncTestStorage<E>, oracle: &Oracle, key: &[u8]) -> Re
     for i in 0..INC_MAX_RETRY {
         let start_ts = oracle.get_ts();
         let number: i32 = match store.get(Context::default(), &key_address, start_ts) {
-            Ok((Some(x), _, _)) => String::from_utf8(x).unwrap().parse().unwrap(),
-            Ok((None, _, _)) => 0,
+            Ok((Some(x), ..)) => String::from_utf8(x).unwrap().parse().unwrap(),
+            Ok((None, ..)) => 0,
             Err(_) => {
                 backoff(i);
                 continue;
@@ -949,8 +959,8 @@ fn inc_multi<E: Engine>(store: &SyncTestStorage<E>, oracle: &Oracle, n: usize) -
         let mut mutations = vec![];
         for key in keys.iter().take(n) {
             let number = match store.get(Context::default(), key, start_ts) {
-                Ok((Some(n), _, _)) => String::from_utf8(n).unwrap().parse().unwrap(),
-                Ok((None, _, _)) => 0,
+                Ok((Some(n), ..)) => String::from_utf8(n).unwrap().parse().unwrap(),
+                Ok((None, ..)) => 0,
                 Err(_) => {
                     backoff(i);
                     continue 'retry;

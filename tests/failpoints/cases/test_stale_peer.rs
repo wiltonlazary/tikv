@@ -1,13 +1,14 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::thread;
-use std::time::*;
+use std::time::Duration;
 
 use engine_rocks::Compat;
 use engine_traits::Peekable;
 use kvproto::raft_serverpb::RaftLocalState;
 use test_raftstore::*;
 use tikv_util::config::ReadableDuration;
+use tikv_util::time::Instant;
 
 #[test]
 fn test_one_node_leader_missing() {
@@ -18,7 +19,8 @@ fn test_one_node_leader_missing() {
     cluster.cfg.raft_store.raft_election_timeout_ticks = 5;
     let base_tick_interval = cluster.cfg.raft_store.raft_base_tick_interval.0;
     let election_timeout = base_tick_interval * 5;
-    cluster.cfg.raft_store.raft_store_max_leader_lease = ReadableDuration(election_timeout);
+    cluster.cfg.raft_store.raft_store_max_leader_lease =
+        ReadableDuration(election_timeout - base_tick_interval);
     // Use large peer check interval, abnormal and max leader missing duration to make a valid config,
     // that is election timeout x 2 < peer stale state check < abnormal < max leader missing duration.
     cluster.cfg.raft_store.peer_stale_state_check_interval = ReadableDuration(election_timeout * 3);
@@ -107,7 +109,7 @@ fn test_stale_learner_restart() {
         .unwrap();
     let last_index = state.get_last_index();
     let timer = Instant::now();
-    while timer.elapsed() < Duration::from_secs(5) {
+    while timer.saturating_elapsed() < Duration::from_secs(5) {
         state = cluster
             .get_raft_engine(2)
             .c()

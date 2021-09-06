@@ -4,12 +4,11 @@ use txn_types::{Key, TimeStamp};
 
 use crate::storage::kv::WriteData;
 use crate::storage::lock_manager::LockManager;
-use crate::storage::mvcc::txn::MissingLockAction;
-use crate::storage::mvcc::MvccTxn;
+use crate::storage::mvcc::{MvccTxn, SnapshotReader};
 use crate::storage::txn::actions::check_txn_status::*;
 use crate::storage::txn::commands::{
-    Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
-    WriteResult,
+    Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
+    WriteCommand, WriteContext, WriteResult,
 };
 use crate::storage::txn::Result;
 use crate::storage::{ProcessResult, Snapshot, TxnStatus};
@@ -64,7 +63,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
     /// situation, `self.start_ts` is T2's `start_ts`, `caller_start_ts` is T1's `start_ts`, and
     /// the `current_ts` is literally the timestamp when this function is invoked; it may not be
     /// accurate.
-    fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(self, snapshot: S, mut context: WriteContext<'_, L>) -> Result<WriteResult> {
         let mut new_max_ts = self.lock_ts;
         if !self.current_ts.is_max() && self.current_ts > new_max_ts {
             new_max_ts = self.current_ts;
@@ -74,11 +73,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
         }
         context.concurrency_manager.update_max_ts(new_max_ts);
 
-        let mut txn = MvccTxn::new(
-            snapshot,
-            self.lock_ts,
-            !self.ctx.get_not_fill_cache(),
-            context.concurrency_manager,
+        let mut txn = MvccTxn::new(self.lock_ts, context.concurrency_manager);
+        let mut reader = ReaderWithStats::new(
+            SnapshotReader::new(self.lock_ts, snapshot, !self.ctx.get_not_fill_cache()),
+            &mut context.statistics,
         );
 
         fail_point!("check_txn_status", |err| Err(
@@ -90,9 +88,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
             .into()
         ));
 
-        let (txn_status, released) = match txn.reader.load_lock(&self.primary_key)? {
+        let (txn_status, released) = match reader.load_lock(&self.primary_key)? {
             Some(lock) if lock.ts == self.lock_ts => check_txn_status_lock_exists(
                 &mut txn,
+                &mut reader,
                 self.primary_key,
                 lock,
                 self.current_ts,
@@ -100,11 +99,10 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
                 self.force_sync_commit,
                 self.resolving_pessimistic_lock,
             )?,
-            // The rollback must be protected, see more on
-            // [issue #7364](https://github.com/tikv/tikv/issues/7364)
             l => (
                 check_txn_status_missing_lock(
                     &mut txn,
+                    &mut reader,
                     self.primary_key,
                     l,
                     MissingLockAction::rollback(self.rollback_if_not_exist),
@@ -121,9 +119,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckTxnStatus {
             released_locks.wake_up(context.lock_mgr);
         }
 
-        context.statistics.add(&txn.take_statistics());
         let pr = ProcessResult::TxnStatus { txn_status };
-        let write_data = WriteData::from_modifies(txn.into_modifies());
+        let mut write_data = WriteData::from_modifies(txn.into_modifies());
+        write_data.set_allowed_on_disk_almost_full();
         Ok(WriteResult {
             ctx: self.ctx,
             to_be_write: write_data,
@@ -222,18 +220,20 @@ pub mod tests {
             force_sync_commit,
             resolving_pessimistic_lock,
         };
-        assert!(command
-            .process_write(
-                snapshot,
-                WriteContext {
-                    lock_mgr: &DummyLockManager,
-                    concurrency_manager: cm,
-                    extra_op: Default::default(),
-                    statistics: &mut Default::default(),
-                    async_apply_prewrite: false,
-                },
-            )
-            .is_err());
+        assert!(
+            command
+                .process_write(
+                    snapshot,
+                    WriteContext {
+                        lock_mgr: &DummyLockManager,
+                        concurrency_manager: cm,
+                        extra_op: Default::default(),
+                        statistics: &mut Default::default(),
+                        async_apply_prewrite: false,
+                    },
+                )
+                .is_err()
+        );
     }
 
     fn committed(commit_ts: impl Into<TimeStamp>) -> impl FnOnce(TxnStatus) -> bool {
@@ -597,7 +597,8 @@ pub mod tests {
         must_large_txn_locked(&engine, k, ts(5, 0), 100, ts(9, 1), false);
 
         // caller_start_ts < lock.min_commit_ts < current_ts
-        // When caller_start_ts < lock.min_commit_ts, no need to update it.
+        // When caller_start_ts < lock.min_commit_ts, no need to update it, but pushed should be
+        // true.
         must_success(
             &engine,
             k,
@@ -607,7 +608,7 @@ pub mod tests {
             r,
             false,
             false,
-            uncommitted(100, ts(9, 1), false),
+            uncommitted(100, ts(9, 1), true),
         );
         must_large_txn_locked(&engine, k, ts(5, 0), 100, ts(9, 1), false);
 
@@ -921,6 +922,7 @@ pub mod tests {
             1,
             /* min_commit_ts */ TimeStamp::zero(),
             /* max_commit_ts */ TimeStamp::zero(),
+            false,
         );
         must_success(
             &engine,
@@ -934,7 +936,7 @@ pub mod tests {
             uncommitted(100, TimeStamp::zero(), false),
         );
         must_large_txn_locked(&engine, k, ts(300, 0), 100, TimeStamp::zero(), false);
-        must_rollback(&engine, k, ts(300, 0));
+        must_rollback(&engine, k, ts(300, 0), false);
 
         must_prewrite_put_for_large_txn(&engine, k, v, k, ts(310, 0), 100, 0);
         must_large_txn_locked(&engine, k, ts(310, 0), 100, ts(310, 1), false);
@@ -962,6 +964,12 @@ pub mod tests {
             false,
             committed(ts(315, 0)),
         );
+    }
+
+    #[test]
+    fn test_check_txn_status() {
+        test_check_txn_status_impl(false);
+        test_check_txn_status_impl(true);
     }
 
     #[test]
@@ -1036,6 +1044,7 @@ pub mod tests {
             1,
             /* min_commit_ts */ TimeStamp::zero(),
             /* max_commit_ts */ TimeStamp::zero(),
+            false,
         );
         must_success(
             &engine,
@@ -1082,11 +1091,5 @@ pub mod tests {
         );
         must_unlocked(&engine, k);
         must_get_rollback_ts(&engine, k, ts(50, 0));
-    }
-
-    #[test]
-    fn test_check_txn_status() {
-        test_check_txn_status_impl(false);
-        test_check_txn_status_impl(true);
     }
 }
