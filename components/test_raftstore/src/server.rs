@@ -108,7 +108,7 @@ impl StoreAddrResolver for AddressMap {
 }
 
 struct ServerMeta {
-    node: Node<TestPdClient, RocksEngine>,
+    node: Node<TestPdClient, RocksEngine, RocksEngine>,
     server: Server<SimulateStoreTransport, PdStoreAddrResolver, SimulateEngine>,
     sim_router: SimulateStoreTransport,
     sim_trans: SimulateServerTransport,
@@ -270,9 +270,11 @@ impl Simulator for ServerCluster {
             block_on(self.pd_client.get_tso()).expect("failed to get timestamp from PD");
         let concurrency_manager = ConcurrencyManager::new(latest_ts);
 
+        let (tx, _rx) = std::sync::mpsc::channel();
         let mut gc_worker = GcWorker::new(
             engine.clone(),
             sim_router.clone(),
+            tx,
             cfg.gc.clone(),
             Default::default(),
         );
