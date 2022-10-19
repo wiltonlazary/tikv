@@ -9,6 +9,7 @@
 //! with your engine's own name; then fill in the implementations; remove
 //! the allow(unused) attribute;
 
+#![feature(generic_associated_types)]
 #![allow(unused)]
 
 mod cf_names;
@@ -43,5 +44,7 @@ pub mod perf_context;
 pub use crate::perf_context::*;
 pub mod flow_control_factors;
 pub use crate::flow_control_factors::*;
+pub mod table_properties;
+pub use crate::table_properties::*;
 
 mod raft_engine;

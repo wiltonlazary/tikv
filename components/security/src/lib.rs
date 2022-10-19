@@ -3,11 +3,13 @@
 #[macro_use]
 extern crate serde_derive;
 
-use std::error::Error;
-use std::fs::{self, File};
-use std::io::Read;
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::{
+    error::Error,
+    fs::{self, File},
+    io::Read,
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
 
 use collections::HashSet;
 use encryption::EncryptionConfig;
@@ -16,8 +18,10 @@ use grpcio::{
     RpcContext, RpcStatus, RpcStatusCode, ServerBuilder, ServerChecker, ServerCredentialsBuilder,
     ServerCredentialsFetcher,
 };
+#[cfg(feature = "tonic")]
+use tonic::transport::{channel::ClientTlsConfig, Certificate, Identity};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct SecurityConfig {
@@ -33,25 +37,12 @@ pub struct SecurityConfig {
     pub encryption: EncryptionConfig,
 }
 
-impl Default for SecurityConfig {
-    fn default() -> SecurityConfig {
-        SecurityConfig {
-            ca_path: String::new(),
-            cert_path: String::new(),
-            key_path: String::new(),
-            override_ssl_target: String::new(),
-            cert_allowed_cn: HashSet::default(),
-            redact_info_log: None,
-            encryption: EncryptionConfig::default(),
-        }
-    }
-}
-
 /// Checks and opens key file. Returns `Ok(None)` if the path is empty.
 ///
 ///  # Arguments
 ///
-///  - `tag`: only used in the error message, like "ca key", "cert key", "private key", etc.
+///  - `tag`: only used in the error message, like "ca key", "cert key",
+///    "private key", etc.
 fn check_key_file(tag: &str, path: &str) -> Result<Option<File>, Box<dyn Error>> {
     if path.is_empty() {
         return Ok(None);
@@ -109,7 +100,7 @@ impl SecurityConfig {
 
     /// Determine if the cert file has been modified.
     /// If modified, update the timestamp of this modification.
-    fn is_modified(&self, last: &mut Option<SystemTime>) -> Result<bool, Box<dyn Error>> {
+    pub fn is_modified(&self, last: &mut Option<SystemTime>) -> Result<bool, Box<dyn Error>> {
         let this = fs::metadata(&self.cert_path)?.modified()?;
         if let Some(last) = last {
             if *last == this {
@@ -131,6 +122,23 @@ impl SecurityManager {
         Ok(SecurityManager {
             cfg: Arc::new(cfg.clone()),
         })
+    }
+
+    #[cfg(feature = "tonic")]
+    /// Make a tonic tls config via the config.
+    pub fn tonic_tls_config(&self) -> Option<ClientTlsConfig> {
+        let (ca, cert, key) = self.cfg.load_certs().unwrap_or_default();
+        if ca.is_empty() && cert.is_empty() && key.is_empty() {
+            return None;
+        }
+        let mut cfg = ClientTlsConfig::new();
+        if !ca.is_empty() {
+            cfg = cfg.ca_certificate(Certificate::from_pem(ca));
+        }
+        if !cert.is_empty() && !key.is_empty() {
+            cfg = cfg.identity(Identity::from_pem(cert, key));
+        }
+        Some(cfg)
     }
 
     pub fn connect(&self, mut cb: ChannelBuilder, addr: &str) -> Channel {
@@ -158,7 +166,7 @@ impl SecurityManager {
             sb.bind(addr, port)
         } else {
             if !self.cfg.cert_allowed_cn.is_empty() {
-                let cn_checker = CNChecker {
+                let cn_checker = CnChecker {
                     allowed_cn: Arc::new(self.cfg.cert_allowed_cn.clone()),
                 };
                 sb = sb.add_checker(cn_checker);
@@ -178,12 +186,12 @@ impl SecurityManager {
 }
 
 #[derive(Clone)]
-struct CNChecker {
+struct CnChecker {
     allowed_cn: Arc<HashSet<String>>,
 }
 
-impl ServerChecker for CNChecker {
-    fn check(&mut self, ctx: &RpcContext) -> CheckResult {
+impl ServerChecker for CnChecker {
+    fn check(&mut self, ctx: &RpcContext<'_>) -> CheckResult {
         match check_common_name(&self.allowed_cn, ctx) {
             Ok(()) => CheckResult::Continue,
             Err(reason) => CheckResult::Abort(RpcStatus::with_message(
@@ -234,7 +242,10 @@ impl ServerCredentialsFetcher for Fetcher {
 /// Check peer CN with cert-allowed-cn field.
 /// Return true when the match is successful (support wildcard pattern).
 /// Skip the check when the secure channel is not used.
-fn check_common_name(cert_allowed_cn: &HashSet<String>, ctx: &RpcContext) -> Result<(), String> {
+fn check_common_name(
+    cert_allowed_cn: &HashSet<String>,
+    ctx: &RpcContext<'_>,
+) -> Result<(), String> {
     if let Some(auth_ctx) = ctx.auth_context() {
         if let Some(auth_property) = auth_ctx
             .into_iter()
@@ -266,11 +277,11 @@ pub fn match_peer_names(allowed_cn: &HashSet<String>, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{fs, io::Write};
 
-    use std::fs;
-    use std::io::Write;
     use tempfile::Builder;
+
+    use super::*;
 
     #[test]
     fn test_security() {
@@ -302,7 +313,7 @@ mod tests {
         let example_ca = temp.path().join("ca");
         let example_cert = temp.path().join("cert");
         let example_key = temp.path().join("key");
-        for (id, f) in (&[&example_ca, &example_cert, &example_key])
+        for (id, f) in [&example_ca, &example_cert, &example_key]
             .iter()
             .enumerate()
         {

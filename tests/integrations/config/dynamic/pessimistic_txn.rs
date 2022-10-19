@@ -1,14 +1,20 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::{atomic::Ordering, mpsc, Arc};
-use std::time::Duration;
+use std::{
+    sync::{atomic::Ordering, mpsc, Arc},
+    time::Duration,
+};
 
 use security::SecurityManager;
-use test_raftstore::TestPdClient;
-use tikv::config::*;
-use tikv::server::lock_manager::*;
-use tikv::server::resolve::{Callback, StoreAddrResolver};
-use tikv::server::{Error, Result};
+use test_pd_client::TestPdClient;
+use tikv::{
+    config::*,
+    server::{
+        lock_manager::*,
+        resolve::{Callback, StoreAddrResolver},
+        Error, Result,
+    },
+};
 use tikv_util::config::ReadableDuration;
 
 #[test]
@@ -18,7 +24,7 @@ fn test_config_validate() {
 
     let mut invalid_cfg = Config::default();
     invalid_cfg.wait_for_lock_timeout = ReadableDuration::millis(0);
-    assert!(invalid_cfg.validate().is_err());
+    invalid_cfg.validate().unwrap_err();
 }
 
 #[derive(Clone)]
@@ -30,14 +36,14 @@ impl StoreAddrResolver for MockResolver {
 }
 
 fn setup(
-    cfg: TiKvConfig,
+    cfg: TikvConfig,
 ) -> (
     ConfigController,
     WaiterMgrScheduler,
     DetectorScheduler,
     LockManager,
 ) {
-    let mut lock_mgr = LockManager::new(cfg.pessimistic_txn.pipelined);
+    let mut lock_mgr = LockManager::new(&cfg.pessimistic_txn);
     let pd_client = Arc::new(TestPdClient::new(0, true));
     let security_mgr = Arc::new(SecurityManager::new(&cfg.security).unwrap());
     lock_mgr
@@ -89,10 +95,11 @@ where
 fn test_lock_manager_cfg_update() {
     const DEFAULT_TIMEOUT: u64 = 3000;
     const DEFAULT_DELAY: u64 = 100;
-    let (mut cfg, _dir) = TiKvConfig::with_tmp().unwrap();
+    let (mut cfg, _dir) = TikvConfig::with_tmp().unwrap();
     cfg.pessimistic_txn.wait_for_lock_timeout = ReadableDuration::millis(DEFAULT_TIMEOUT);
     cfg.pessimistic_txn.wake_up_delay_duration = ReadableDuration::millis(DEFAULT_DELAY);
     cfg.pessimistic_txn.pipelined = false;
+    cfg.pessimistic_txn.in_memory = false;
     cfg.validate().unwrap();
     let (cfg_controller, waiter, deadlock, mut lock_mgr) = setup(cfg);
 
@@ -166,11 +173,38 @@ fn test_lock_manager_cfg_update() {
     });
 
     // update pipelined
-    assert!(!lock_mgr.get_pipelined().load(Ordering::Relaxed));
+    assert!(
+        !lock_mgr
+            .get_storage_dynamic_configs()
+            .pipelined_pessimistic_lock
+            .load(Ordering::SeqCst)
+    );
     cfg_controller
         .update_config("pessimistic-txn.pipelined", "true")
         .unwrap();
-    assert!(lock_mgr.get_pipelined().load(Ordering::Relaxed));
+    assert!(
+        lock_mgr
+            .get_storage_dynamic_configs()
+            .pipelined_pessimistic_lock
+            .load(Ordering::SeqCst)
+    );
+
+    // update in-memory
+    assert!(
+        !lock_mgr
+            .get_storage_dynamic_configs()
+            .in_memory_pessimistic_lock
+            .load(Ordering::SeqCst)
+    );
+    cfg_controller
+        .update_config("pessimistic-txn.in-memory", "true")
+        .unwrap();
+    assert!(
+        lock_mgr
+            .get_storage_dynamic_configs()
+            .in_memory_pessimistic_lock
+            .load(Ordering::SeqCst)
+    );
 
     lock_mgr.stop();
 }

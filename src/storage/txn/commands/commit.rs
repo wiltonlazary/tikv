@@ -3,15 +3,19 @@
 // #[PerformanceCriticalPath]
 use txn_types::Key;
 
-use crate::storage::kv::WriteData;
-use crate::storage::lock_manager::LockManager;
-use crate::storage::mvcc::{MvccTxn, SnapshotReader};
-use crate::storage::txn::commands::{
-    Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
-    WriteCommand, WriteContext, WriteResult,
+use crate::storage::{
+    kv::WriteData,
+    lock_manager::LockManager,
+    mvcc::{MvccTxn, SnapshotReader},
+    txn::{
+        commands::{
+            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
+            WriteCommand, WriteContext, WriteResult,
+        },
+        commit, Error, ErrorInner, Result,
+    },
+    ProcessResult, Snapshot, TxnStatus,
 };
-use crate::storage::txn::{commit, Error, ErrorInner, Result};
-use crate::storage::{ProcessResult, Snapshot, TxnStatus};
 
 command! {
     /// Commit the transaction that started at `lock_ts`.
@@ -19,7 +23,7 @@ command! {
     /// This should be following a [`Prewrite`](Command::Prewrite).
     Commit:
         cmd_ty => TxnStatus,
-        display => "kv::command::commit {} {} -> {} | {:?}", (keys.len, lock_ts, commit_ts, ctx),
+        display => "kv::command::commit {:?} {} -> {} | {:?}", (keys, lock_ts, commit_ts, ctx),
         content => {
             /// The keys affected.
             keys: Vec<Key>,
@@ -33,13 +37,14 @@ command! {
 impl CommandExt for Commit {
     ctx!();
     tag!(commit);
+    request_type!(KvCommit);
     ts!(commit_ts);
     write_bytes!(keys: multiple);
     gen_lock!(keys: multiple);
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Commit {
-    fn process_write(self, snapshot: S, mut context: WriteContext<'_, L>) -> Result<WriteResult> {
+    fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
         if self.commit_ts <= self.lock_ts {
             return Err(Error::from(ErrorInner::InvalidTxnTso {
                 start_ts: self.lock_ts,
@@ -48,8 +53,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Commit {
         }
         let mut txn = MvccTxn::new(self.lock_ts, context.concurrency_manager);
         let mut reader = ReaderWithStats::new(
-            SnapshotReader::new(self.lock_ts, snapshot, !self.ctx.get_not_fill_cache()),
-            &mut context.statistics,
+            SnapshotReader::new_with_ctx(self.lock_ts, snapshot, &self.ctx),
+            context.statistics,
         );
 
         let rows = self.keys.len();

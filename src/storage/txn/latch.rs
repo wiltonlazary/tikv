@@ -1,10 +1,11 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::collections::hash_map::DefaultHasher;
-use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
-use std::usize;
+use std::{
+    collections::{hash_map::DefaultHasher, VecDeque},
+    hash::{Hash, Hasher},
+    usize,
+};
 
 use crossbeam::utils::CachePadded;
 use parking_lot::{Mutex, MutexGuard};
@@ -12,13 +13,16 @@ use parking_lot::{Mutex, MutexGuard};
 const WAITING_LIST_SHRINK_SIZE: usize = 8;
 const WAITING_LIST_MAX_CAPACITY: usize = 16;
 
-/// Latch which is used to serialize accesses to resources hashed to the same slot.
+/// Latch which is used to serialize accesses to resources hashed to the same
+/// slot.
 ///
-/// Latches are indexed by slot IDs. The keys of a command are hashed into unsigned numbers,
-/// then the command is added to the waiting queues of the latches.
+/// Latches are indexed by slot IDs. The keys of a command are hashed into
+/// unsigned numbers, then the command is added to the waiting queues of the
+/// latches.
 ///
-/// If command A is ahead of command B in one latch, it must be ahead of command B in all the
-/// overlapping latches. This is an invariant ensured by the `gen_lock`, `acquire` and `release`.
+/// If command A is ahead of command B in one latch, it must be ahead of command
+/// B in all the overlapping latches. This is an invariant ensured by the
+/// `gen_lock`, `acquire` and `release`.
 #[derive(Clone)]
 struct Latch {
     // store hash value of the key and command ID which requires this key.
@@ -33,7 +37,8 @@ impl Latch {
         }
     }
 
-    /// Find the first command ID in the queue whose hash value is equal to hash.
+    /// Find the first command ID in the queue whose hash value is equal to
+    /// hash.
     pub fn get_first_req_by_hash(&self, hash: u64) -> Option<u64> {
         for (h, cid) in self.waiting.iter().flatten() {
             if *h == hash {
@@ -43,10 +48,11 @@ impl Latch {
         None
     }
 
-    /// Remove the first command ID in the queue whose hash value is equal to hash_key.
-    /// If the element which would be removed does not appear at the front of the queue, it will leave
-    /// a hole in the queue. So we must remove consecutive hole when remove the head of the
-    /// queue to make the queue not too long.
+    /// Remove the first command ID in the queue whose hash value is equal to
+    /// hash_key. If the element which would be removed does not appear at the
+    /// front of the queue, it will leave a hole in the queue. So we must remove
+    /// consecutive hole when remove the head of the queue to make the queue not
+    /// too long.
     pub fn pop_front(&mut self, key_hash: u64) -> Option<(u64, u64)> {
         if let Some(item) = self.waiting.pop_front() {
             if let Some((k, _)) = item.as_ref() {
@@ -73,8 +79,8 @@ impl Latch {
         self.waiting.push_back(Some((key_hash, cid)));
     }
 
-    /// For some hot keys, the waiting list maybe very long, so we should shrink the waiting
-    /// VecDeque after pop.
+    /// For some hot keys, the waiting list maybe very long, so we should shrink
+    /// the waiting VecDeque after pop.
     fn maybe_shrink(&mut self) {
         // Pop item which is none to make queue not too long.
         while let Some(item) = self.waiting.front() {
@@ -94,7 +100,8 @@ impl Latch {
 /// Lock required for a command.
 #[derive(Clone)]
 pub struct Lock {
-    /// The hash value of the keys that a command must acquire before being able to be processed.
+    /// The hash value of the keys that a command must acquire before being able
+    /// to be processed.
     pub required_hashes: Vec<u64>,
 
     /// The number of latches that the command has acquired.
@@ -125,7 +132,8 @@ impl Lock {
         }
     }
 
-    /// Returns true if all the required latches have be acquired, false otherwise.
+    /// Returns true if all the required latches have be acquired, false
+    /// otherwise.
     pub fn acquired(&self) -> bool {
         self.required_hashes.len() == self.owned_count
     }
@@ -137,8 +145,9 @@ impl Lock {
 
 /// Latches which are used for concurrency control in the scheduler.
 ///
-/// Each latch is indexed by a slot ID, hence the term latch and slot are used interchangeably, but
-/// conceptually a latch is a queue, and a slot is an index to the queue.
+/// Each latch is indexed by a slot ID, hence the term latch and slot are used
+/// interchangeably, but conceptually a latch is a queue, and a slot is an index
+/// to the queue.
 pub struct Latches {
     slots: Vec<CachePadded<Mutex<Latch>>>,
     size: usize,
@@ -155,11 +164,13 @@ impl Latches {
         Latches { slots, size }
     }
 
-    /// Tries to acquire the latches specified by the `lock` for command with ID `who`.
+    /// Tries to acquire the latches specified by the `lock` for command with ID
+    /// `who`.
     ///
-    /// This method will enqueue the command ID into the waiting queues of the latches. A latch is
-    /// considered acquired if the command ID is the first one of elements in the queue which have
-    /// the same hash value. Returns true if all the Latches are acquired, false otherwise.
+    /// This method will enqueue the command ID into the waiting queues of the
+    /// latches. A latch is considered acquired if the command ID is the first
+    /// one of elements in the queue which have the same hash value. Returns
+    /// true if all the Latches are acquired, false otherwise.
     pub fn acquire(&self, lock: &mut Lock, who: u64) -> bool {
         let mut acquired_count: usize = 0;
         for &key_hash in &lock.required_hashes[lock.owned_count..] {
@@ -183,9 +194,11 @@ impl Latches {
         lock.acquired()
     }
 
-    /// Releases all latches owned by the `lock` of command with ID `who`, returns the wakeup list.
+    /// Releases all latches owned by the `lock` of command with ID `who`,
+    /// returns the wakeup list.
     ///
-    /// Preconditions: the caller must ensure the command is at the front of the latches.
+    /// Preconditions: the caller must ensure the command is at the front of the
+    /// latches.
     pub fn release(&self, lock: &Lock, who: u64) -> Vec<u64> {
         let mut wakeup_list: Vec<u64> = vec![];
         for &key_hash in &lock.required_hashes[..lock.owned_count] {
@@ -201,7 +214,7 @@ impl Latches {
     }
 
     #[inline]
-    fn lock_latch(&self, hash: u64) -> MutexGuard<Latch> {
+    fn lock_latch(&self, hash: u64) -> MutexGuard<'_, Latch> {
         self.slots[(hash as usize) & (self.size - 1)].lock()
     }
 }

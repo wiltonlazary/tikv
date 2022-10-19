@@ -1,16 +1,16 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::Snapshot;
-use raftstore::coprocessor::ObserveID;
-use raftstore::store::RegionSnapshot;
 use std::marker::PhantomData;
+
+use engine_traits::Snapshot;
+use raftstore::{coprocessor::ObserveId, store::RegionSnapshot};
 use txn_types::TimeStamp;
 
 use crate::cmd::ChangeLog;
 
 pub struct SinkCmd {
     pub region_id: u64,
-    pub observe_id: ObserveID,
+    pub observe_id: ObserveId,
     pub logs: Vec<ChangeLog>,
 }
 

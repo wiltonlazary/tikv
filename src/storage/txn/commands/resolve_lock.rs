@@ -1,19 +1,26 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use crate::storage::kv::WriteData;
-use crate::storage::lock_manager::LockManager;
-use crate::storage::mvcc::{
-    Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader, MAX_TXN_WRITE_SIZE,
-};
-use crate::storage::txn::commands::{
-    Command, CommandExt, ReaderWithStats, ReleasedLocks, ResolveLockReadPhase, ResponsePolicy,
-    TypedCommand, WriteCommand, WriteContext, WriteResult,
-};
-use crate::storage::txn::{cleanup, commit, Error, ErrorInner, Result};
-use crate::storage::{ProcessResult, Snapshot};
 use collections::HashMap;
 use txn_types::{Key, Lock, TimeStamp};
+
+use crate::storage::{
+    kv::WriteData,
+    lock_manager::LockManager,
+    mvcc::{
+        Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader,
+        MAX_TXN_WRITE_SIZE,
+    },
+    txn::{
+        cleanup,
+        commands::{
+            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResolveLockReadPhase,
+            ResponsePolicy, TypedCommand, WriteCommand, WriteContext, WriteResult,
+        },
+        commit, Error, ErrorInner, Result,
+    },
+    ProcessResult, Snapshot,
+};
 
 command! {
     /// Resolve locks according to `txn_status`.
@@ -23,7 +30,7 @@ command! {
     /// This should follow after a `ResolveLockReadPhase`.
     ResolveLock:
         cmd_ty => (),
-        display => "kv::resolve_lock", (),
+        display => "kv::resolve_lock {:?} scan_key({:?}) key_locks({:?})", (txn_status, scan_key, key_locks),
         content => {
             /// Maps lock_ts to commit_ts. If a transaction was rolled back, it is mapped to 0.
             ///
@@ -50,6 +57,7 @@ command! {
 impl CommandExt for ResolveLock {
     ctx!();
     tag!(resolve_lock);
+    request_type!(KvResolveLock);
     property!(is_sys_cmd);
 
     fn write_bytes(&self) -> usize {
@@ -63,17 +71,13 @@ impl CommandExt for ResolveLock {
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
-    fn process_write(
-        mut self,
-        snapshot: S,
-        mut context: WriteContext<'_, L>,
-    ) -> Result<WriteResult> {
+    fn process_write(mut self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
         let (ctx, txn_status, key_locks) = (self.ctx, self.txn_status, self.key_locks);
 
         let mut txn = MvccTxn::new(TimeStamp::zero(), context.concurrency_manager);
         let mut reader = ReaderWithStats::new(
-            SnapshotReader::new(TimeStamp::zero(), snapshot, !ctx.get_not_fill_cache()),
-            &mut context.statistics,
+            SnapshotReader::new_with_ctx(TimeStamp::zero(), snapshot, &ctx),
+            context.statistics,
         );
 
         let mut scan_key = self.scan_key.take();
@@ -96,9 +100,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
                     false,
                 )?
             } else if commit_ts > current_lock.ts {
-                // Continue to resolve locks if the not found committed locks are pessimistic type.
-                // They could be left if the transaction is finally committed and pessimistic conflict
-                // retry happens during execution.
+                // Continue to resolve locks if the not found committed locks are pessimistic
+                // type. They could be left if the transaction is finally committed and
+                // pessimistic conflict retry happens during execution.
                 match commit(&mut txn, &mut reader, current_key.clone(), commit_ts) {
                     Ok(res) => res,
                     Err(MvccError(box MvccErrorInner::TxnLockNotFound { .. }))
@@ -156,6 +160,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for ResolveLock {
     }
 }
 
-// To resolve a key, the write size is about 100~150 bytes, depending on key and value length.
-// The write batch will be around 32KB if we scan 256 keys each time.
+// To resolve a key, the write size is about 100~150 bytes, depending on key and
+// value length. The write batch will be around 32KB if we scan 256 keys each
+// time.
 pub const RESOLVE_LOCK_BATCH_SIZE: usize = 256;

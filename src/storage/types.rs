@@ -2,14 +2,17 @@
 
 //! Core data types.
 
+use std::fmt::Debug;
+
+use kvproto::kvrpcpb;
+use txn_types::{Key, Value};
+
 use crate::storage::{
+    lock_manager::WaitTimeout,
     mvcc::{Lock, LockType, TimeStamp, Write, WriteType},
     txn::ProcessResult,
     Callback, Result,
 };
-use kvproto::kvrpcpb;
-use std::fmt::Debug;
-use txn_types::{Key, Value};
 
 /// `MvccInfo` stores all mvcc information of given key.
 /// Used by `MvccGetByKey` and `MvccGetByStartTs`.
@@ -119,9 +122,41 @@ pub struct PrewriteResult {
     pub one_pc_commit_ts: TimeStamp,
 }
 
+#[cfg_attr(test, derive(Default))]
+pub struct PessimisticLockParameters {
+    pub pb_ctx: kvrpcpb::Context,
+    pub primary: Vec<u8>,
+    pub start_ts: TimeStamp,
+    pub lock_ttl: u64,
+    pub for_update_ts: TimeStamp,
+    pub wait_timeout: Option<WaitTimeout>,
+    pub return_values: bool,
+    pub min_commit_ts: TimeStamp,
+    pub check_existence: bool,
+    pub is_first_lock: bool,
+
+    /// Whether it's allowed for an pessimistic lock request to acquire the lock
+    /// even there is write conflict (i.e. the latest version's `commit_ts` is
+    /// greater than the current request's `for_update_ts`.
+    ///
+    /// When this is true, it's also inferred that the request is resumable,
+    /// which means, if such a request encounters a lock of another
+    /// transaction and it waits for the lock, it can resume executing and
+    /// continue trying to acquire the lock when it's woken up. Also see:
+    /// [`super::lock_manager::lock_waiting_queue`]
+    pub allow_lock_with_conflict: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PessimisticLockRes {
+    /// The previous value is loaded while handling the `AcquirePessimisticLock`
+    /// command. The i-th item is the value of the i-th key in the
+    /// `AcquirePessimisticLock` command.
     Values(Vec<Option<Value>>),
+    /// Checked whether the key exists while handling the
+    /// `AcquirePessimisticLock` command. The i-th item is true if the i-th key
+    /// in the `AcquirePessimisticLock` command exists.
+    Existence(Vec<bool>),
     Empty,
 }
 
@@ -129,6 +164,7 @@ impl PessimisticLockRes {
     pub fn push(&mut self, value: Option<Value>) {
         match self {
             PessimisticLockRes::Values(v) => v.push(value),
+            PessimisticLockRes::Existence(v) => v.push(value.is_some()),
             _ => panic!("unexpected PessimisticLockRes"),
         }
     }
@@ -142,6 +178,10 @@ impl PessimisticLockRes {
                     (v.unwrap_or_default(), is_not_found)
                 })
                 .unzip(),
+            PessimisticLockRes::Existence(mut vals) => {
+                vals.iter_mut().for_each(|x| *x = !*x);
+                (vec![], vals)
+            }
             PessimisticLockRes::Empty => (vec![], vec![]),
         }
     }

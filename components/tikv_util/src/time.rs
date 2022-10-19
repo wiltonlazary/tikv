@@ -1,23 +1,24 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cell::RefCell;
-use std::cmp::Ordering;
-use std::ops::{Add, AddAssign, Sub, SubAssign};
-use std::sync::mpsc::{self, Sender};
-use std::thread::{self, Builder, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
+// Re-export duration.
+pub use std::time::Duration;
+use std::{
+    cell::RefCell,
+    cmp::Ordering,
+    ops::{Add, AddAssign, Sub, SubAssign},
+    sync::mpsc::{self, Sender},
+    thread::{self, Builder, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_speed_limit::clock::{BlockingClock, Clock, StandardClock};
 use time::{Duration as TimeDuration, Timespec};
-
-// Re-export duration.
-pub use std::time::Duration;
 
 /// Converts Duration to milliseconds.
 #[inline]
 pub fn duration_to_ms(d: Duration) -> u64 {
     let nanos = u64::from(d.subsec_nanos());
-    // Most of case, we can't have so large Duration, so here just panic if overflow now.
+    // If Duration is too large, the result may be overflow.
     d.as_secs() * 1_000 + (nanos / 1_000_000)
 }
 
@@ -25,15 +26,28 @@ pub fn duration_to_ms(d: Duration) -> u64 {
 #[inline]
 pub fn duration_to_sec(d: Duration) -> f64 {
     let nanos = f64::from(d.subsec_nanos());
-    // Most of case, we can't have so large Duration, so here just panic if overflow now.
     d.as_secs() as f64 + (nanos / 1_000_000_000.0)
+}
+
+/// Converts Duration to microseconds.
+#[inline]
+pub fn duration_to_us(d: Duration) -> u64 {
+    let nanos = u64::from(d.subsec_nanos());
+    // If Duration is too large, the result may be overflow.
+    d.as_secs() * 1_000_000 + (nanos / 1_000)
+}
+
+/// Converts TimeSpec to nanoseconds
+#[inline]
+pub fn timespec_to_ns(t: Timespec) -> u64 {
+    (t.sec as u64) * NANOSECONDS_PER_SECOND + t.nsec as u64
 }
 
 /// Converts Duration to nanoseconds.
 #[inline]
-pub fn duration_to_nanos(d: Duration) -> u64 {
+pub fn duration_to_ns(d: Duration) -> u64 {
     let nanos = u64::from(d.subsec_nanos());
-    // Most of case, we can't have so large Duration, so here just panic if overflow now.
+    // If Duration is too large, the result may be overflow.
     d.as_secs() * 1_000_000_000 + nanos
 }
 
@@ -134,7 +148,7 @@ impl Monitor {
         let (tx, rx) = mpsc::channel();
         let h = Builder::new()
             .name(thd_name!("time-monitor"))
-            .spawn(move || {
+            .spawn_wrapper(move || {
                 crate::thread_group::set_properties(props);
                 tikv_alloc::add_thread_memory_accessor();
                 while rx.try_recv().is_err() {
@@ -183,7 +197,6 @@ impl Drop for Monitor {
 
         if let Err(e) = h.unwrap().join() {
             error!("join time monitor worker failed"; "err" => ?e);
-            return;
         }
     }
 }
@@ -192,6 +205,7 @@ use self::inner::monotonic_coarse_now;
 pub use self::inner::monotonic_now;
 /// Returns the monotonic raw time since some unspecified starting point.
 pub use self::inner::monotonic_raw_now;
+use crate::sys::thread::StdThreadBuildWrapper;
 
 const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
 const MILLISECOND_PER_SECOND: i64 = 1_000;
@@ -199,8 +213,9 @@ const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
 
 #[cfg(not(target_os = "linux"))]
 mod inner {
-    use super::NANOSECONDS_PER_SECOND;
     use time::{self, Timespec};
+
+    use super::NANOSECONDS_PER_SECOND;
 
     pub fn monotonic_raw_now() -> Timespec {
         // TODO Add monotonic raw clock time impl for macos and windows
@@ -225,6 +240,7 @@ mod inner {
 #[cfg(target_os = "linux")]
 mod inner {
     use std::io;
+
     use time::Timespec;
 
     #[inline]
@@ -326,10 +342,11 @@ impl Instant {
         }
     }
 
-    /// It is similar to `duration_since`, but it won't panic when `self` is less than `other`,
-    /// and `None` will be returned in this case.
+    /// It is similar to `duration_since`, but it won't panic when `self` is
+    /// less than `other`, and `None` will be returned in this case.
     ///
-    /// Callers need to ensure that `self` and `other` are same type of Instants.
+    /// Callers need to ensure that `self` and `other` are same type of
+    /// Instants.
     pub fn checked_sub(&self, other: Instant) -> Option<Duration> {
         if *self >= other {
             Some(self.duration_since(other))
@@ -489,7 +506,7 @@ pub type Limiter = async_speed_limit::Limiter<CoarseClock>;
 pub type Consume = async_speed_limit::limiter::Consume<CoarseClock, ()>;
 
 /// ReadId to judge whether the read requests come from the same GRPC stream.
-#[derive(Eq, PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone, Debug)]
 pub struct ThreadReadId {
     sequence: u64,
     pub create_time: Timespec,
@@ -519,14 +536,17 @@ impl Default for ThreadReadId {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::f64;
-    use std::ops::Sub;
-    use std::thread;
-    use std::time::{Duration, SystemTime};
+    use std::{
+        ops::Sub,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
+        time::{Duration, SystemTime},
+    };
 
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use super::*;
 
     #[test]
     fn test_time_monitor() {
@@ -561,7 +581,8 @@ mod tests {
             let exp_sec = ms as f64 / 1000.0;
             let act_sec = duration_to_sec(d);
             assert!((act_sec - exp_sec).abs() < f64::EPSILON);
-            assert_eq!(ms * 1_000_000, duration_to_nanos(d));
+            assert_eq!(ms * 1_000, duration_to_us(d));
+            assert_eq!(ms * 1_000_000, duration_to_ns(d));
         }
     }
 

@@ -1,36 +1,44 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::HashMap;
-use std::fmt;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    fmt,
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{KvEngine, Snapshot};
 use grpcio::Environment;
-use kvproto::metapb::Region;
-use kvproto::raft_cmdpb::AdminCmdType;
+use kvproto::{metapb::Region, raft_cmdpb::AdminCmdType};
 use online_config::{self, ConfigChange, ConfigManager, OnlineConfig};
 use pd_client::PdClient;
-use raftstore::coprocessor::CmdBatch;
-use raftstore::coprocessor::{ObserveHandle, ObserveID};
-use raftstore::router::RaftStoreRouter;
-use raftstore::store::fsm::StoreMeta;
-use raftstore::store::util::{self, RegionReadProgress, RegionReadProgressRegistry};
-use raftstore::store::RegionSnapshot;
+use raftstore::{
+    coprocessor::{CmdBatch, ObserveHandle, ObserveId},
+    router::RaftStoreRouter,
+    store::{
+        fsm::StoreMeta,
+        util::{self, RegionReadProgress, RegionReadProgressRegistry},
+        RegionSnapshot,
+    },
+};
 use security::SecurityManager;
 use tikv::config::ResolvedTsConfig;
 use tikv_util::worker::{Runnable, RunnableWithTimer, Scheduler};
 use txn_types::{Key, TimeStamp};
 
-use crate::advance::AdvanceTsWorker;
-use crate::cmd::{ChangeLog, ChangeRow};
-use crate::metrics::*;
-use crate::resolver::Resolver;
-use crate::scanner::{ScanEntry, ScanMode, ScanTask, ScannerPool};
-use crate::sinker::{CmdSinker, SinkCmd};
+use crate::{
+    advance::AdvanceTsWorker,
+    cmd::{ChangeLog, ChangeRow},
+    metrics::*,
+    resolver::Resolver,
+    scanner::{ScanEntry, ScanMode, ScanTask, ScannerPool},
+    sinker::{CmdSinker, SinkCmd},
+};
 
 enum ResolverStatus {
     Pending {
@@ -55,8 +63,8 @@ enum PendingLock {
 }
 
 // Records information related to observed region.
-// observe_id is used for avoiding ABA problems in incremental scan task, advance resolved ts task,
-// and command observing.
+// observe_id is used for avoiding ABA problems in incremental scan task,
+// advance resolved ts task, and command observing.
 struct ObserveRegion {
     meta: Region,
     handle: ObserveHandle,
@@ -98,8 +106,9 @@ impl ObserveRegion {
                             continue;
                         }
                         ChangeLog::Admin(req_type) => {
-                            // TODO: for admin cmd that won't change the region meta like peer list and key range
-                            // (i.e. `CompactLog`, `ComputeHash`) we may not need to return error
+                            // TODO: for admin cmd that won't change the region meta like peer list
+                            // and key range (i.e. `CompactLog`, `ComputeHash`) we may not need to
+                            // return error
                             return Err(format!(
                                 "region met admin command {:?} while initializing resolver",
                                 req_type
@@ -125,6 +134,7 @@ impl ObserveRegion {
                                 }),
                                 // One pc command do not contains any lock, so just skip it
                                 ChangeRow::OnePc { .. } => {}
+                                ChangeRow::IngestSsT => {}
                             });
                             assert!(
                                 *tracked_index < *index,
@@ -159,8 +169,9 @@ impl ObserveRegion {
                                     "region met split/merge command, stop tracking since key range changed, wait for re-register";
                                     "req_type" => ?req_type,
                                 );
-                                // Stop tracking so that `tracked_index` larger than the split/merge command index won't be published
-                                // untill `RegionUpdate` event trigger the region re-register and re-scan the new key range
+                                // Stop tracking so that `tracked_index` larger than the split/merge
+                                // command index won't be published until `RegionUpdate` event
+                                // trigger the region re-register and re-scan the new key range
                                 self.resolver.stop_tracking();
                             }
                             _ => {
@@ -180,7 +191,12 @@ impl ObserveRegion {
                                     .resolver
                                     .untrack_lock(&key.to_raw().unwrap(), Some(*index)),
                                 // One pc command do not contains any lock, so just skip it
-                                ChangeRow::OnePc { .. } => {}
+                                ChangeRow::OnePc { .. } => {
+                                    self.resolver.update_tracked_index(*index);
+                                }
+                                ChangeRow::IngestSsT => {
+                                    self.resolver.update_tracked_index(*index);
+                                }
                             });
                         }
                     }
@@ -245,6 +261,7 @@ impl ObserveRegion {
 }
 
 pub struct Endpoint<T, E: KvEngine, C> {
+    store_id: Option<u64>,
     cfg: ResolvedTsConfig,
     cfg_version: usize,
     store_meta: Arc<Mutex<StoreMeta>>,
@@ -274,7 +291,10 @@ where
         security_mgr: Arc<SecurityManager>,
         sinker: C,
     ) -> Self {
-        let region_read_progress = store_meta.lock().unwrap().region_read_progress.clone();
+        let (region_read_progress, store_id) = {
+            let meta = store_meta.lock().unwrap();
+            (meta.region_read_progress.clone(), meta.store_id)
+        };
         let advance_worker = AdvanceTsWorker::new(
             pd_client,
             scheduler.clone(),
@@ -286,6 +306,7 @@ where
         );
         let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, raft_router);
         let ep = Self {
+            store_id,
             cfg: cfg.clone(),
             cfg_version: 0,
             scheduler,
@@ -356,7 +377,7 @@ where
                         entries,
                         apply_index,
                     })
-                    .unwrap_or_else(|e| debug!("schedule resolved ts task failed"; "err" => ?e));
+                    .unwrap_or_else(|e| warn!("schedule resolved ts task failed"; "err" => ?e));
                 RTS_SCAN_TASKS.with_label_values(&["finish"]).inc();
             }),
             on_error: Some(Box::new(move |observe_id, _region, e| {
@@ -366,7 +387,7 @@ where
                         observe_id,
                         cause: format!("met error while handle scan task {:?}", e),
                     })
-                    .unwrap();
+                    .unwrap_or_else(|schedule_err| warn!("schedule re-register task failed"; "err" => ?schedule_err, "re-register cause" => ?e));
                 RTS_SCAN_TASKS.with_label_values(&["abort"]).inc();
             })),
         }
@@ -382,7 +403,7 @@ where
 
             info!(
                 "deregister observe region";
-                "store_id" => ?self.store_meta.lock().unwrap().store_id,
+                "store_id" => ?self.get_or_init_store_id(),
                 "region_id" => region_id,
                 "observe_id" => ?handle.id
             );
@@ -408,15 +429,17 @@ where
                 return;
             }
             // TODO: may not need to re-register region for some cases:
-            // - `Split/BatchSplit`, which can be handled by remove out-of-range locks from the `Resolver`'s lock heap
+            // - `Split/BatchSplit`, which can be handled by remove out-of-range locks from
+            //   the `Resolver`'s lock heap
             // - `PrepareMerge` and `RollbackMerge`, the key range is unchanged
             self.deregister_region(region_id);
             self.register_region(incoming_region);
         }
     }
 
-    // This function is corresponding to RegionDestroyed event that can be only scheduled by observer.
-    // To prevent destroying region for wrong peer, it should check the region epoch at first.
+    // This function is corresponding to RegionDestroyed event that can be only
+    // scheduled by observer. To prevent destroying region for wrong peer, it
+    // should check the region epoch at first.
     fn region_destroyed(&mut self, region: Region) {
         if let Some(observe_region) = self.regions.get(&region.id) {
             if util::compare_region_epoch(
@@ -441,7 +464,7 @@ where
     }
 
     // Deregister current observed region and try to register it again.
-    fn re_register_region(&mut self, region_id: u64, observe_id: ObserveID, cause: String) {
+    fn re_register_region(&mut self, region_id: u64, observe_id: ObserveId, cause: String) {
         if let Some(observe_region) = self.regions.get(&region_id) {
             if observe_region.handle.id != observe_id {
                 warn!("resolved ts deregister region failed due to observe_id not match");
@@ -488,7 +511,8 @@ where
         self.sinker.sink_resolved_ts(regions, ts);
     }
 
-    // Tracking or untracking locks with incoming commands that corresponding observe id is valid.
+    // Tracking or untracking locks with incoming commands that corresponding
+    // observe id is valid.
     #[allow(clippy::drop_ref)]
     fn handle_change_log(
         &mut self,
@@ -501,7 +525,7 @@ where
             .into_iter()
             .filter_map(|batch| {
                 if !batch.is_empty() {
-                    if let Some(observe_region) = self.regions.get_mut(&batch.region.get_id()) {
+                    if let Some(observe_region) = self.regions.get_mut(&batch.region_id) {
                         let observe_id = batch.rts_id;
                         let region_id = observe_region.meta.id;
                         if observe_region.handle.id == observe_id {
@@ -517,7 +541,7 @@ where
                             });
                         } else {
                             debug!("resolved ts CmdBatch discarded";
-                                "region_id" => batch.region.get_id(),
+                                "region_id" => batch.region_id,
                                 "observe_id" => ?batch.rts_id,
                                 "current" => ?observe_region.handle.id,
                             );
@@ -536,7 +560,7 @@ where
     fn handle_scan_locks(
         &mut self,
         region_id: u64,
-        observe_id: ObserveID,
+        observe_id: ObserveId,
         entries: Vec<ScanEntry>,
         apply_index: u64,
     ) {
@@ -553,7 +577,8 @@ where
     }
 
     fn register_advance_event(&self, cfg_version: usize) {
-        // Ignore advance event that registered with previous `advance_ts_interval` config
+        // Ignore advance event that registered with previous `advance_ts_interval`
+        // config
         if self.cfg_version != cfg_version {
             return;
         }
@@ -566,7 +591,10 @@ where
     fn handle_change_config(&mut self, change: ConfigChange) {
         let prev = format!("{:?}", self.cfg);
         let prev_advance_ts_interval = self.cfg.advance_ts_interval;
-        self.cfg.update(change);
+        if let Err(e) = self.cfg.update(change) {
+            error!("update resolved-ts config unexpectly failed"; "err" => ?e);
+            return;
+        }
         if self.cfg.advance_ts_interval != prev_advance_ts_interval {
             // Increase the `cfg_version` to reject advance event that registered before
             self.cfg_version += 1;
@@ -578,6 +606,14 @@ where
             "prev" => prev,
             "current" => ?self.cfg,
         );
+    }
+
+    fn get_or_init_store_id(&mut self) -> Option<u64> {
+        self.store_id.or_else(|| {
+            let meta = self.store_meta.lock().unwrap();
+            self.store_id = meta.store_id;
+            meta.store_id
+        })
     }
 }
 
@@ -592,7 +628,7 @@ pub enum Task<S: Snapshot> {
     },
     ReRegisterRegion {
         region_id: u64,
-        observe_id: ObserveID,
+        observe_id: ObserveId,
         cause: String,
     },
     RegisterAdvanceEvent {
@@ -608,7 +644,7 @@ pub enum Task<S: Snapshot> {
     },
     ScanLocks {
         region_id: u64,
-        observe_id: ObserveID,
+        observe_id: ObserveId,
         entries: Vec<ScanEntry>,
         apply_index: u64,
     },
@@ -747,10 +783,14 @@ where
     C: CmdSinker<E::Snapshot>,
 {
     fn on_timeout(&mut self) {
+        let store_id = self.get_or_init_store_id();
         let (mut oldest_ts, mut oldest_region, mut zero_ts_count) = (u64::MAX, 0, 0);
+        let (mut oldest_leader_ts, mut oldest_leader_region) = (u64::MAX, 0);
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
-                let ts = read_progress.safe_ts();
+                let (peers, leader_info) = read_progress.dump_leader_info();
+                let leader_store_id = crate::util::find_store_id(&peers, leader_info.peer_id);
+                let ts = leader_info.get_read_state().get_safe_ts();
                 if ts == 0 {
                     zero_ts_count += 1;
                     continue;
@@ -758,6 +798,13 @@ where
                 if ts < oldest_ts {
                     oldest_ts = ts;
                     oldest_region = *region_id;
+                }
+
+                if let (Some(store_id), Some(leader_store_id)) = (store_id, leader_store_id) {
+                    if leader_store_id == store_id && ts < oldest_leader_ts {
+                        oldest_leader_ts = ts;
+                        oldest_leader_region = *region_id;
+                    }
                 }
             }
         });
@@ -786,6 +833,14 @@ where
         RTS_MIN_RESOLVED_TS_GAP.set(
             TimeStamp::physical_now().saturating_sub(TimeStamp::from(oldest_ts).physical()) as i64,
         );
+
+        RTS_MIN_LEADER_RESOLVED_TS_REGION.set(oldest_leader_region as i64);
+        RTS_MIN_LEADER_RESOLVED_TS.set(oldest_leader_ts as i64);
+        RTS_MIN_LEADER_RESOLVED_TS_GAP.set(
+            TimeStamp::physical_now().saturating_sub(TimeStamp::from(oldest_leader_ts).physical())
+                as i64,
+        );
+
         RTS_LOCK_HEAP_BYTES_GAUGE.set(lock_heap_size as i64);
         RTS_REGION_RESOLVE_STATUS_GAUGE_VEC
             .with_label_values(&["resolved"])

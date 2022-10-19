@@ -1,8 +1,9 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::{
+    sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+    time::Duration,
+};
 
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
@@ -15,6 +16,7 @@ use tikv_util::HandyRwLock;
 fn test_async_io_commit_without_leader_persist() {
     let mut cluster = new_node_cluster(0, 3);
     cluster.cfg.raft_store.cmd_batch_concurrent_ready_max_count = 0;
+    cluster.cfg.raft_store.store_io_pool_size = 2;
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -50,6 +52,7 @@ fn test_async_io_commit_without_leader_persist() {
 #[test]
 fn test_async_io_delay_destroy_after_conf_change() {
     let mut cluster = new_node_cluster(0, 3);
+    cluster.cfg.raft_store.store_io_pool_size = 2;
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
@@ -93,6 +96,7 @@ fn test_async_io_delay_destroy_after_conf_change() {
 #[test]
 fn test_async_io_cannot_destroy_when_persist_snapshot() {
     let mut cluster = new_node_cluster(0, 3);
+    cluster.cfg.raft_store.store_io_pool_size = 2;
     configure_for_snapshot(&mut cluster);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -104,6 +108,10 @@ fn test_async_io_cannot_destroy_when_persist_snapshot() {
     let peer_3 = find_peer(&region, 3).cloned().unwrap();
 
     cluster.must_transfer_leader(region.get_id(), peer_1);
+
+    cluster.must_put(b"k", b"v");
+    // Make sure peer 3 exists
+    must_get_equal(&cluster.get_engine(3), b"k", b"v");
 
     let dropped_msgs = Arc::new(Mutex::new(Vec::new()));
     let send_filter = Box::new(
@@ -171,6 +179,7 @@ fn test_async_io_cannot_destroy_when_persist_snapshot() {
 #[test]
 fn test_async_io_cannot_handle_ready_when_persist_snapshot() {
     let mut cluster = new_node_cluster(0, 3);
+    cluster.cfg.raft_store.store_io_pool_size = 2;
     configure_for_snapshot(&mut cluster);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();

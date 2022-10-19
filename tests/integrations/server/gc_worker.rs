@@ -1,11 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::sync::Arc;
+
 use collections::HashMap;
 use engine_traits::{Peekable, CF_WRITE};
 use grpcio::{ChannelBuilder, Environment};
 use keys::data_key;
 use kvproto::{kvrpcpb::*, metapb, tikvpb::TikvClient};
-use std::sync::Arc;
 use test_raftstore::*;
 use tikv::server::gc_worker::sync_gc;
 use tikv_util::HandyRwLock;
@@ -138,13 +139,13 @@ fn test_applied_lock_collector() {
     // Lock observer should only collect values in lock CF.
     let key = b"key0";
     must_kv_prewrite(
-        &leader_client,
+        leader_client,
         ctx.clone(),
         vec![new_mutation(Op::Put, key, &b"v".repeat(1024))],
         key.to_vec(),
         1,
     );
-    must_kv_commit(&leader_client, ctx.clone(), vec![key.to_vec()], 1, 2, 2);
+    must_kv_commit(leader_client, ctx.clone(), vec![key.to_vec()], 1, 2, 2);
     wait_for_apply(&mut cluster, &region);
     clients.iter().for_each(|(_, c)| {
         let locks = must_check_lock_observer(c, safe_point, true);
@@ -154,7 +155,7 @@ fn test_applied_lock_collector() {
 
     // Lock observer shouldn't collect locks after the safe point.
     must_kv_prewrite(
-        &leader_client,
+        leader_client,
         ctx.clone(),
         vec![new_mutation(Op::Put, key, b"v")],
         key.to_vec(),
@@ -171,7 +172,7 @@ fn test_applied_lock_collector() {
     let mutations = (1..1000)
         .map(|i| new_mutation(Op::Put, format!("key{}", i).as_bytes(), b"v"))
         .collect();
-    must_kv_prewrite(&leader_client, ctx.clone(), mutations, b"key1".to_vec(), 10);
+    must_kv_prewrite(leader_client, ctx.clone(), mutations, b"key1".to_vec(), 10);
     wait_for_apply(&mut cluster, &region);
     clients.iter().for_each(|(_, c)| {
         let locks = must_check_lock_observer(c, safe_point, true);
@@ -199,7 +200,7 @@ fn test_applied_lock_collector() {
         .map(|i| new_mutation(Op::Put, format!("key{}", i).as_bytes(), b"v"))
         .collect();
     must_kv_prewrite(
-        &leader_client,
+        leader_client,
         ctx.clone(),
         mutations,
         b"key1000".to_vec(),
@@ -225,14 +226,15 @@ fn test_applied_lock_collector() {
         assert_eq!(resp.get_locks().len(), 1024);
     });
 
-    // Register lock observer at a later safe point. Lock observer should reset its state.
+    // Register lock observer at a later safe point. Lock observer should reset its
+    // state.
     safe_point += 1;
     clients.iter().for_each(|(_, c)| {
         must_register_lock_observer(c, safe_point);
         assert!(must_check_lock_observer(c, safe_point, true).is_empty());
         // Can't register observer with smaller max_ts.
         assert!(
-            !register_lock_observer(&c, safe_point - 1)
+            !register_lock_observer(c, safe_point - 1)
                 .get_error()
                 .is_empty()
         );
@@ -240,7 +242,7 @@ fn test_applied_lock_collector() {
     });
     let leader_client = clients.get(&leader_store_id).unwrap();
     must_kv_prewrite(
-        &leader_client,
+        leader_client,
         ctx,
         vec![new_mutation(Op::Put, b"key1100", b"v")],
         b"key1100".to_vec(),
@@ -265,11 +267,11 @@ fn test_applied_lock_collector() {
     });
 }
 
-// Since v5.0 GC bypasses Raft, which means GC scans/deletes records with `keys::DATA_PREFIX`.
-// This case ensures it's performed correctly.
+// Since v5.0 GC bypasses Raft, which means GC scans/deletes records with
+// `keys::DATA_PREFIX`. This case ensures it's performed correctly.
 #[test]
 fn test_gc_bypass_raft() {
-    let (cluster, leader, ctx) = must_new_cluster_mul(1);
+    let (cluster, leader, ctx) = must_new_cluster_mul(2);
     cluster.pd_client.disable_default_operator();
 
     let env = Arc::new(Environment::new(1));
@@ -298,17 +300,25 @@ fn test_gc_bypass_raft() {
         assert!(engine.kv.get_value_cf(CF_WRITE, &key).unwrap().is_some());
     }
 
-    let gc_sched = cluster.sim.rl().get_gc_worker(1).scheduler();
-    assert!(sync_gc(&gc_sched, 0, b"k1".to_vec(), b"k2".to_vec(), 200.into()).is_ok());
+    let node_ids = cluster.get_node_ids();
+    for store_id in node_ids {
+        let gc_sched = cluster.sim.rl().get_gc_worker(store_id).scheduler();
 
-    for &start_ts in &[10, 20, 30] {
-        let commit_ts = start_ts + 5;
-        let key = Key::from_raw(b"k1").append_ts(start_ts.into());
-        let key = data_key(key.as_encoded());
-        assert!(engine.kv.get_value(&key).unwrap().is_none());
+        let mut region = cluster.get_region(b"a");
+        region.set_start_key(b"k1".to_vec());
+        region.set_end_key(b"k2".to_vec());
+        sync_gc(&gc_sched, region, 200.into()).unwrap();
 
-        let key = Key::from_raw(b"k1").append_ts(commit_ts.into());
-        let key = data_key(key.as_encoded());
-        assert!(engine.kv.get_value_cf(CF_WRITE, &key).unwrap().is_none());
+        let engine = cluster.engines.get(&store_id).unwrap();
+        for &start_ts in &[10, 20, 30] {
+            let commit_ts = start_ts + 5;
+            let key = Key::from_raw(b"k1").append_ts(start_ts.into());
+            let key = data_key(key.as_encoded());
+            assert!(engine.kv.get_value(&key).unwrap().is_none());
+
+            let key = Key::from_raw(b"k1").append_ts(commit_ts.into());
+            let key = data_key(key.as_encoded());
+            assert!(engine.kv.get_value_cf(CF_WRITE, &key).unwrap().is_none());
+        }
     }
 }
