@@ -33,7 +33,7 @@ impl<'a> JsonRef<'a> {
             ));
         }
         for expr in path_expr_list {
-            if expr.contains_any_asterisk() {
+            if expr.contains_any_asterisk() || expr.contains_any_range() {
                 return Err(box_err!(
                     "Invalid path expression: expected no asterisk, found {:?}",
                     expr
@@ -41,7 +41,7 @@ impl<'a> JsonRef<'a> {
             }
         }
         let mut res = self.to_owned();
-        for (expr, value) in path_expr_list.iter().zip(values.into_iter()) {
+        for (expr, value) in path_expr_list.iter().zip(values) {
             let modifier = BinaryModifier::new(res.as_ref());
             res = match mt {
                 ModifyType::Insert => modifier.insert(expr, value)?,

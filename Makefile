@@ -137,6 +137,7 @@ export TIKV_BUILD_GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2> /dev/
 
 export DOCKER_IMAGE_NAME ?= "pingcap/tikv"
 export DOCKER_IMAGE_TAG ?= "latest"
+export DEV_DOCKER_IMAGE_NAME ?= "pingcap/tikv_dev"
 
 # Turn on cargo pipelining to add more build parallelism. This has shown decent
 # speedups in TiKV.
@@ -330,11 +331,11 @@ unset-override:
 
 pre-format: unset-override
 	@rustup component add rustfmt
-	@which cargo-sort &> /dev/null || cargo install -q cargo-sort 
+	@which cargo-sort &> /dev/null || cargo install -q cargo-sort
 
 format: pre-format
 	@cargo fmt
-	@cargo sort -w >/dev/null 
+	@cargo sort -w -c &>/dev/null || cargo sort -w >/dev/null
 
 doc:
 	@cargo doc --workspace --document-private-items \
@@ -346,6 +347,7 @@ pre-clippy: unset-override
 
 clippy: pre-clippy
 	@./scripts/check-redact-log
+	@./scripts/check-log-style
 	@./scripts/check-docker-build
 	@./scripts/check-license
 	@./scripts/clippy-all
@@ -395,6 +397,14 @@ docker:
 		--build-arg GIT_TAG=${TIKV_BUILD_GIT_TAG} \
 		--build-arg GIT_BRANCH=${TIKV_BUILD_GIT_BRANCH} \
 		.
+
+docker_test:
+	docker build -f Dockerfile.test \
+		-t ${DEV_DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+		.
+	docker run -i -v $(shell pwd):/tikv \
+		${DEV_DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+		make test
 
 ## The driver for script/run-cargo.sh
 ## ----------------------------------

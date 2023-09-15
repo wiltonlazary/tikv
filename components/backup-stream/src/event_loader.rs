@@ -1,18 +1,14 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    marker::PhantomData,
-    sync::{atomic::Ordering, Arc},
-    time::Duration,
-};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 use futures::executor::block_on;
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 use raftstore::{
-    coprocessor::RegionInfoProvider,
-    router::RaftStoreRouter,
-    store::{fsm::ChangeObserver, Callback, SignificantMsg},
+    coprocessor::{ObserveHandle, RegionInfoProvider},
+    router::CdcHandle,
+    store::{fsm::ChangeObserver, Callback},
 };
 use tikv::storage::{
     kv::StatisticsSummary,
@@ -37,13 +33,13 @@ use crate::{
     errors::{ContextualResultExt, Error, Result},
     metrics,
     router::{ApplyEvent, ApplyEvents, Router},
-    subscription_track::{SubscriptionTracer, TwoPhaseResolver},
+    subscription_track::{Ref, RefMut, SubscriptionTracer, TwoPhaseResolver},
     try_send,
     utils::{self, RegionPager},
     Task,
 };
 
-const MAX_GET_SNAPSHOT_RETRY: usize = 3;
+const MAX_GET_SNAPSHOT_RETRY: usize = 5;
 
 #[derive(Clone)]
 pub struct PendingMemoryQuota(Arc<Semaphore>);
@@ -204,7 +200,7 @@ impl<E, R, RT> InitialDataLoader<E, R, RT>
 where
     E: KvEngine,
     R: RegionInfoProvider + Clone + 'static,
-    RT: RaftStoreRouter<E>,
+    RT: CdcHandle<E>,
 {
     pub fn new(
         router: RT,
@@ -236,7 +232,8 @@ where
     ) -> Result<impl Snapshot> {
         let mut last_err = None;
         for _ in 0..MAX_GET_SNAPSHOT_RETRY {
-            let r = self.observe_over(region, cmd());
+            let c = cmd();
+            let r = self.observe_over(region, c);
             match r {
                 Ok(s) => {
                     return Ok(s);
@@ -268,7 +265,7 @@ where
                     if !can_retry {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(500));
+                    std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
             }
@@ -291,33 +288,33 @@ where
 
         let (callback, fut) =
             tikv_util::future::paired_future_callback::<std::result::Result<_, Error>>();
+
         self.router
-            .significant_send(
-                region.id,
-                SignificantMsg::CaptureChange {
-                    cmd,
-                    region_epoch: region.get_region_epoch().clone(),
-                    callback: Callback::read(Box::new(|snapshot| {
-                        if snapshot.response.get_header().has_error() {
-                            callback(Err(Error::RaftRequest(
-                                snapshot.response.get_header().get_error().clone(),
-                            )));
-                            return;
-                        }
-                        if let Some(snap) = snapshot.snapshot {
-                            callback(Ok(snap));
-                            return;
-                        }
-                        callback(Err(Error::Other(box_err!(
-                            "PROBABLY BUG: the response contains neither error nor snapshot"
-                        ))))
-                    })),
-                },
+            .capture_change(
+                region.get_id(),
+                region.get_region_epoch().clone(),
+                cmd,
+                Callback::read(Box::new(|snapshot| {
+                    if snapshot.response.get_header().has_error() {
+                        callback(Err(Error::RaftRequest(
+                            snapshot.response.get_header().get_error().clone(),
+                        )));
+                        return;
+                    }
+                    if let Some(snap) = snapshot.snapshot {
+                        callback(Ok(snap));
+                        return;
+                    }
+                    callback(Err(Error::Other(box_err!(
+                        "PROBABLY BUG: the response contains neither error nor snapshot"
+                    ))))
+                })),
             )
             .context(format_args!(
                 "failed to register the observer to region {}",
                 region.get_id()
             ))?;
+
         let snap = block_on(fut)
             .map_err(|err| {
                 annotate!(
@@ -335,17 +332,19 @@ where
         Ok(snap)
     }
 
-    pub fn with_resolver<T: 'static>(
+    fn with_resolver<T: 'static>(
         &self,
         region: &Region,
+        handle: &ObserveHandle,
         f: impl FnOnce(&mut TwoPhaseResolver) -> Result<T>,
     ) -> Result<T> {
-        Self::with_resolver_by(&self.tracing, region, f)
+        Self::with_resolver_by(&self.tracing, region, handle, f)
     }
 
-    pub fn with_resolver_by<T: 'static>(
+    fn with_resolver_by<T: 'static>(
         tracing: &SubscriptionTracer,
         region: &Region,
+        handle: &ObserveHandle,
         f: impl FnOnce(&mut TwoPhaseResolver) -> Result<T>,
     ) -> Result<T> {
         let region_id = region.get_id();
@@ -353,6 +352,8 @@ where
             .get_subscription_of(region_id)
             .ok_or_else(|| Error::Other(box_err!("observer for region {} canceled", region_id)))
             .and_then(|v| {
+                // NOTE: once we have compared the observer handle, perhaps we can remove this 
+                // check because epoch version changed implies observer handle changed.
                 raftstore::store::util::compare_region_epoch(
                     region.get_region_epoch(),
                     &v.value().meta,
@@ -362,6 +363,10 @@ where
                     true,
                     false,
                 )?;
+                if v.value().handle().id != handle.id {
+                    return Err(box_err!("stale observe handle {:?}, should be {:?}, perhaps new initial scanning starts", 
+                        handle.id, v.value().handle().id));
+                }
                 Ok(v)
             })
             .map_err(|err| Error::Contextual {
@@ -379,6 +384,7 @@ where
     fn scan_and_async_send(
         &self,
         region: &Region,
+        handle: &ObserveHandle,
         mut event_loader: EventLoader<impl Snapshot>,
         join_handles: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<Statistics> {
@@ -401,7 +407,9 @@ where
             // and we would exit after the first run of loop :(
             let no_progress = event_loader.entry_batch.is_empty();
             let stat = stat?;
-            self.with_resolver(region, |r| event_loader.emit_entries_to(&mut events, r))?;
+            self.with_resolver(region, handle, |r| {
+                event_loader.emit_entries_to(&mut events, r)
+            })?;
             if no_progress {
                 metrics::INITIAL_SCAN_DURATION.observe(start.saturating_elapsed_secs());
                 return Ok(stats.stat);
@@ -429,6 +437,8 @@ where
     pub fn do_initial_scan(
         &self,
         region: &Region,
+        // We are using this handle for checking whether the initial scan is stale.
+        handle: ObserveHandle,
         start_ts: TimeStamp,
         snap: impl Snapshot,
     ) -> Result<Statistics> {
@@ -440,13 +450,13 @@ where
 
         // It is ok to sink more data than needed. So scan to +inf TS for convenance.
         let event_loader = EventLoader::load_from(snap, start_ts, TimeStamp::max(), region)?;
-        let stats = self.scan_and_async_send(region, event_loader, &mut join_handles)?;
+        let stats = self.scan_and_async_send(region, &handle, event_loader, &mut join_handles)?;
 
         Handle::current()
             .block_on(futures::future::try_join_all(join_handles))
             .map_err(|err| annotate!(err, "tokio runtime failed to join consuming threads"))?;
 
-        Self::with_resolver_by(&tr, region, |r| {
+        Self::with_resolver_by(&tr, region, &handle, |r| {
             r.phase_one_done();
             Ok(())
         })
@@ -474,13 +484,10 @@ where
                 // is still little chance to lost data: For example, if a region cannot elect
                 // the leader for long time. (say, net work partition) At that time, we have
                 // nowhere to record the lock status of this region.
-                let success = try_send!(
+                try_send!(
                     self.scheduler,
                     Task::ModifyObserve(ObserveOp::Start { region: r.region })
                 );
-                if success {
-                    crate::observer::IN_FLIGHT_START_OBSERVE_MESSAGE.fetch_add(1, Ordering::SeqCst);
-                }
             }
         }
         Ok(())

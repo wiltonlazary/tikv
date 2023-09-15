@@ -1,15 +1,19 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::*, time::Duration};
+use std::{
+    sync::*,
+    time::{Duration, Instant},
+};
 
 use causal_ts::CausalTsProvider;
-use cdc::{recv_timeout, CdcObserver, FeatureGate, MemoryQuota, Task};
+use cdc::{recv_timeout, CdcObserver, Delegate, FeatureGate, Task, Validate};
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::RocksEngine;
 use futures::executor::block_on;
 use grpcio::{
-    ChannelBuilder, ClientDuplexReceiver, ClientDuplexSender, ClientUnaryReceiver, Environment,
+    CallOption, ChannelBuilder, ClientDuplexReceiver, ClientDuplexSender, ClientUnaryReceiver,
+    Environment, MetadataBuilder,
 };
 use kvproto::{
     cdcpb::{create_change_data, ChangeDataClient, ChangeDataEvent, ChangeDataRequest},
@@ -17,11 +21,12 @@ use kvproto::{
     tikvpb::TikvClient,
 };
 use online_config::OnlineConfig;
-use raftstore::coprocessor::CoprocessorHost;
+use raftstore::{coprocessor::CoprocessorHost, router::CdcRaftRouter};
 use test_raftstore::*;
-use tikv::{config::CdcConfig, server::DEFAULT_CLUSTER_ID};
+use tikv::{config::CdcConfig, server::DEFAULT_CLUSTER_ID, storage::kv::LocalTablets};
 use tikv_util::{
     config::ReadableDuration,
+    memory::MemoryQuota,
     worker::{LazyWorker, Runnable},
     HandyRwLock,
 };
@@ -45,7 +50,6 @@ impl ClientReceiver {
         std::mem::replace(&mut *self.receiver.lock().unwrap(), rx)
     }
 }
-
 #[allow(clippy::type_complexity)]
 pub fn new_event_feed(
     client: &ChangeDataClient,
@@ -54,7 +58,37 @@ pub fn new_event_feed(
     ClientReceiver,
     Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
 ) {
-    let (req_tx, resp_rx) = client.event_feed().unwrap();
+    create_event_feed(client, false)
+}
+
+#[allow(clippy::type_complexity)]
+pub fn new_event_feed_v2(
+    client: &ChangeDataClient,
+) -> (
+    ClientDuplexSender<ChangeDataRequest>,
+    ClientReceiver,
+    Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
+) {
+    create_event_feed(client, true)
+}
+
+#[allow(clippy::type_complexity)]
+fn create_event_feed(
+    client: &ChangeDataClient,
+    stream_multiplexing: bool,
+) -> (
+    ClientDuplexSender<ChangeDataRequest>,
+    ClientReceiver,
+    Box<dyn Fn(bool) -> ChangeDataEvent + Send>,
+) {
+    let (req_tx, resp_rx) = if stream_multiplexing {
+        let mut metadata = MetadataBuilder::with_capacity(1);
+        metadata.add_str("features", "stream-multiplexing").unwrap();
+        let opt = CallOption::default().headers(metadata.build());
+        client.event_feed_v2_opt(opt).unwrap()
+    } else {
+        client.event_feed().unwrap()
+    };
     let event_feed_wrap = Arc::new(Mutex::new(Some(resp_rx)));
     let event_feed_wrap_clone = event_feed_wrap.clone();
 
@@ -134,6 +168,7 @@ impl TestSuiteBuilder {
         let count = cluster.count;
         let pd_cli = cluster.pd_client.clone();
         let mut endpoints = HashMap::default();
+        let mut quotas = HashMap::default();
         let mut obs = HashMap::default();
         let mut concurrency_managers = HashMap::default();
         // Hack! node id are generated from 1..count+1.
@@ -143,15 +178,14 @@ impl TestSuiteBuilder {
             let mut sim = cluster.sim.wl();
 
             // Register cdc service to gRPC server.
+            let memory_quota = Arc::new(MemoryQuota::new(memory_quota));
+            let memory_quota_ = memory_quota.clone();
             let scheduler = worker.scheduler();
             sim.pending_services
                 .entry(id)
                 .or_default()
                 .push(Box::new(move || {
-                    create_change_data(cdc::Service::new(
-                        scheduler.clone(),
-                        MemoryQuota::new(memory_quota),
-                    ))
+                    create_change_data(cdc::Service::new(scheduler.clone(), memory_quota_.clone()))
                 }));
             sim.txn_extra_schedulers.insert(
                 id,
@@ -166,6 +200,7 @@ impl TestSuiteBuilder {
                 },
             ));
             endpoints.insert(id, worker);
+            quotas.insert(id, memory_quota);
         }
 
         runner(&mut cluster);
@@ -179,17 +214,18 @@ impl TestSuiteBuilder {
             let mut cdc_endpoint = cdc::Endpoint::new(
                 DEFAULT_CLUSTER_ID,
                 &cfg,
+                false,
                 cluster.cfg.storage.api_version(),
                 pd_cli.clone(),
                 worker.scheduler(),
-                raft_router,
-                cluster.engines[id].kv.clone(),
+                CdcRaftRouter(raft_router),
+                LocalTablets::Singleton(cluster.engines[id].kv.clone()),
                 cdc_ob,
                 cluster.store_metas[id].clone(),
                 cm.clone(),
                 env,
                 sim.security_mgr.clone(),
-                MemoryQuota::new(usize::MAX),
+                quotas[id].clone(),
                 sim.get_causal_ts_provider(*id),
             );
             let mut updated_cfg = cfg.clone();
@@ -233,7 +269,7 @@ impl TestSuite {
     pub fn new(count: usize, api_version: ApiVersion) -> TestSuite {
         let mut cluster = new_server_cluster_with_api_ver(1, count, api_version);
         // Increase the Raft tick interval to make this test case running reliably.
-        configure_for_lease_read(&mut cluster, Some(100), None);
+        configure_for_lease_read(&mut cluster.cfg, Some(100), None);
         // Disable background renew to make timestamp predictable.
         configure_for_causal_ts(&mut cluster, "0s", 1);
 
@@ -267,8 +303,21 @@ impl TestSuite {
         pk: Vec<u8>,
         ts: TimeStamp,
     ) {
+        self.must_kv_prewrite_with_source(region_id, muts, pk, ts, 0);
+    }
+
+    pub fn must_kv_prewrite_with_source(
+        &mut self,
+        region_id: u64,
+        muts: Vec<Mutation>,
+        pk: Vec<u8>,
+        ts: TimeStamp,
+        txn_source: u64,
+    ) {
         let mut prewrite_req = PrewriteRequest::default();
-        prewrite_req.set_context(self.get_context(region_id));
+        let mut context = self.get_context(region_id);
+        context.set_txn_source(txn_source);
+        prewrite_req.set_context(context);
         prewrite_req.set_mutations(muts.into_iter().collect());
         prewrite_req.primary_lock = pk;
         prewrite_req.start_version = ts.into_inner();
@@ -312,8 +361,21 @@ impl TestSuite {
         start_ts: TimeStamp,
         commit_ts: TimeStamp,
     ) {
+        self.must_kv_commit_with_source(region_id, keys, start_ts, commit_ts, 0);
+    }
+
+    pub fn must_kv_commit_with_source(
+        &mut self,
+        region_id: u64,
+        keys: Vec<Vec<u8>>,
+        start_ts: TimeStamp,
+        commit_ts: TimeStamp,
+        txn_source: u64,
+    ) {
         let mut commit_req = CommitRequest::default();
-        commit_req.set_context(self.get_context(region_id));
+        let mut context = self.get_context(region_id);
+        context.set_txn_source(txn_source);
+        commit_req.set_context(context);
         commit_req.start_version = start_ts.into_inner();
         commit_req.set_keys(keys.into_iter().collect());
         commit_req.commit_version = commit_ts.into_inner();
@@ -522,5 +584,84 @@ impl TestSuite {
                 .async_flush(),
         )
         .unwrap();
+    }
+
+    pub fn must_wait_delegate_condition(
+        &self,
+        region_id: u64,
+        cond: Arc<dyn Fn(Option<&Delegate>) -> bool + Sync + Send>,
+    ) {
+        let scheduler = self.endpoints[&region_id].scheduler();
+        let start = Instant::now();
+        loop {
+            sleep_ms(100);
+            let (tx, rx) = mpsc::sync_channel(1);
+            let c = cond.clone();
+            let checker = move |d: Option<&Delegate>| {
+                tx.send(c(d)).unwrap();
+            };
+            scheduler
+                .schedule(Task::Validate(Validate::Region(
+                    region_id,
+                    Box::new(checker),
+                )))
+                .unwrap();
+            if rx.recv().unwrap() {
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("wait delegate timeout");
+            }
+        }
+    }
+
+    pub fn must_kv_prepare_flashback(
+        &mut self,
+        region_id: u64,
+        start_key: &[u8],
+        end_key: &[u8],
+        start_ts: TimeStamp,
+    ) {
+        let mut prepare_flashback_req = PrepareFlashbackToVersionRequest::default();
+        prepare_flashback_req.set_context(self.get_context(region_id));
+        prepare_flashback_req.set_start_key(start_key.to_vec());
+        prepare_flashback_req.set_end_key(end_key.to_vec());
+        prepare_flashback_req.set_start_ts(start_ts.into_inner());
+        let prepare_flashback_resp = self
+            .get_tikv_client(region_id)
+            .kv_prepare_flashback_to_version(&prepare_flashback_req)
+            .unwrap();
+        assert!(
+            !prepare_flashback_resp.has_region_error(),
+            "{:?}",
+            prepare_flashback_resp.get_region_error()
+        );
+    }
+
+    pub fn must_kv_flashback(
+        &mut self,
+        region_id: u64,
+        start_key: &[u8],
+        end_key: &[u8],
+        start_ts: TimeStamp,
+        commit_ts: TimeStamp,
+        version: TimeStamp,
+    ) {
+        let mut flashback_req = FlashbackToVersionRequest::default();
+        flashback_req.set_context(self.get_context(region_id));
+        flashback_req.set_start_key(start_key.to_vec());
+        flashback_req.set_end_key(end_key.to_vec());
+        flashback_req.set_start_ts(start_ts.into_inner());
+        flashback_req.set_commit_ts(commit_ts.into_inner());
+        flashback_req.set_version(version.into_inner());
+        let flashback_resp = self
+            .get_tikv_client(region_id)
+            .kv_flashback_to_version(&flashback_req)
+            .unwrap();
+        assert!(
+            !flashback_resp.has_region_error(),
+            "{:?}",
+            flashback_resp.get_region_error()
+        );
     }
 }

@@ -162,7 +162,7 @@ impl<C> SimulateTransport<C> {
     }
 }
 
-fn filter_send<H>(
+pub fn filter_send<H>(
     filters: &Arc<RwLock<Vec<Box<dyn Filter>>>>,
     msg: RaftMessage,
     mut h: H,
@@ -273,7 +273,7 @@ pub struct DefaultFilterFactory<F: Filter + Default>(PhantomData<F>);
 
 impl<F: Filter + Default + 'static> FilterFactory for DefaultFilterFactory<F> {
     fn generate(&self, _: u64) -> Vec<Box<dyn Filter>> {
-        vec![Box::new(F::default())]
+        vec![Box::<F>::default()]
     }
 }
 
@@ -831,18 +831,18 @@ impl Filter for LeaseReadFilter {
 
 #[derive(Clone)]
 pub struct DropMessageFilter {
-    ty: MessageType,
+    retain: Arc<dyn Fn(&RaftMessage) -> bool + Sync + Send>,
 }
 
 impl DropMessageFilter {
-    pub fn new(ty: MessageType) -> DropMessageFilter {
-        DropMessageFilter { ty }
+    pub fn new(retain: Arc<dyn Fn(&RaftMessage) -> bool + Sync + Send>) -> DropMessageFilter {
+        DropMessageFilter { retain }
     }
 }
 
 impl Filter for DropMessageFilter {
     fn before(&self, msgs: &mut Vec<RaftMessage>) -> Result<()> {
-        msgs.retain(|m| m.get_message().get_msg_type() != self.ty);
+        msgs.retain(|m| (self.retain)(m));
         Ok(())
     }
 }

@@ -1,10 +1,10 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use kvproto::import_sstpb::SstMeta;
 
-use crate::{errors::Result, RefIterable};
+use crate::{errors::Result, EncryptionKeyManager, RefIterable};
 
 #[derive(Clone, Debug)]
 pub struct SstMetaInfo {
@@ -22,13 +22,14 @@ pub trait SstExt: Sized {
 /// SstReader is used to read an SST file.
 pub trait SstReader: RefIterable + Sized {
     fn open(path: &str) -> Result<Self>;
+    fn open_encrypted<E: EncryptionKeyManager>(path: &str, mgr: Arc<E>) -> Result<Self>;
     fn verify_checksum(&self) -> Result<()>;
 }
 
 /// SstWriter is used to create sst files that can be added to database later.
 pub trait SstWriter: Send {
     type ExternalSstFileInfo: ExternalSstFileInfo;
-    type ExternalSstFileReader: std::io::Read;
+    type ExternalSstFileReader: std::io::Read + Send;
 
     /// Add key, value to currently opened file
     /// REQUIRES: key is after any previously added key according to comparator.

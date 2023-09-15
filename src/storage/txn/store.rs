@@ -1,7 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use kvproto::kvrpcpb::IsolationLevel;
-use txn_types::{Key, KvPair, OldValue, TimeStamp, TsSet, Value, WriteRef};
+use txn_types::{Key, KvPair, LastChange, Lock, OldValue, TimeStamp, TsSet, Value, WriteRef};
 
 use super::{Error, ErrorInner, Result};
 use crate::storage::{
@@ -158,6 +158,26 @@ impl TxnEntry {
                 ref mut old_value, ..
             } => old_value,
         }
+    }
+
+    pub fn erasing_last_change_ts(&self) -> TxnEntry {
+        let mut e = self.clone();
+        match &mut e {
+            TxnEntry::Prewrite {
+                lock: (_, value), ..
+            } => {
+                let l = Lock::parse(value).unwrap();
+                *value = l.set_last_change(LastChange::Unknown).to_bytes();
+            }
+            TxnEntry::Commit {
+                write: (_, value), ..
+            } => {
+                let mut w = WriteRef::parse(value).unwrap();
+                w.last_change = LastChange::Unknown;
+                *value = w.to_bytes();
+            }
+        }
+        e
     }
 }
 
@@ -705,10 +725,12 @@ mod tests {
                             need_old_value: false,
                             is_retry_request: false,
                             assertion_level: AssertionLevel::Off,
+                            txn_source: 0,
                         },
                         Mutation::make_put(Key::from_raw(key), key.to_vec()),
                         &None,
                         SkipPessimisticCheck,
+                        None,
                     )
                     .unwrap();
                 }

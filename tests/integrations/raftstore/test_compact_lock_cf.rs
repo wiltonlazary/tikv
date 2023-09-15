@@ -5,21 +5,19 @@ use engine_traits::{MiscExt, CF_LOCK};
 use test_raftstore::*;
 use tikv_util::config::*;
 
-fn flush<T: Simulator>(cluster: &mut Cluster<T>) {
+fn flush<T: Simulator>(cluster: &Cluster<T>) {
     for engines in cluster.engines.values() {
         engines.kv.flush_cf(CF_LOCK, true).unwrap();
     }
 }
 
-fn flush_then_check<T: Simulator>(cluster: &mut Cluster<T>, interval: u64, written: bool) {
+fn flush_then_check<T: Simulator>(cluster: &Cluster<T>, interval: u64, written: bool) {
     flush(cluster);
     // Wait for compaction.
     sleep_ms(interval * 2);
-    for engines in cluster.engines.values() {
-        let compact_write_bytes = engines
-            .kv
-            .as_inner()
-            .get_statistics_ticker_count(DBStatisticsTickerType::CompactWriteBytes);
+    for statistics in &cluster.kv_statistics {
+        let compact_write_bytes =
+            statistics.get_ticker_count(DBStatisticsTickerType::CompactWriteBytes);
         if written {
             assert!(compact_write_bytes > 0);
         } else {

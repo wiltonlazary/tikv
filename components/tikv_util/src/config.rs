@@ -131,28 +131,35 @@ impl Mul<u64> for ReadableSize {
     }
 }
 
+impl fmt::Display for ReadableSize {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let size = self.0;
+        if size == 0 {
+            write!(f, "{}KiB", size)
+        } else if size % PIB == 0 {
+            write!(f, "{}PiB", size / PIB)
+        } else if size % TIB == 0 {
+            write!(f, "{}TiB", size / TIB)
+        } else if size % GIB == 0 {
+            write!(f, "{}GiB", size / GIB)
+        } else if size % MIB == 0 {
+            write!(f, "{}MiB", size / MIB)
+        } else if size % KIB == 0 {
+            write!(f, "{}KiB", size / KIB)
+        } else {
+            write!(f, "{}B", size)
+        }
+    }
+}
+
 impl Serialize for ReadableSize {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let size = self.0;
         let mut buffer = String::new();
-        if size == 0 {
-            write!(buffer, "{}KiB", size).unwrap();
-        } else if size % PIB == 0 {
-            write!(buffer, "{}PiB", size / PIB).unwrap();
-        } else if size % TIB == 0 {
-            write!(buffer, "{}TiB", size / TIB).unwrap();
-        } else if size % GIB == 0 {
-            write!(buffer, "{}GiB", size / GIB).unwrap();
-        } else if size % MIB == 0 {
-            write!(buffer, "{}MiB", size / MIB).unwrap();
-        } else if size % KIB == 0 {
-            write!(buffer, "{}KiB", size / KIB).unwrap();
-        } else {
-            write!(buffer, "{}B", size).unwrap();
-        }
+        write!(buffer, "{}", self).unwrap();
         serializer.serialize_str(&buffer)
     }
 }
@@ -164,11 +171,11 @@ impl FromStr for ReadableSize {
     fn from_str(s: &str) -> Result<ReadableSize, String> {
         let size_str = s.trim();
         if size_str.is_empty() {
-            return Err(format!("{:?} is not a valid size.", s));
+            return Err(format!("{s:?} is not a valid size."));
         }
 
         if !size_str.is_ascii() {
-            return Err(format!("ASCII string is expected, but got {:?}", s));
+            return Err(format!("ASCII string is expected, but got {s:?}"));
         }
 
         // size: digits and '.' as decimal separator
@@ -198,15 +205,14 @@ impl FromStr for ReadableSize {
             }
             _ => {
                 return Err(format!(
-                    "only B, KB, KiB, MB, MiB, GB, GiB, TB, TiB, PB, and PiB are supported: {:?}",
-                    s
+                    "only B, KB, KiB, MB, MiB, GB, GiB, TB, TiB, PB, and PiB are supported: {s:?}"
                 ));
             }
         };
 
         match size.parse::<f64>() {
             Ok(n) => Ok(ReadableSize((n * unit as f64) as u64)),
-            Err(_) => Err(format!("invalid size string: {:?}", s)),
+            Err(_) => Err(format!("invalid size string: {s:?}")),
         }
     }
 }
@@ -255,7 +261,7 @@ impl<'de> Deserialize<'de> for ReadableSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Default)]
 pub struct ReadableDuration(pub Duration);
 
 impl Add for ReadableDuration {
@@ -384,8 +390,8 @@ impl FromStr for ReadableDuration {
         if dur.is_sign_negative() {
             return Err("duration should be positive.".to_owned());
         }
-        let secs = dur as u64 / SECOND as u64;
-        let micros = (dur as u64 % SECOND as u64) as u32 * 1_000;
+        let secs = dur as u64 / SECOND;
+        let micros = (dur as u64 % SECOND) as u32 * 1_000;
         Ok(ReadableDuration(Duration::new(secs, micros)))
     }
 }
@@ -641,6 +647,9 @@ pub fn ensure_dir_exist(path: &str) -> Result<(), Box<dyn Error>> {
 
 #[cfg(unix)]
 pub fn check_max_open_fds(expect: u64) -> Result<(), ConfigError> {
+    #[cfg(target_os = "freebsd")]
+    let expect = expect as i64;
+
     use std::mem;
 
     unsafe {
@@ -814,7 +823,7 @@ mod check_data_dir {
                 }
                 let ent = &*ent;
                 let cur_dir = CStr::from_ptr(ent.mnt_dir).to_str().unwrap();
-                if path.starts_with(&cur_dir) && cur_dir.len() >= fs.mnt_dir.len() {
+                if path.starts_with(cur_dir) && cur_dir.len() >= fs.mnt_dir.len() {
                     fs.tp = CStr::from_ptr(ent.mnt_type).to_str().unwrap().to_owned();
                     fs.opts = CStr::from_ptr(ent.mnt_opts).to_str().unwrap().to_owned();
                     fs.fsname = CStr::from_ptr(ent.mnt_fsname).to_str().unwrap().to_owned();
@@ -844,7 +853,7 @@ mod check_data_dir {
         let block_dir = "/sys/block";
         let mut device_dir = format!("{}/{}", block_dir, dev);
         if !Path::new(&device_dir).exists() {
-            let dir = fs::read_dir(&block_dir).map_err(|e| {
+            let dir = fs::read_dir(block_dir).map_err(|e| {
                 ConfigError::FileSystem(format!(
                     "{}: read block dir {:?} failed: {:?}",
                     op, block_dir, e
@@ -1554,7 +1563,7 @@ impl RaftDataStateMachine {
                 fs::remove_dir_all(&trash).unwrap();
             } else {
                 info!("Removing file"; "path" => %path.display());
-                fs::remove_file(&path).unwrap();
+                fs::remove_file(path).unwrap();
                 Self::sync_dir(path.parent().unwrap());
             }
         }
@@ -1571,11 +1580,11 @@ impl RaftDataStateMachine {
         if !path.exists() || !path.is_dir() {
             return false;
         }
-        fs::read_dir(&path).unwrap().next().is_some()
+        fs::read_dir(path).unwrap().next().is_some()
     }
 
     fn sync_dir(dir: &Path) {
-        fs::File::open(&dir).and_then(|d| d.sync_all()).unwrap();
+        fs::File::open(dir).and_then(|d| d.sync_all()).unwrap();
     }
 }
 
@@ -1789,8 +1798,8 @@ mod tests {
         ensure_dir_exist(&format!("{}", tmp_dir.to_path_buf().join("dir").display())).unwrap();
         let nodes: &[&str] = if cfg!(target_os = "linux") {
             std::os::unix::fs::symlink(
-                &tmp_dir.to_path_buf().join("dir"),
-                &tmp_dir.to_path_buf().join("symlink"),
+                tmp_dir.to_path_buf().join("dir"),
+                tmp_dir.to_path_buf().join("symlink"),
             )
             .unwrap();
             &["non_existing", "dir", "symlink"]
@@ -2116,10 +2125,10 @@ yyy = 100
                 let source_file = source.join("file");
                 let target_file = target.join("file");
                 if !target.exists() {
-                    fs::create_dir_all(&target).unwrap();
+                    fs::create_dir_all(target).unwrap();
                     check();
                 }
-                fs::copy(&source_file, &target_file).unwrap();
+                fs::copy(source_file, target_file).unwrap();
                 check();
                 state.after_dump_data_with_check(&check);
             }
@@ -2130,14 +2139,14 @@ yyy = 100
             if dst.exists() {
                 fs::remove_dir_all(dst)?;
             }
-            fs::create_dir_all(&dst)?;
+            fs::create_dir_all(dst)?;
             for entry in fs::read_dir(src)? {
                 let entry = entry?;
                 let ty = entry.file_type()?;
                 if ty.is_dir() {
                     copy_dir(&entry.path(), &dst.join(entry.file_name()))?;
                 } else {
-                    fs::copy(entry.path(), &dst.join(entry.file_name()))?;
+                    fs::copy(entry.path(), dst.join(entry.file_name()))?;
                 }
             }
             Ok(())
@@ -2151,7 +2160,7 @@ yyy = 100
         fs::create_dir_all(&target).unwrap();
         // Write some data into source.
         let source_file = source.join("file");
-        File::create(&source_file).unwrap();
+        File::create(source_file).unwrap();
 
         let backup = dir.path().join("backup");
 

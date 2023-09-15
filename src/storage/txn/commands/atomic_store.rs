@@ -8,8 +8,8 @@ use crate::storage::{
     lock_manager::LockManager,
     txn::{
         commands::{
-            Command, CommandExt, ResponsePolicy, TypedCommand, WriteCommand, WriteContext,
-            WriteResult,
+            Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand,
+            WriteContext, WriteResult,
         },
         Result,
     },
@@ -58,7 +58,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawAtomicStore {
             to_be_write,
             rows,
             pr: ProcessResult::Res,
-            lock_info: None,
+            lock_info: vec![],
+            released_locks: ReleasedLocks::new(),
+            new_acquired_locks: vec![],
             lock_guards: raw_ext.into_iter().map(|r| r.key_guard).collect(),
             response_policy: ResponsePolicy::OnApplied,
         })
@@ -75,7 +77,7 @@ mod tests {
 
     use super::*;
     use crate::storage::{
-        lock_manager::DummyLockManager, txn::scheduler::get_raw_ext, Statistics, TestEngineBuilder,
+        lock_manager::MockLockManager, txn::scheduler::get_raw_ext, Statistics, TestEngineBuilder,
     };
 
     #[test]
@@ -86,8 +88,8 @@ mod tests {
     fn test_atomic_process_write_impl<F: KvFormat>() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
         let cm = concurrency_manager::ConcurrencyManager::new(1.into());
-        let raw_keys = vec![b"ra", b"rz"];
-        let raw_values = vec![b"valuea", b"valuez"];
+        let raw_keys = [b"ra", b"rz"];
+        let raw_values = [b"valuea", b"valuez"];
         let ts_provider = super::super::test_util::gen_ts_provider(F::TAG);
 
         let mut modifies = vec![];
@@ -108,7 +110,7 @@ mod tests {
         let snap = engine.snapshot(Default::default()).unwrap();
         let raw_ext = block_on(get_raw_ext(ts_provider, cm.clone(), true, &cmd.cmd)).unwrap();
         let context = WriteContext {
-            lock_mgr: &DummyLockManager {},
+            lock_mgr: &MockLockManager::new(),
             concurrency_manager: cm,
             extra_op: kvproto::kvrpcpb::ExtraOp::Noop,
             statistics: &mut statistic,

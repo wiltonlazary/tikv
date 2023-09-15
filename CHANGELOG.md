@@ -1,6 +1,6 @@
 # TiKV Change Log
 All notable changes to this project are documented in this file.
-See also [TiDB Changelog](https://github.com/pingcap/tidb/blob/master/CHANGELOG.md) and [PD Changelog](https://github.com/pingcap/pd/blob/master/CHANGELOG.md).
+See also [TiDB Release Notes](https://github.com/pingcap/docs/blob/master/releases/release-notes.md) and [PD Changelog](https://github.com/pingcap/pd/blob/master/CHANGELOG.md).
 
 ## [5.3.0] - 2021-11-29
 
@@ -696,7 +696,7 @@ See also [TiDB Changelog](https://github.com/pingcap/tidb/blob/master/CHANGELOG.
 + Support batch-split command and empty batch command [#5470](https://github.com/tikv/tikv/pull/5470)
 + Fix `PointGetter` performance issue when there are concurrent write [#5495](https://github.com/tikv/tikv/pull/5495)
 + Fix the output on short version flag [#5501](https://github.com/tikv/tikv/pull/5501)
-+ Support the pessmistic transaction API: txn-heart-beat [#5507](https://github.com/tikv/tikv/pull/5507)
++ Support the pessimistic transaction API: txn-heart-beat [#5507](https://github.com/tikv/tikv/pull/5507)
 + `titan` GC and monitoring improvement [#5517](https://github.com/tikv/tikv/pull/5517)
 + Update `grpcio` to v0.4.5 [#5523](https://github.com/tikv/tikv/pull/5523)
 + Support GRPC memory quota [#5524](https://github.com/tikv/tikv/pull/5524)

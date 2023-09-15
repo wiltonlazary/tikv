@@ -125,6 +125,7 @@ pub enum LocksStatus {
     TransferringLeader,
     MergingRegion,
     NotLeader,
+    IsInFlashback,
 }
 
 impl fmt::Debug for PeerPessimisticLocks {
@@ -243,7 +244,7 @@ impl PeerPessimisticLocks {
         // Locks that are marked deleted still need to be moved to the new regions,
         // and the deleted mark should also be cleared.
         // Refer to the comment in `PeerPessimisticLocks` for details.
-        let removed_locks = self.map.drain_filter(|key, _| {
+        let removed_locks = self.map.extract_if(|key, _| {
             let key = &**key.as_encoded();
             let (start_key, end_key) = (derived.get_start_key(), derived.get_end_key());
             key < start_key || (!end_key.is_empty() && key >= end_key)
@@ -310,6 +311,7 @@ mod tests {
     use std::sync::Mutex;
 
     use tikv_util::defer;
+    use txn_types::LastChange;
 
     use super::*;
 
@@ -322,8 +324,10 @@ mod tests {
             primary: primary.to_vec().into_boxed_slice(),
             start_ts: 100.into(),
             ttl: 3000,
-            for_update_ts: 100.into(),
-            min_commit_ts: Default::default(),
+            for_update_ts: 110.into(),
+            min_commit_ts: 110.into(),
+            last_change: LastChange::make_exist(105.into(), 2),
+            is_locked_with_conflict: false,
         }
     }
 
@@ -424,6 +428,8 @@ mod tests {
                         ttl: 1000,
                         for_update_ts: 10.into(),
                         min_commit_ts: 20.into(),
+                        last_change: LastChange::make_exist(5.into(), 2),
+                        is_locked_with_conflict: false,
                     },
                     deleted,
                 ),

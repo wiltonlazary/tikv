@@ -1,6 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::ops::Deref;
+use std::ops::{Bound, Deref};
 
 use engine_traits::{ReadOptions, CF_DEFAULT, CF_WRITE};
 use getset::CopyGetters;
@@ -261,7 +261,7 @@ fn new_write_cursor_on_key<S: EngineSnapshot>(snapshot: &S, key: &Key) -> Cursor
         .range(Some(key.clone()), upper)
         // Use bloom filter to speed up seeking on a given prefix.
         .prefix_seek(true)
-        .hint_max_ts(Some(ts))
+        .hint_max_ts(Some(Bound::Included(ts)))
         .build()
         .unwrap()
 }
@@ -341,8 +341,8 @@ mod tests {
             old_value_cache.cache.insert(key, value.clone());
         }
 
-        assert_eq!(old_value_cache.cache.size(), size * cases as usize);
-        assert_eq!(old_value_cache.cache.len(), cases as usize);
+        assert_eq!(old_value_cache.cache.size(), size * cases);
+        assert_eq!(old_value_cache.cache.len(), cases);
         assert_eq!(old_value_cache.capacity(), capacity as usize);
 
         // Reduces capacity.
@@ -360,7 +360,7 @@ mod tests {
 
         assert_eq!(old_value_cache.cache.size(), size * remaining_count);
         assert_eq!(old_value_cache.cache.len(), remaining_count);
-        assert_eq!(old_value_cache.capacity(), new_capacity as usize);
+        assert_eq!(old_value_cache.capacity(), new_capacity);
         for i in dropped_count..cases {
             let key = Key::from_raw(&i.to_be_bytes());
             assert_eq!(old_value_cache.cache.get(&key).is_some(), true);
@@ -614,5 +614,37 @@ mod tests {
         // are filtered by `prefix_seek`.
         let perf_delta = perf_instant.delta();
         assert_eq!(perf_delta.block_read_count, 1);
+    }
+
+    #[test]
+    fn test_old_value_capacity_not_exceed_quota() {
+        let mut cache = OldValueCache::new(ReadableSize(1000));
+        fn short_val() -> OldValue {
+            OldValue::Value {
+                value: b"s".to_vec(),
+            }
+        }
+        fn long_val() -> OldValue {
+            OldValue::Value {
+                value: vec![b'l'; 1024],
+            }
+        }
+        fn enc(i: i32) -> Key {
+            Key::from_encoded(i32::to_ne_bytes(i).to_vec())
+        }
+
+        for i in 0..100 {
+            cache.insert(enc(i), (short_val(), None));
+        }
+        for i in 100..200 {
+            // access the previous key for making it not be evicted
+            cache.cache.get(&enc(i - 1));
+            cache.insert(enc(i), (long_val(), None));
+        }
+        assert!(
+            cache.cache.size() <= 1000,
+            "but it is {}",
+            cache.cache.size()
+        );
     }
 }

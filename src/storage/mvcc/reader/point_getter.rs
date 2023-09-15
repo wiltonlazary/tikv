@@ -5,7 +5,8 @@ use std::borrow::Cow;
 
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::kvrpcpb::{IsolationLevel, WriteConflictReason};
-use txn_types::{Key, Lock, LockType, TimeStamp, TsSet, Value, WriteRef, WriteType};
+use tikv_kv::SEEK_BOUND;
+use txn_types::{Key, LastChange, Lock, LockType, TimeStamp, TsSet, Value, WriteRef, WriteType};
 
 use crate::storage::{
     kv::{Cursor, CursorBuilder, ScanMode, Snapshot, Statistics},
@@ -281,10 +282,9 @@ impl<S: Snapshot> PointGetter<S> {
             return Ok(None);
         }
 
+        let mut write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
+        let mut owned_value: Vec<u8>; // To work around lifetime problem
         loop {
-            // No need to compare user key because it uses prefix seek.
-            let write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
-
             if !write.check_gc_fence_as_latest_version(self.ts) {
                 return Ok(None);
             }
@@ -315,13 +315,42 @@ impl<S: Snapshot> PointGetter<S> {
                     return Ok(None);
                 }
                 WriteType::Lock | WriteType::Rollback => {
-                    // Continue iterate next `write`.
+                    match write.last_change {
+                        LastChange::NotExist => {
+                            return Ok(None);
+                        }
+                        LastChange::Exist {
+                            last_change_ts: commit_ts,
+                            estimated_versions_to_last_change,
+                        } if estimated_versions_to_last_change >= SEEK_BOUND => {
+                            let key_with_ts = user_key.clone().append_ts(commit_ts);
+                            match self.snapshot.get_cf(CF_WRITE, &key_with_ts)? {
+                                Some(v) => owned_value = v,
+                                None => return Ok(None),
+                            }
+                            self.statistics.write.get += 1;
+                            write = WriteRef::parse(&owned_value)?;
+                            assert!(
+                                write.write_type == WriteType::Put
+                                    || write.write_type == WriteType::Delete,
+                                "Write record pointed by last_change_ts {} should be Put or Delete, but got {:?}",
+                                commit_ts,
+                                write.write_type,
+                            );
+                            continue;
+                        }
+                        _ => {
+                            // Continue iterate next `write`.
+                        }
+                    }
                 }
             }
 
             if !self.write_cursor.next(&mut self.statistics.write) {
                 return Ok(None);
             }
+            // No need to compare user key because it uses prefix seek.
+            write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
         }
     }
 
@@ -347,7 +376,7 @@ impl<S: Snapshot> PointGetter<S> {
             Ok(value)
         } else {
             Err(default_not_found_error(
-                user_key.to_raw()?,
+                user_key.clone().append_ts(write_start_ts).into_encoded(),
                 "load_data_from_default_cf",
             ))
         }
@@ -391,6 +420,13 @@ impl<S: Snapshot> PointGetter<S> {
 mod tests {
     use engine_rocks::ReadPerfInstant;
     use kvproto::kvrpcpb::{Assertion, AssertionLevel, PrewriteRequestPessimisticAction::*};
+    use tidb_query_datatype::{
+        codec::row::v2::{
+            encoder_for_test::{prepare_cols_for_test, RowEncoder},
+            RowSlice,
+        },
+        expr::EvalContext,
+    };
     use txn_types::SHORT_VALUE_MAX_LEN;
 
     use super::*;
@@ -611,7 +647,7 @@ mod tests {
         must_get_value(&mut getter, b"foo2", b"foo2v");
         let s = getter.take_statistics();
         // We have to check every version
-        assert_seek_next_prev(&s.write, 1, 40, 0);
+        assert_seek_next_prev(&s.write, 1, 0, 0);
         assert_eq!(
             s.processed_size,
             Key::from_raw(b"foo2").len()
@@ -621,7 +657,8 @@ mod tests {
         // Get again
         must_get_value(&mut getter, b"foo2", b"foo2v");
         let s = getter.take_statistics();
-        assert_seek_next_prev(&s.write, 1, 40, 0);
+        assert_seek_next_prev(&s.write, 1, 0, 0);
+        assert_eq!(s.write.get, 1);
         assert_eq!(
             s.processed_size,
             Key::from_raw(b"foo2").len()
@@ -1242,5 +1279,46 @@ mod tests {
             new_point_getter_with_iso(&mut engine, 70.into(), IsolationLevel::RcCheckTs);
         must_get_value(&mut batch_getter_ok, key4, val4);
         must_get_value(&mut batch_getter_ok, key5, val5);
+    }
+
+    #[test]
+    fn test_point_get_non_exist_skip_lock() {
+        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let k = b"k";
+
+        // Write enough LOCK recrods
+        for start_ts in (1..30).step_by(2) {
+            must_prewrite_lock(&mut engine, k, k, start_ts);
+            must_commit(&mut engine, k, start_ts, start_ts + 1);
+        }
+
+        let mut getter = new_point_getter(&mut engine, 40.into());
+        must_get_none(&mut getter, k);
+        let s = getter.take_statistics();
+        // We can know the key doesn't exist without skipping all these locks according
+        // to last_change_ts and estimated_versions_to_last_change.
+        assert_eq!(s.write.seek, 1);
+        assert_eq!(s.write.next, 0);
+        assert_eq!(s.write.get, 0);
+    }
+
+    #[test]
+    fn test_point_get_with_checksum() {
+        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let k = b"k";
+        let mut val_buf = Vec::new();
+        let columns = prepare_cols_for_test();
+        val_buf
+            .write_row_with_checksum(&mut EvalContext::default(), columns, Some(123))
+            .unwrap();
+
+        must_prewrite_put(&mut engine, k, val_buf.as_slice(), k, 1);
+        must_commit(&mut engine, k, 1, 2);
+
+        let mut getter = new_point_getter(&mut engine, 40.into());
+        let val = getter.get(&Key::from_raw(k)).unwrap().unwrap();
+        assert_eq!(val, val_buf.as_slice());
+        let row_slice = RowSlice::from_bytes(val.as_slice()).unwrap();
+        assert!(row_slice.get_checksum().unwrap().get_checksum_val() > 0);
     }
 }

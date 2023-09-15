@@ -5,7 +5,7 @@ use std::{borrow::Cow, cmp::Ordering};
 
 use engine_traits::CF_DEFAULT;
 use kvproto::kvrpcpb::{ExtraOp, IsolationLevel, WriteConflictReason};
-use txn_types::{Key, Lock, LockType, OldValue, TimeStamp, Value, WriteRef, WriteType};
+use txn_types::{Key, LastChange, Lock, LockType, OldValue, TimeStamp, Value, WriteRef, WriteType};
 
 use super::ScannerConfig;
 use crate::storage::{
@@ -472,11 +472,25 @@ impl<S: Snapshot> ScanPolicy<S> for LatestKvPolicy {
                 }
                 WriteType::Delete => break None,
                 WriteType::Lock | WriteType::Rollback => {
-                    // Continue iterate next `write`.
+                    match write.last_change {
+                        LastChange::NotExist => {
+                            break None;
+                        }
+                        LastChange::Exist {
+                            last_change_ts,
+                            estimated_versions_to_last_change,
+                        } if estimated_versions_to_last_change >= SEEK_BOUND => {
+                            // Seek to the expected version directly.
+                            let key_with_ts = current_user_key.clone().append_ts(last_change_ts);
+                            cursors.write.seek(&key_with_ts, &mut statistics.write)?;
+                        }
+                        _ => {
+                            // Continue iterate next `write`.
+                            cursors.write.next(&mut statistics.write);
+                        }
+                    }
                 }
             }
-
-            cursors.write.next(&mut statistics.write);
 
             if !cursors.write.valid()? {
                 // Key space ended. Needn't move write cursor to next key.
@@ -619,7 +633,7 @@ impl<S: Snapshot> ScanPolicy<S> for LatestEntryPolicy {
 
 fn scan_latest_handle_lock<S: Snapshot, T>(
     current_user_key: Key,
-    cfg: &mut ScannerConfig<S>,
+    cfg: &ScannerConfig<S>,
     cursors: &mut Cursors<S>,
     statistics: &mut Statistics,
 ) -> Result<HandleRes<T>> {
@@ -868,6 +882,8 @@ where
 }
 
 pub mod test_util {
+    use txn_types::LastChange;
+
     use super::*;
     use crate::storage::{
         mvcc::Write,
@@ -886,6 +902,8 @@ pub mod test_util {
         pub commit_ts: TimeStamp,
         pub for_update_ts: TimeStamp,
         pub old_value: OldValue,
+        pub last_change_ts: TimeStamp,
+        pub estimated_versions_to_last_change: u64,
     }
 
     impl Default for EntryBuilder {
@@ -898,6 +916,8 @@ pub mod test_util {
                 commit_ts: 0.into(),
                 for_update_ts: 0.into(),
                 old_value: OldValue::None,
+                last_change_ts: TimeStamp::zero(),
+                estimated_versions_to_last_change: 0,
             }
         }
     }
@@ -931,6 +951,15 @@ pub mod test_util {
             self.old_value = OldValue::value(old_value.to_owned());
             self
         }
+        pub fn last_change(
+            &mut self,
+            last_change_ts: TimeStamp,
+            estimated_versions_to_last_change: u64,
+        ) -> &mut Self {
+            self.last_change_ts = last_change_ts;
+            self.estimated_versions_to_last_change = estimated_versions_to_last_change;
+            self
+        }
         pub fn build_commit(&self, wt: WriteType, is_short_value: bool) -> TxnEntry {
             let write_key = Key::from_raw(&self.key).append_ts(self.commit_ts);
             let (key, value, short) = if is_short_value {
@@ -949,7 +978,9 @@ pub mod test_util {
                     None,
                 )
             };
-            let write_value = Write::new(wt, self.start_ts, short);
+            let write_value = Write::new(wt, self.start_ts, short).set_last_change(
+                LastChange::from_parts(self.last_change_ts, self.estimated_versions_to_last_change),
+            );
             TxnEntry::Commit {
                 default: (key, value),
                 write: (write_key.into_encoded(), write_value.as_ref().to_bytes()),
@@ -984,7 +1015,12 @@ pub mod test_util {
                 self.for_update_ts,
                 0,
                 0.into(),
-            );
+                false,
+            )
+            .set_last_change(LastChange::from_parts(
+                self.last_change_ts,
+                self.estimated_versions_to_last_change,
+            ));
             TxnEntry::Prewrite {
                 default: (key, value),
                 lock: (lock_key.into_encoded(), lock_value.to_bytes()),
@@ -1586,6 +1622,86 @@ mod latest_kv_tests {
         );
         scanner.next().unwrap_err();
     }
+
+    #[test]
+    fn test_skip_versions_by_seek() {
+        let mut engine = TestEngineBuilder::new().build().unwrap();
+
+        must_prewrite_put(&mut engine, b"k1", b"v11", b"k1", 1);
+        must_commit(&mut engine, b"k1", 1, 5);
+        must_prewrite_put(&mut engine, b"k1", b"v12", b"k1", 6);
+        must_commit(&mut engine, b"k1", 6, 8);
+        must_prewrite_put(&mut engine, b"k2", b"v21", b"k2", 2);
+        must_commit(&mut engine, b"k2", 2, 6);
+        must_prewrite_put(&mut engine, b"k4", b"v41", b"k4", 3);
+        must_commit(&mut engine, b"k4", 3, 7);
+
+        for start_ts in (10..30).step_by(2) {
+            must_prewrite_lock(&mut engine, b"k1", b"k1", start_ts);
+            must_commit(&mut engine, b"k1", start_ts, start_ts + 1);
+            must_prewrite_lock(&mut engine, b"k3", b"k1", start_ts);
+            must_commit(&mut engine, b"k3", start_ts, start_ts + 1);
+            must_prewrite_lock(&mut engine, b"k4", b"k1", start_ts);
+            must_commit(&mut engine, b"k4", start_ts, start_ts + 1);
+        }
+
+        must_prewrite_put(&mut engine, b"k1", b"v13", b"k1", 40);
+        must_commit(&mut engine, b"k1", 40, 45);
+        must_prewrite_put(&mut engine, b"k2", b"v22", b"k2", 41);
+        must_commit(&mut engine, b"k2", 41, 46);
+        must_prewrite_put(&mut engine, b"k3", b"v32", b"k3", 42);
+        must_commit(&mut engine, b"k3", 42, 47);
+
+        // KEY | COMMIT_TS |   TYPE   | VALUE
+        // ----|-----------|----------|-------
+        // k1  |     45    |   PUT    | v13
+        // k1  |     29    |   LOCK   |
+        // k1  |     27    |   LOCK   |
+        // k1  |    ...    |   LOCK   |
+        // k1  |     11    |   LOCK   |
+        // k1  |      8    |   PUT    | v12
+        // k1  |      5    |   PUT    | v1
+        // k2  |     46    |   PUT    | v22
+        // k2  |      6    |   PUT    | v21
+        // k3  |     47    |   PUT    | v32
+        // k3  |     29    |   LOCK   |
+        // k3  |     27    |   LOCK   |
+        // k3  |    ...    |   LOCK   |
+        // k3  |     11    |   LOCK   |
+        // k4  |     29    |   LOCK   |
+        // k4  |     27    |   LOCK   |
+        // k4  |    ...    |   LOCK   |
+        // k4  |     11    |   LOCK   |
+        // k4  |      7    |   PUT    | v41
+
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut scanner = ScannerBuilder::new(snapshot, 35.into())
+            .range(None, None)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            scanner.next().unwrap(),
+            Some((Key::from_raw(b"k1"), b"v12".to_vec()))
+        );
+        let stats = scanner.take_statistics();
+        assert_eq!(stats.write.next, 3); // skip k1@45, k1@8, k1@5
+        assert_eq!(stats.write.seek, 2); // seek beginning and k1@8
+
+        assert_eq!(
+            scanner.next().unwrap(),
+            Some((Key::from_raw(b"k2"), b"v21".to_vec()))
+        );
+        scanner.take_statistics();
+
+        assert_eq!(
+            scanner.next().unwrap(),
+            Some((Key::from_raw(b"k4"), b"v41".to_vec()))
+        );
+        let stats = scanner.take_statistics();
+        assert_le!(stats.write.next, 1 + SEEK_BOUND as usize); // skip k2@6, near_seek to k4 (8 times next)
+        assert_eq!(stats.write.seek, 2); // seek k4, k4@7
+    }
 }
 
 #[cfg(test)]
@@ -2035,6 +2151,7 @@ mod delta_entry_tests {
 
     use super::{super::ScannerBuilder, test_util::*, *};
     use crate::storage::{mvcc::tests::write, txn::tests::*, Engine, Modify, TestEngineBuilder};
+
     /// Check whether everything works as usual when `Delta::get()` goes out of
     /// bound.
     #[test]
@@ -2426,11 +2543,9 @@ mod delta_entry_tests {
                     let mut entries_of_key = vec![];
 
                     if let Some((ts, lock_type, value)) = lock {
-                        let max_commit_ts = writes
-                            .last()
-                            .cloned()
-                            .map(|(_, commit_ts, ..)| commit_ts)
-                            .unwrap_or(0);
+                        let last_write = writes.last();
+                        let max_commit_ts =
+                            last_write.map(|(_, commit_ts, ..)| *commit_ts).unwrap_or(0);
                         let for_update_ts = std::cmp::max(*ts, max_commit_ts + 1);
 
                         if *ts <= to_ts {
@@ -2580,10 +2695,12 @@ mod delta_entry_tests {
             // Do assertions one by one so that if it fails it won't print too long panic
             // message.
             for i in 0..std::cmp::max(actual.len(), expected.len()) {
+                // We don't care about last_change_ts here. Use a trick to ignore them.
+                let actual_erased = actual[i].erasing_last_change_ts();
                 assert_eq!(
-                    actual[i], expected[i],
+                    actual_erased, expected[i],
                     "item {} not match: expected {:?}, but got {:?}",
-                    i, &expected[i], &actual[i]
+                    i, &expected[i], &actual_erased
                 );
             }
         };

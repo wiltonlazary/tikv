@@ -31,7 +31,8 @@ pub use self::test_utils::TEST_PROFILE_MUTEX;
 use self::test_utils::{activate_prof, deactivate_prof, dump_prof};
 
 // File name suffix for periodically dumped heap profiles.
-const HEAP_PROFILE_SUFFIX: &str = ".heap";
+pub const HEAP_PROFILE_SUFFIX: &str = ".heap";
+pub const HEAP_PROFILE_REGEX: &str = r"^[0-9]{6,6}\.heap$";
 
 lazy_static! {
     // If it's locked it means there are already a heap or CPU profiling.
@@ -234,7 +235,7 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
 pub fn jeprof_heap_profile(path: &str) -> Result<Vec<u8>, String> {
     info!("using jeprof to process {}", path);
     let output = Command::new("./jeprof")
-        .args(&["--show_bytes", "./bin/tikv-server", path, "--svg"])
+        .args(["--show_bytes", "./bin/tikv-server", path, "--svg"])
         .output()
         .map_err(|e| format!("jeprof: {}", e))?;
     if !output.status.success() {
@@ -244,20 +245,28 @@ pub fn jeprof_heap_profile(path: &str) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
+pub fn heap_profiles_dir() -> Option<PathBuf> {
+    PROFILE_ACTIVE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(_, dir)| dir.path().to_owned())
+}
+
 pub fn list_heap_profiles() -> Result<Vec<(String, String)>, String> {
-    let path = match &*PROFILE_ACTIVE.lock().unwrap() {
-        Some((_, ref dir)) => dir.path().to_str().unwrap().to_owned(),
+    let path = match heap_profiles_dir() {
+        Some(path) => path.into_os_string().into_string().unwrap(),
         None => return Ok(vec![]),
     };
 
-    let dir = std::fs::read_dir(&path).map_err(|e| format!("read dir fail: {}", e))?;
+    let dir = std::fs::read_dir(path).map_err(|e| format!("read dir fail: {}", e))?;
     let mut profiles = Vec::new();
     for item in dir {
         let item = match item {
             Ok(x) => x,
             _ => continue,
         };
-        let f = item.path().to_str().unwrap().to_owned();
+        let f = item.file_name().to_str().unwrap().to_owned();
         if !f.ends_with(HEAP_PROFILE_SUFFIX) {
             continue;
         }

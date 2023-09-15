@@ -27,7 +27,7 @@ fn check_available<T: Simulator>(cluster: &mut Cluster<T>) {
     for i in 0..1000 {
         let last_available = stats.get_available();
         cluster.must_put(format!("k{}", i).as_bytes(), &value);
-        engine.flush_cfs(true).unwrap();
+        engine.flush_cfs(&[], true).unwrap();
         sleep_ms(20);
 
         let stats = pd_client.get_store_stats(1).unwrap();
@@ -58,7 +58,7 @@ fn test_simple_store_stats<T: Simulator>(cluster: &mut Cluster<T>) {
     }
 
     let engine = cluster.get_engine(1);
-    engine.flush_cfs(true).unwrap();
+    engine.flush_cfs(&[], true).unwrap();
     let last_stats = pd_client.get_store_stats(1).unwrap();
     assert_eq!(last_stats.get_region_count(), 1);
 
@@ -67,7 +67,7 @@ fn test_simple_store_stats<T: Simulator>(cluster: &mut Cluster<T>) {
 
     let region = pd_client.get_region(b"").unwrap();
     cluster.must_split(&region, b"k2");
-    engine.flush_cfs(true).unwrap();
+    engine.flush_cfs(&[], true).unwrap();
 
     // wait report region count after split
     for _ in 0..100 {
@@ -420,6 +420,7 @@ fn test_txn_query_stats_tmpl<F: KvFormat>() {
     fail::remove("mock_collect_tick_interval");
 }
 
+#[allow(clippy::extra_unused_type_parameters)]
 fn raw_put<F: KvFormat>(
     _cluster: &Cluster<ServerCluster>,
     client: &TikvClient,
@@ -575,7 +576,7 @@ pub fn test_rollback() {
 fn test_query_num<F: KvFormat>(query: Box<Query>, is_raw_kv: bool) {
     let (mut cluster, client, mut ctx) = must_new_and_configure_cluster_and_kv_client(|cluster| {
         cluster.cfg.raft_store.pd_store_heartbeat_tick_interval = ReadableDuration::millis(50);
-        cluster.cfg.split.qps_threshold = 0;
+        cluster.cfg.split.qps_threshold = Some(0);
         cluster.cfg.split.split_balance_score = 2.0;
         cluster.cfg.split.split_contained_score = 2.0;
         cluster.cfg.split.detect_times = 1;

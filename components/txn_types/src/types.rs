@@ -192,6 +192,16 @@ impl Key {
         Ok(number::decode_u64_desc(&mut ts)?.into())
     }
 
+    /// Decode the timestamp from a ts encoded key and return in bytes.
+    #[inline]
+    pub fn decode_ts_bytes_from(key: &[u8]) -> Result<&[u8], codec::Error> {
+        let len = key.len();
+        if len < number::U64_SIZE {
+            return Err(codec::Error::KeyLength);
+        }
+        Ok(&key[key.len() - number::U64_SIZE..])
+    }
+
     /// Whether the user key part of a ts encoded key `ts_encoded_key` equals to
     /// the encoded user key `user_key`.
     ///
@@ -441,7 +451,7 @@ impl From<kvrpcpb::Mutation> for Mutation {
 
 /// `OldValue` is used by cdc to read the previous value associated with some
 /// key during the prewrite process.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub enum OldValue {
     /// A real `OldValue`.
     Value { value: Value },
@@ -450,16 +460,11 @@ pub enum OldValue {
     /// `None` means we don't found a previous value.
     None,
     /// The user doesn't care about the previous value.
+    #[default]
     Unspecified,
     /// Not sure whether the old value exists or not. users can seek CF_WRITE to
     /// the give position to take a look.
     SeekWrite(Key),
-}
-
-impl Default for OldValue {
-    fn default() -> Self {
-        OldValue::Unspecified
-    }
 }
 
 impl OldValue {
@@ -512,6 +517,19 @@ impl OldValue {
 // MutationType is the type of mutation of the current write.
 pub type OldValues = HashMap<Key, (OldValue, Option<MutationType>)>;
 
+pub fn insert_old_value_if_resolved(
+    old_values: &mut OldValues,
+    key: Key,
+    start_ts: TimeStamp,
+    old_value: OldValue,
+    mutation_type: Option<MutationType>,
+) {
+    if old_value.resolved() {
+        let key = key.append_ts(start_ts);
+        old_values.insert(key, (old_value, mutation_type));
+    }
+}
+
 // Extra data fields filled by kvrpcpb::ExtraOp.
 #[derive(Default, Debug, Clone)]
 pub struct TxnExtra {
@@ -519,8 +537,8 @@ pub struct TxnExtra {
     // Marks that this transaction is a 1PC transaction. RaftKv should set this flag
     // in the raft command request.
     pub one_pc: bool,
-    // Marks that this transaction is a flashback transaction.
-    pub for_flashback: bool,
+    // Marks that this transaction is allowed in the flashback state.
+    pub allowed_in_flashback: bool,
 }
 
 impl TxnExtra {
@@ -547,6 +565,8 @@ bitflags! {
         const TRANSFER_LEADER_PROPOSAL = 0b00000100;
         /// Indicates this request is a flashback transaction.
         const FLASHBACK = 0b00001000;
+        /// Indicates the relevant tablet has been flushed, and we can propose split now.
+        const PRE_FLUSH_FINISHED = 0b00010000;
     }
 }
 
@@ -558,6 +578,67 @@ impl WriteBatchFlags {
             None => panic!("unrecognized flags: {:b}", bits),
             // zero or more flags
             Some(f) => f,
+        }
+    }
+}
+
+/// The position info of the last actual write (PUT or DELETE) of a LOCK record.
+/// Note that if the last change is a DELETE, its LastChange can be either
+/// Exist(which points to it) or NotExist.
+#[derive(Clone, Default, Eq, PartialEq, Debug)]
+pub enum LastChange {
+    #[default]
+    Unknown,
+    /// The pointer may point to a PUT or a DELETE record.
+    Exist {
+        /// The commit TS of the latest PUT/DELETE record
+        last_change_ts: TimeStamp,
+        /// The estimated number of versions that need skipping from this record
+        /// to find the latest PUT/DELETE record. Note this could be inaccurate.
+        estimated_versions_to_last_change: u64,
+    },
+    /// Either there is no previous write of the key or the last write is a
+    /// DELETE.
+    NotExist,
+}
+
+impl LastChange {
+    pub fn make_exist(last_change_ts: TimeStamp, estimated_versions_to_last_change: u64) -> Self {
+        assert!(!last_change_ts.is_zero());
+        assert!(estimated_versions_to_last_change > 0);
+        LastChange::Exist {
+            last_change_ts,
+            estimated_versions_to_last_change,
+        }
+    }
+
+    // How `LastChange` is stored.
+    // (1) ts == 0 && version == 0 means Unknown.
+    // (2) ts == 0 && version > 0 means NotExist. In current implementation version
+    // is set to 1. In older implementations it can be any positive integer. So
+    // we accept any positive when deserializing.
+    // (3) ts > 0 && version > 0 means Exist.
+
+    pub fn to_parts(&self) -> (TimeStamp, u64) {
+        match self {
+            LastChange::Unknown => (TimeStamp::zero(), 0),
+            LastChange::Exist {
+                last_change_ts,
+                estimated_versions_to_last_change,
+            } => (*last_change_ts, *estimated_versions_to_last_change),
+            LastChange::NotExist => (TimeStamp::zero(), 1),
+        }
+    }
+
+    pub fn from_parts(last_change_ts: TimeStamp, estimated_versions_to_last_change: u64) -> Self {
+        if last_change_ts.is_zero() {
+            if estimated_versions_to_last_change > 0 {
+                LastChange::NotExist
+            } else {
+                LastChange::Unknown
+            }
+        } else {
+            Self::make_exist(last_change_ts, estimated_versions_to_last_change)
         }
     }
 }
@@ -681,7 +762,7 @@ mod tests {
             let shorter_encoded = Key::from_encoded_slice(&encoded.0[..encoded_len - 9]);
             assert!(!shorter_encoded.is_encoded_from(&raw));
             let mut longer_encoded = encoded.as_encoded().clone();
-            longer_encoded.extend(&[0, 0, 0, 0, 0, 0, 0, 0, 0xFF]);
+            longer_encoded.extend([0, 0, 0, 0, 0, 0, 0, 0, 0xFF]);
             let longer_encoded = Key::from_encoded(longer_encoded);
             assert!(!longer_encoded.is_encoded_from(&raw));
 
@@ -732,6 +813,19 @@ mod tests {
             let mut another_key = key.clone();
             another_key.append_ts_inplace(ts);
             assert_eq!(another_key, key_with_ts);
+        }
+    }
+
+    #[test]
+    fn test_serialize_last_change() {
+        let objs = vec![
+            LastChange::Unknown,
+            LastChange::NotExist,
+            LastChange::make_exist(100.into(), 3),
+        ];
+        for obj in objs {
+            let (ts, versions) = obj.to_parts();
+            assert_eq!(obj, LastChange::from_parts(ts, versions));
         }
     }
 }

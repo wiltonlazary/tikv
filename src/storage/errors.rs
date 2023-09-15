@@ -176,6 +176,14 @@ pub enum ErrorHeaderKind {
     StaleCommand,
     StoreNotMatch,
     RaftEntryTooLarge,
+    ReadIndexNotReady,
+    ProposalInMergeMode,
+    DataNotReady,
+    RegionNotInitialized,
+    DiskFull,
+    RecoveryInProgress,
+    FlashbackInProgress,
+    BucketsVersionNotMatch,
     Other,
 }
 
@@ -193,6 +201,14 @@ impl ErrorHeaderKind {
             ErrorHeaderKind::StaleCommand => "stale_command",
             ErrorHeaderKind::StoreNotMatch => "store_not_match",
             ErrorHeaderKind::RaftEntryTooLarge => "raft_entry_too_large",
+            ErrorHeaderKind::ReadIndexNotReady => "read_index_not_ready",
+            ErrorHeaderKind::ProposalInMergeMode => "proposal_in_merge_mode",
+            ErrorHeaderKind::DataNotReady => "data_not_ready",
+            ErrorHeaderKind::RegionNotInitialized => "region_not_initialized",
+            ErrorHeaderKind::DiskFull => "disk_full",
+            ErrorHeaderKind::RecoveryInProgress => "recovery_in_progress",
+            ErrorHeaderKind::FlashbackInProgress => "flashback_in_progress",
+            ErrorHeaderKind::BucketsVersionNotMatch => "buckets_version_not_match",
             ErrorHeaderKind::Other => "other",
         }
     }
@@ -227,6 +243,22 @@ pub fn get_error_kind_from_header(header: &errorpb::Error) -> ErrorHeaderKind {
         ErrorHeaderKind::StoreNotMatch
     } else if header.has_raft_entry_too_large() {
         ErrorHeaderKind::RaftEntryTooLarge
+    } else if header.has_read_index_not_ready() {
+        ErrorHeaderKind::ReadIndexNotReady
+    } else if header.has_proposal_in_merging_mode() {
+        ErrorHeaderKind::ProposalInMergeMode
+    } else if header.has_data_is_not_ready() {
+        ErrorHeaderKind::DataNotReady
+    } else if header.has_region_not_initialized() {
+        ErrorHeaderKind::RegionNotInitialized
+    } else if header.has_disk_full() {
+        ErrorHeaderKind::DiskFull
+    } else if header.has_recovery_in_progress() {
+        ErrorHeaderKind::RecoveryInProgress
+    } else if header.has_flashback_in_progress() {
+        ErrorHeaderKind::FlashbackInProgress
+    } else if header.has_bucket_version_not_match() {
+        ErrorHeaderKind::BucketsVersionNotMatch
     } else {
         ErrorHeaderKind::Other
     }
@@ -238,45 +270,54 @@ pub fn get_tag_from_header(header: &errorpb::Error) -> &'static str {
     get_error_kind_from_header(header).get_str()
 }
 
-pub fn extract_region_error<T>(res: &Result<T>) -> Option<errorpb::Error> {
-    match *res {
+pub fn extract_region_error_from_error(e: &Error) -> Option<errorpb::Error> {
+    match e {
         // TODO: use `Error::cause` instead.
-        Err(Error(box ErrorInner::Kv(KvError(box KvErrorInner::Request(ref e)))))
-        | Err(Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Engine(KvError(
+        Error(box ErrorInner::Kv(KvError(box KvErrorInner::Request(ref e))))
+        | Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Engine(KvError(
             box KvErrorInner::Request(ref e),
-        ))))))
-        | Err(Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(MvccError(
+        )))))
+        | Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(MvccError(
             box MvccErrorInner::Kv(KvError(box KvErrorInner::Request(ref e))),
-        )))))) => Some(e.to_owned()),
-        Err(Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::MaxTimestampNotSynced {
+        ))))) => Some(e.to_owned()),
+        Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::MaxTimestampNotSynced {
             ..
-        })))) => {
+        }))) => {
             let mut err = errorpb::Error::default();
             err.set_max_timestamp_not_synced(Default::default());
             Some(err)
         }
-        Err(Error(box ErrorInner::SchedTooBusy)) => {
+        Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::FlashbackNotPrepared(
+            region_id,
+        )))) => {
+            let mut err = errorpb::Error::default();
+            let mut flashback_not_prepared_err = errorpb::FlashbackNotPrepared::default();
+            flashback_not_prepared_err.set_region_id(*region_id);
+            err.set_flashback_not_prepared(flashback_not_prepared_err);
+            Some(err)
+        }
+        Error(box ErrorInner::SchedTooBusy) => {
             let mut err = errorpb::Error::default();
             let mut server_is_busy_err = errorpb::ServerIsBusy::default();
             server_is_busy_err.set_reason(SCHEDULER_IS_BUSY.to_owned());
             err.set_server_is_busy(server_is_busy_err);
             Some(err)
         }
-        Err(Error(box ErrorInner::GcWorkerTooBusy)) => {
+        Error(box ErrorInner::GcWorkerTooBusy) => {
             let mut err = errorpb::Error::default();
             let mut server_is_busy_err = errorpb::ServerIsBusy::default();
             server_is_busy_err.set_reason(GC_WORKER_IS_BUSY.to_owned());
             err.set_server_is_busy(server_is_busy_err);
             Some(err)
         }
-        Err(Error(box ErrorInner::Closed)) => {
+        Error(box ErrorInner::Closed) => {
             // TiKV is closing, return an RegionError to tell the client that this region is
             // unavailable temporarily, the client should retry the request in other TiKVs.
             let mut err = errorpb::Error::default();
             err.set_message("TiKV is Closing".to_string());
             Some(err)
         }
-        Err(Error(box ErrorInner::DeadlineExceeded)) => {
+        Error(box ErrorInner::DeadlineExceeded) => {
             let mut err = errorpb::Error::default();
             let mut server_is_busy_err = errorpb::ServerIsBusy::default();
             server_is_busy_err.set_reason(DEADLINE_EXCEEDED.to_owned());
@@ -284,6 +325,13 @@ pub fn extract_region_error<T>(res: &Result<T>) -> Option<errorpb::Error> {
             Some(err)
         }
         _ => None,
+    }
+}
+
+pub fn extract_region_error<T>(res: &Result<T>) -> Option<errorpb::Error> {
+    match res {
+        Ok(_) => None,
+        Err(e) => extract_region_error_from_error(e),
     }
 }
 
@@ -408,6 +456,13 @@ pub fn extract_key_error(err: &Error) -> kvrpcpb::KeyError {
             assertion_failed.set_existing_commit_ts(existing_commit_ts.into_inner());
             key_error.set_assertion_failed(assertion_failed);
         }
+        Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(MvccError(
+            box MvccErrorInner::PrimaryMismatch(lock_info),
+        ))))) => {
+            let mut primary_mismatch = kvrpcpb::PrimaryMismatch::default();
+            primary_mismatch.set_lock_info(lock_info.clone());
+            key_error.set_primary_mismatch(primary_mismatch);
+        }
         _ => {
             error!(?*err; "txn aborts");
             key_error.set_abort(format!("{:?}", err));
@@ -461,19 +516,25 @@ pub fn extract_key_errors(res: Result<Vec<Result<()>>>) -> Vec<kvrpcpb::KeyError
 /// The shared version of [`Error`]. In some cases, it's necessary to pass a
 /// single error to more than one requests, since the inner error doesn't
 /// support cloning.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 #[error(transparent)]
-pub struct SharedError(pub Arc<ErrorInner>);
+pub struct SharedError(pub Arc<Error>);
+
+impl SharedError {
+    pub fn inner(&self) -> &ErrorInner {
+        &self.0.0
+    }
+}
 
 impl From<ErrorInner> for SharedError {
     fn from(e: ErrorInner) -> Self {
-        Self(Arc::new(e))
+        Self(Arc::new(Error::from(e)))
     }
 }
 
 impl From<Error> for SharedError {
     fn from(e: Error) -> Self {
-        Self(Arc::from(e.0))
+        Self(Arc::new(e))
     }
 }
 
@@ -483,7 +544,7 @@ impl TryFrom<SharedError> for Error {
     type Error = ();
 
     fn try_from(e: SharedError) -> std::result::Result<Self, Self::Error> {
-        Arc::try_unwrap(e.0).map(Into::into).map_err(|_| ())
+        Arc::try_unwrap(e.0).map_err(|_| ())
     }
 }
 

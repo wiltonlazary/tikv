@@ -18,7 +18,7 @@ use pd_client::PdClient;
 use raft::StateRole;
 use raftstore::{
     coprocessor::{ObserveHandle, RegionInfoProvider},
-    router::RaftStoreRouter,
+    router::CdcHandle,
     store::fsm::ChangeObserver,
 };
 use tikv::storage::Statistics;
@@ -29,7 +29,7 @@ use yatp::task::callback::Handle as YatpHandle;
 
 use crate::{
     annotate,
-    endpoint::ObserveOp,
+    endpoint::{BackupStreamResolver, ObserveOp},
     errors::{Error, Result},
     event_loader::InitialDataLoader,
     future,
@@ -37,7 +37,7 @@ use crate::{
     metrics,
     observer::BackupStreamObserver,
     router::{Router, TaskSelector},
-    subscription_track::SubscriptionTracer,
+    subscription_track::{CheckpointType, ResolveResult, SubscriptionTracer},
     try_send,
     utils::{self, CallbackWaitGroup, Work},
     Task,
@@ -46,6 +46,21 @@ use crate::{
 type ScanPool = yatp::ThreadPool<yatp::task::callback::TaskCell>;
 
 const INITIAL_SCAN_FAILURE_MAX_RETRY_TIME: usize = 10;
+
+// The retry parameters for failed to get last checkpoint ts.
+// When PD is temporarily disconnected, we may need this retry.
+// The total duration of retrying is about 345s ( 20 * 16 + 15 ),
+// which is longer than the RPO promise.
+const TRY_START_OBSERVE_MAX_RETRY_TIME: u8 = 24;
+const RETRY_AWAIT_BASIC_DURATION: Duration = Duration::from_secs(1);
+const RETRY_AWAIT_MAX_DURATION: Duration = Duration::from_secs(16);
+
+fn backoff_for_start_observe(failed_for: u8) -> Duration {
+    Ord::min(
+        RETRY_AWAIT_BASIC_DURATION * (1 << failed_for),
+        RETRY_AWAIT_MAX_DURATION,
+    )
+}
 
 /// a request for doing initial scanning.
 struct ScanCmd {
@@ -57,7 +72,7 @@ struct ScanCmd {
 
 /// The response of requesting resolve the new checkpoint of regions.
 pub struct ResolvedRegions {
-    items: Vec<(Region, TimeStamp)>,
+    items: Vec<ResolveResult>,
     checkpoint: TimeStamp,
 }
 
@@ -66,7 +81,7 @@ impl ResolvedRegions {
     /// Note: Maybe we can compute the global checkpoint internal and getting
     /// the interface clear. However we must take the `min_ts` or we cannot
     /// provide valid global checkpoint if there isn't any region checkpoint.
-    pub fn new(checkpoint: TimeStamp, checkpoints: Vec<(Region, TimeStamp)>) -> Self {
+    pub fn new(checkpoint: TimeStamp, checkpoints: Vec<ResolveResult>) -> Self {
         Self {
             items: checkpoints,
             checkpoint,
@@ -74,7 +89,16 @@ impl ResolvedRegions {
     }
 
     /// take the region checkpoints from the structure.
+    #[deprecated = "please use `take_resolve_result` instead."]
     pub fn take_region_checkpoints(&mut self) -> Vec<(Region, TimeStamp)> {
+        std::mem::take(&mut self.items)
+            .into_iter()
+            .map(|x| (x.region, x.checkpoint))
+            .collect()
+    }
+
+    /// take the resolve result from this struct.
+    pub fn take_resolve_result(&mut self) -> Vec<ResolveResult> {
         std::mem::take(&mut self.items)
     }
 
@@ -119,7 +143,7 @@ impl<E, R, RT> InitialScan for InitialDataLoader<E, R, RT>
 where
     E: KvEngine,
     R: RegionInfoProvider + Clone + 'static,
-    RT: RaftStoreRouter<E>,
+    RT: CdcHandle<E>,
 {
     fn do_initial_scan(
         &self,
@@ -128,12 +152,15 @@ where
         handle: ObserveHandle,
     ) -> Result<Statistics> {
         let region_id = region.get_id();
+        let h = handle.clone();
         // Note: we have external retry at `ScanCmd::exec_by_with_retry`, should we keep
         // retrying here?
         let snap = self.observe_over_with_retry(region, move || {
             ChangeObserver::from_pitr(region_id, handle.clone())
         })?;
-        let stat = self.do_initial_scan(region, start_ts, snap)?;
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("scan_after_get_snapshot");
+        let stat = self.do_initial_scan(region, h, start_ts, snap)?;
         Ok(stat)
     }
 
@@ -162,7 +189,7 @@ impl ScanCmd {
         } = self;
         let begin = Instant::now_coarse();
         let stat = initial_scan.do_initial_scan(region, *last_checkpoint, handle.clone())?;
-        info!("initial scanning of leader transforming finished!"; "takes" => ?begin.saturating_elapsed(), "region" => %region.get_id(), "from_ts" => %last_checkpoint);
+        info!("initial scanning finished!"; "takes" => ?begin.saturating_elapsed(), "from_ts" => %last_checkpoint, utils::slog_region(region));
         utils::record_cf_stat("lock", &stat.lock);
         utils::record_cf_stat("write", &stat.write);
         utils::record_cf_stat("default", &stat.data);
@@ -236,10 +263,8 @@ fn spawn_executors(init: impl InitialScan + Send + 'static, number: usize) -> Sc
         let rx = rx.clone();
         let stopped = stopped.clone();
         pool.spawn(move |_: &mut YatpHandle<'_>| {
-            tikv_alloc::add_thread_memory_accessor();
             let _io_guard = file_system::WithIoType::new(file_system::IoType::Replication);
             scan_executor_loop(init, rx, stopped);
-            tikv_alloc::remove_thread_memory_accessor();
         })
     }
     ScanPoolHandle {
@@ -278,7 +303,7 @@ impl ScanPoolHandle {
 }
 
 /// The default channel size.
-const MESSAGE_BUFFER_SIZE: usize = 4096;
+const MESSAGE_BUFFER_SIZE: usize = 32768;
 
 /// The operator for region subscription.
 /// It make a queue for operations over the `SubscriptionTracer`, generally,
@@ -348,10 +373,11 @@ where
         meta_cli: MetadataClient<S>,
         pd_client: Arc<PDC>,
         scan_pool_size: usize,
+        resolver: BackupStreamResolver<RT, E>,
     ) -> (Self, future![()])
     where
         E: KvEngine,
-        RT: RaftStoreRouter<E> + 'static,
+        RT: CdcHandle<E> + 'static,
     {
         let (tx, rx) = channel(MESSAGE_BUFFER_SIZE);
         let scan_pool_handle = spawn_executors(initial_loader.clone(), scan_pool_size);
@@ -367,7 +393,7 @@ where
             scan_pool_handle: Arc::new(scan_pool_handle),
             scans: CallbackWaitGroup::new(),
         };
-        let fut = op.clone().region_operator_loop(rx);
+        let fut = op.clone().region_operator_loop(rx, resolver);
         (op, fut)
     }
 
@@ -387,9 +413,19 @@ where
     }
 
     /// the handler loop.
-    async fn region_operator_loop(self, mut message_box: Receiver<ObserveOp>) {
+    async fn region_operator_loop<E, RT>(
+        self,
+        mut message_box: Receiver<ObserveOp>,
+        mut resolver: BackupStreamResolver<RT, E>,
+    ) where
+        E: KvEngine,
+        RT: CdcHandle<E> + 'static,
+    {
         while let Some(op) = message_box.recv().await {
-            info!("backup stream: on_modify_observe"; "op" => ?op);
+            // Skip some trivial resolve commands.
+            if !matches!(op, ObserveOp::ResolveRegions { .. }) {
+                info!("backup stream: on_modify_observe"; "op" => ?op);
+            }
             match op {
                 ObserveOp::Start { region } => {
                     fail::fail_point!("delay_on_start_observe");
@@ -397,7 +433,6 @@ where
                     metrics::INITIAL_SCAN_REASON
                         .with_label_values(&["leader-changed"])
                         .inc();
-                    crate::observer::IN_FLIGHT_START_OBSERVE_MESSAGE.fetch_sub(1, Ordering::SeqCst);
                 }
                 ObserveOp::Stop { ref region } => {
                     self.subs.deregister_region_if(region, |_, _| true);
@@ -411,7 +446,7 @@ where
                             true,
                             false,
                         )
-                        .map_err(|err| warn!("check epoch and stop failed."; "err" => %err))
+                        .map_err(|err| warn!("check epoch and stop failed."; utils::slog_region(region), "err" => %err))
                         .is_ok()
                     });
                 }
@@ -420,6 +455,7 @@ where
                     region,
                     handle,
                     err,
+                    has_failed_for,
                 } => {
                     info!("retry observe region"; "region" => %region.get_id(), "err" => %err);
                     // No need for retrying observe canceled.
@@ -430,7 +466,7 @@ where
                         region.get_start_key().to_owned(),
                         region.get_end_key().to_owned(),
                     );
-                    match self.retry_observe(region, handle).await {
+                    match self.retry_observe(region, handle, has_failed_for).await {
                         Ok(()) => {}
                         Err(e) => {
                             let msg = Task::FatalError(
@@ -446,18 +482,23 @@ where
                 }
                 ObserveOp::ResolveRegions { callback, min_ts } => {
                     let now = Instant::now();
-                    let timedout = self.wait(Duration::from_secs(30)).await;
+                    let timedout = self.wait(Duration::from_secs(5)).await;
                     if timedout {
                         warn!("waiting for initial scanning done timed out, forcing progress!"; 
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
-                    let cps = self.subs.resolve_with(min_ts);
-                    let min_region = cps.iter().min_by_key(|(_, rts)| rts);
+                    let regions = resolver.resolve(self.subs.current_regions(), min_ts).await;
+                    let cps = self.subs.resolve_with(min_ts, regions);
+                    let min_region = cps.iter().min_by_key(|rs| rs.checkpoint);
                     // If there isn't any region observed, the `min_ts` can be used as resolved ts
                     // safely.
-                    let rts = min_region.map(|(_, rts)| *rts).unwrap_or(min_ts);
-                    info!("getting checkpoint"; "defined_by_region" => ?min_region.map(|r| r.0.get_id()), "checkpoint" => %rts);
-                    self.subs.warn_if_gap_too_huge(rts);
+                    let rts = min_region.map(|rs| rs.checkpoint).unwrap_or(min_ts);
+                    if min_region
+                        .map(|mr| mr.checkpoint_type != CheckpointType::MinTs)
+                        .unwrap_or(false)
+                    {
+                        info!("getting non-trivial checkpoint"; "defined_by_region" => ?min_region);
+                    }
                     callback(ResolvedRegions::new(rts, cps));
                 }
             }
@@ -476,6 +517,7 @@ where
                         .with_label_values(&["region-changed"])
                         .inc();
                     let r = async {
+                        self.subs.add_pending_region(region);
                         self.observe_over_with_initial_data_from_checkpoint(
                             region,
                             self.get_last_checkpoint_of(&for_task, region).await?,
@@ -490,14 +532,15 @@ where
                             Task::ModifyObserve(ObserveOp::NotifyFailToStartObserve {
                                 region: region.clone(),
                                 handle,
-                                err: Box::new(e)
+                                err: Box::new(e),
+                                has_failed_for: 0,
                             })
                         );
                     }
                 } else {
                     warn!(
                         "BUG: the region {:?} is register to no task but being observed",
-                        &region
+                        utils::debug_region(region)
                     );
                 }
             }
@@ -517,6 +560,9 @@ where
             }
 
             Some(for_task) => {
+                // the extra failpoint is used to pause the thread.
+                // once it triggered "pause" it cannot trigger early return then.
+                fail::fail_point!("try_start_observe0");
                 fail::fail_point!("try_start_observe", |_| {
                     Err(Error::Other(box_err!("Nature is boring")))
                 });
@@ -528,21 +574,59 @@ where
     }
 
     async fn start_observe(&self, region: Region) {
+        self.start_observe_with_failure_count(region, 0).await
+    }
+
+    async fn start_observe_with_failure_count(&self, region: Region, has_failed_for: u8) {
         let handle = ObserveHandle::new();
+        let schd = self.scheduler.clone();
+        self.subs.add_pending_region(&region);
         if let Err(err) = self.try_start_observe(&region, handle.clone()).await {
-            warn!("failed to start observe, retrying"; "err" => %err);
-            try_send!(
-                self.scheduler,
-                Task::ModifyObserve(ObserveOp::NotifyFailToStartObserve {
-                    region,
-                    handle,
-                    err: Box::new(err)
-                })
-            );
+            warn!("failed to start observe, would retry"; "err" => %err, utils::slog_region(&region));
+            tokio::spawn(async move {
+                #[cfg(not(feature = "failpoints"))]
+                let delay = backoff_for_start_observe(has_failed_for);
+                #[cfg(feature = "failpoints")]
+                let delay = (|| {
+                    fail::fail_point!("subscribe_mgr_retry_start_observe_delay", |v| {
+                        let dur = v
+                            .expect("should provide delay time (in ms)")
+                            .parse::<u64>()
+                            .expect("should be number (in ms)");
+                        Duration::from_millis(dur)
+                    });
+                    backoff_for_start_observe(has_failed_for)
+                })();
+                tokio::time::sleep(delay).await;
+                try_send!(
+                    schd,
+                    Task::ModifyObserve(ObserveOp::NotifyFailToStartObserve {
+                        region,
+                        handle,
+                        err: Box::new(err),
+                        has_failed_for: has_failed_for + 1
+                    })
+                )
+            });
         }
     }
 
-    async fn retry_observe(&self, region: Region, handle: ObserveHandle) -> Result<()> {
+    async fn retry_observe(
+        &self,
+        region: Region,
+        handle: ObserveHandle,
+        failure_count: u8,
+    ) -> Result<()> {
+        if failure_count > TRY_START_OBSERVE_MAX_RETRY_TIME {
+            return Err(Error::Other(
+                format!(
+                    "retry time exceeds for region {:?}",
+                    utils::debug_region(&region)
+                )
+                .into(),
+            ));
+        }
+
         let (tx, rx) = crossbeam::channel::bounded(1);
         self.regions
             .find_region_by_id(
@@ -580,7 +664,7 @@ where
             exists = true;
             let should_remove = old.handle().id == handle.id;
             if !should_remove {
-                warn!("stale retry command"; "region" => ?region, "handle" => ?handle, "old_handle" => ?old.handle());
+                warn!("stale retry command"; utils::slog_region(&region), "handle" => ?handle, "old_handle" => ?old.handle());
             }
             should_remove
         });
@@ -593,7 +677,8 @@ where
         metrics::INITIAL_SCAN_REASON
             .with_label_values(&["retry"])
             .inc();
-        self.start_observe(region).await;
+        self.start_observe_with_failure_count(region, failure_count)
+            .await;
         Ok(())
     }
 
@@ -716,5 +801,33 @@ mod test {
         }
 
         should_finish_in(move || drop(pool), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_backoff_for_start_observe() {
+        assert_eq!(
+            super::backoff_for_start_observe(0),
+            super::RETRY_AWAIT_BASIC_DURATION
+        );
+        assert_eq!(
+            super::backoff_for_start_observe(1),
+            super::RETRY_AWAIT_BASIC_DURATION * 2
+        );
+        assert_eq!(
+            super::backoff_for_start_observe(2),
+            super::RETRY_AWAIT_BASIC_DURATION * 4
+        );
+        assert_eq!(
+            super::backoff_for_start_observe(3),
+            super::RETRY_AWAIT_BASIC_DURATION * 8
+        );
+        assert_eq!(
+            super::backoff_for_start_observe(4),
+            super::RETRY_AWAIT_MAX_DURATION
+        );
+        assert_eq!(
+            super::backoff_for_start_observe(5),
+            super::RETRY_AWAIT_MAX_DURATION
+        );
     }
 }

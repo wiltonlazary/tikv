@@ -88,8 +88,8 @@ impl LockTable {
 
     /// Finds the first handle in the given range that `pred` returns `Some`.
     /// The `Some` return value of `pred` will be returned by `find_first`.
-    pub fn find_first<'m, T>(
-        &'m self,
+    pub fn find_first<T>(
+        &self,
         start_key: Option<&Key>,
         end_key: Option<&Key>,
         mut pred: impl FnMut(Arc<KeyHandle>) -> Option<T>,
@@ -111,6 +111,14 @@ impl LockTable {
         for entry in self.0.iter() {
             if let Some(handle) = entry.value().upgrade() {
                 f(handle);
+            }
+        }
+    }
+
+    pub fn for_each_kv(&self, mut f: impl FnMut(&Key, Arc<KeyHandle>)) {
+        for entry in self.0.iter() {
+            if let Some(handle) = entry.value().upgrade() {
+                f(entry.key(), handle);
             }
         }
     }
@@ -158,9 +166,9 @@ mod test {
         assert_eq!(counter.load(Ordering::SeqCst), 100);
     }
 
-    fn ts_check(lock: &Lock, ts: u64) -> Result<(), Lock> {
+    fn ts_check(lock: &Lock, ts: u64) -> Result<(), Box<Lock>> {
         if lock.ts.into_inner() < ts {
-            Err(lock.clone())
+            Err(Box::new(lock.clone()))
         } else {
             Ok(())
         }
@@ -183,6 +191,7 @@ mod test {
             10.into(),
             1,
             10.into(),
+            false,
         );
         let guard = lock_table.lock_key(&key_k).await;
         guard.with_lock(|l| {
@@ -193,7 +202,10 @@ mod test {
         lock_table.check_key(&key_k, |l| ts_check(l, 5)).unwrap();
 
         // lock does not pass check_fn
-        assert_eq!(lock_table.check_key(&key_k, |l| ts_check(l, 20)), Err(lock));
+        assert_eq!(
+            lock_table.check_key(&key_k, |l| ts_check(l, 20)),
+            Err(Box::new(lock))
+        );
     }
 
     #[tokio::test]
@@ -209,6 +221,7 @@ mod test {
             20.into(),
             1,
             20.into(),
+            false,
         );
         let guard = lock_table.lock_key(&Key::from_raw(b"k")).await;
         guard.with_lock(|l| {
@@ -224,6 +237,7 @@ mod test {
             10.into(),
             1,
             10.into(),
+            false,
         );
         let guard = lock_table.lock_key(&Key::from_raw(b"l")).await;
         guard.with_lock(|l| {
@@ -247,13 +261,13 @@ mod test {
         // first lock does not pass check_fn
         assert_eq!(
             lock_table.check_range(Some(&Key::from_raw(b"a")), None, |_, l| ts_check(l, 25)),
-            Err(lock_k)
+            Err(Box::new(lock_k))
         );
 
         // first lock passes check_fn but the second does not
         assert_eq!(
             lock_table.check_range(None, None, |_, l| ts_check(l, 15)),
-            Err(lock_l)
+            Err(Box::new(lock_l))
         );
     }
 
@@ -281,6 +295,7 @@ mod test {
             20.into(),
             1,
             20.into(),
+            false,
         );
         let guard_a = lock_table.lock_key(&Key::from_raw(b"a")).await;
         guard_a.with_lock(|l| {
@@ -301,6 +316,7 @@ mod test {
             30.into(),
             2,
             30.into(),
+            false,
         )
         .use_async_commit(vec![b"c".to_vec()]);
         let guard_b = lock_table.lock_key(&Key::from_raw(b"b")).await;

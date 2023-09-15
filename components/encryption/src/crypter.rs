@@ -1,12 +1,12 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use byteorder::{BigEndian, ByteOrder};
-use derive_more::Deref;
+use cloud::kms::PlainKey;
 use engine_traits::EncryptionMethod as EtEncryptionMethod;
 use kvproto::encryptionpb::EncryptionMethod;
 use openssl::symm::{self, Cipher as OCipher};
 use rand::{rngs::OsRng, RngCore};
-use tikv_util::{box_err, impl_display_as_debug};
+use tikv_util::box_err;
 
 use crate::{Error, Result};
 
@@ -147,7 +147,7 @@ impl<'k> AesGcmCrypter<'k> {
         let mut tag = AesGcmTag([0u8; GCM_TAG_LEN]);
         let ciphertext = symm::encrypt_aead(
             cipher,
-            &self.key.0,
+            self.key.as_slice(),
             Some(self.iv.as_slice()),
             &[], // AAD
             pt,
@@ -160,7 +160,7 @@ impl<'k> AesGcmCrypter<'k> {
         let cipher = OCipher::aes_256_gcm();
         let plaintext = symm::decrypt_aead(
             cipher,
-            &self.key.0,
+            self.key.as_slice(),
             Some(self.iv.as_slice()),
             &[], // AAD
             ct,
@@ -187,38 +187,9 @@ pub fn verify_encryption_config(method: EncryptionMethod, key: &[u8]) -> Result<
     Ok(())
 }
 
-// PlainKey is a newtype used to mark a vector a plaintext key.
-// It requires the vec to be a valid AesGcmCrypter key.
-#[derive(Deref)]
-pub struct PlainKey(Vec<u8>);
-
-impl PlainKey {
-    pub fn new(key: Vec<u8>) -> Result<Self> {
-        if key.len() != AesGcmCrypter::KEY_LEN {
-            return Err(box_err!(
-                "encryption method and key length mismatch, expect {} get {}",
-                AesGcmCrypter::KEY_LEN,
-                key.len()
-            ));
-        }
-        Ok(Self(key))
-    }
-}
-
-// Don't expose the key in a debug print
-impl std::fmt::Debug for PlainKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PlainKey")
-            .field(&"REDACTED".to_string())
-            .finish()
-    }
-}
-
-// Don't expose the key in a display print
-impl_display_as_debug!(PlainKey);
-
 #[cfg(test)]
 mod tests {
+    use cloud::kms::CryptographyType;
     use hex::FromHex;
 
     use super::*;
@@ -268,14 +239,14 @@ mod tests {
 
         let pt = Vec::from_hex(pt).unwrap();
         let ct = Vec::from_hex(ct).unwrap();
-        let key = PlainKey::new(Vec::from_hex(key).unwrap()).unwrap();
+        let key = PlainKey::new(Vec::from_hex(key).unwrap(), CryptographyType::AesGcm256).unwrap();
         let iv = Iv::from_slice(Vec::from_hex(iv).unwrap().as_slice()).unwrap();
         let tag = Vec::from_hex(tag).unwrap();
 
         let crypter = AesGcmCrypter::new(&key, iv);
         let (ciphertext, gcm_tag) = crypter.encrypt(&pt).unwrap();
         assert_eq!(ciphertext, ct, "{}", hex::encode(&ciphertext));
-        assert_eq!(gcm_tag.0.to_vec(), tag, "{}", hex::encode(&gcm_tag.0));
+        assert_eq!(gcm_tag.0.to_vec(), tag, "{}", hex::encode(gcm_tag.0));
         let plaintext = crypter.decrypt(&ct, gcm_tag).unwrap();
         assert_eq!(plaintext, pt, "{}", hex::encode(&plaintext));
 

@@ -204,6 +204,31 @@ fn quote(bytes: BytesRef) -> Result<Option<Bytes>> {
     Ok(Some(result))
 }
 
+#[rpn_fn(nullable, raw_varg, min_args = 1, max_args = 1)]
+#[inline]
+fn json_valid(args: &[ScalarValueRef]) -> Result<Option<Int>> {
+    assert_eq!(args.len(), 1);
+    let received_et = args[0].eval_type();
+    let r = match args[0].to_owned().is_none() {
+        true => None,
+        _ => match received_et {
+            EvalType::Json => args[0].as_json().and(Some(1)),
+            EvalType::Bytes => match args[0].as_bytes() {
+                Some(p) => {
+                    let tmp_str =
+                        std::str::from_utf8(p).map_err(tidb_query_datatype::codec::Error::from)?;
+                    let json: serde_json::error::Result<Json> = serde_json::from_str(tmp_str);
+                    Some(json.is_ok() as Int)
+                }
+                _ => Some(0),
+            },
+            _ => Some(0),
+        },
+    };
+
+    Ok(r)
+}
+
 #[rpn_fn]
 #[inline]
 fn json_unquote(arg: BytesRef) -> Result<Option<Bytes>> {
@@ -335,6 +360,34 @@ fn json_contains(args: &[ScalarValueRef]) -> Result<Option<i64>> {
         };
     }
     Ok(Some(j.as_ref().json_contains(target)? as i64))
+}
+
+// Args should be like `(Option<JsonRef> , Option<JsonRef>)`
+fn member_of_validator(expr: &tipb::Expr) -> Result<()> {
+    assert!(expr.get_children().len() == 2);
+    let children = expr.get_children();
+    super::function::validate_expr_return_type(&children[0], EvalType::Json)?;
+    super::function::validate_expr_return_type(&children[1], EvalType::Json)?;
+    Ok(())
+}
+
+#[rpn_fn(nullable, raw_varg,min_args= 2, max_args = 2, extra_validator = member_of_validator)]
+#[inline]
+fn member_of(args: &[ScalarValueRef]) -> Result<Option<i64>> {
+    assert!(args.len() == 2);
+    let value: Option<JsonRef> = args[0].as_json();
+    let value = match value {
+        None => return Ok(None),
+        Some(value) => value.to_owned(),
+    };
+
+    let json_array: Option<JsonRef> = args[1].as_json();
+    let json_array = match json_array {
+        None => return Ok(None),
+        Some(json_array) => json_array,
+    };
+
+    Ok(Some(value.as_ref().member_of(json_array)? as i64))
 }
 
 #[rpn_fn(nullable, raw_varg, min_args = 2, extra_validator = json_with_paths_validator)]
@@ -821,6 +874,38 @@ mod tests {
             let output = RpnFnScalarEvaluator::new()
                 .push_params(vargs.clone())
                 .evaluate(ScalarFuncSig::JsonLengthSig)
+                .unwrap();
+            assert_eq!(output, expected, "{:?}", vargs);
+        }
+    }
+
+    #[test]
+    fn test_json_valid() {
+        let cases: Vec<(Vec<ScalarValue>, Option<i64>)> = vec![
+            (
+                vec![Some(Json::from_str(r#"{"a":1}"#).unwrap()).into()],
+                Some(1),
+            ),
+            (vec![Some(b"hello".to_vec()).into()], Some(0)),
+            (vec![Some(b"\"hello\"".to_vec()).into()], Some(1)),
+            (vec![Some(b"null".to_vec()).into()], Some(1)),
+            (vec![Some(Json::from_str(r#"{}"#).unwrap()).into()], Some(1)),
+            (vec![Some(Json::from_str(r#"[]"#).unwrap()).into()], Some(1)),
+            (vec![Some(b"2".to_vec()).into()], Some(1)),
+            (vec![Some(b"2.5".to_vec()).into()], Some(1)),
+            (vec![Some(b"2019-8-19".to_vec()).into()], Some(0)),
+            (vec![Some(b"\"2019-8-19\"".to_vec()).into()], Some(1)),
+            (vec![Some(2).into()], Some(0)),
+            (vec![Some(2.5).into()], Some(0)),
+            (vec![None::<Json>.into()], None),
+            (vec![None::<Bytes>.into()], None),
+            (vec![None::<Int>.into()], None),
+        ];
+
+        for (vargs, expected) in cases {
+            let output = RpnFnScalarEvaluator::new()
+                .push_params(vargs.clone())
+                .evaluate(ScalarFuncSig::JsonValidJsonSig)
                 .unwrap();
             assert_eq!(output, expected, "{:?}", vargs);
         }
@@ -1333,6 +1418,49 @@ mod tests {
             } else {
                 output.unwrap_err();
             }
+        }
+    }
+
+    #[test]
+    fn test_json_member_of() {
+        let test_cases = vec![
+            (Some(r#"1"#), Some(r#"[1,2]"#), Some(1)),
+            (Some(r#"1"#), Some(r#"[1]"#), Some(1)),
+            (Some(r#"1"#), Some(r#"[0]"#), Some(0)),
+            (Some(r#"1"#), Some(r#"[[1]]"#), Some(0)),
+            (Some(r#""1""#), Some(r#"[1]"#), Some(0)),
+            (Some(r#""1""#), Some(r#"["1"]"#), Some(1)),
+            (Some(r#""{\"a\":1}""#), Some(r#"{"a":1}"#), Some(0)),
+            (Some(r#""{\"a\":1}""#), Some(r#"[{"a":1}]"#), Some(0)),
+            (Some(r#""{\"a\":1}""#), Some(r#"[{"a":1}, 1]"#), Some(0)),
+            (Some(r#""{\"a\":1}""#), Some(r#"["{\"a\":1}"]"#), Some(1)),
+            (Some(r#""{\"a\":1}""#), Some(r#"["{\"a\":1}",1]"#), Some(1)),
+            (Some(r#"1"#), Some(r#"1"#), Some(1)),
+            (Some(r#"[4,5]"#), Some(r#"[[3,4],[4,5]]"#), Some(1)),
+            (Some(r#""[4,5]""#), Some(r#"[[3,4],"[4,5]"]"#), Some(1)),
+            (Some(r#"{"a":1}"#), Some(r#"{"a":1}"#), Some(1)),
+            (Some(r#"{"a":1}"#), Some(r#"{"a":1, "b":2}"#), Some(0)),
+            (Some(r#"{"a":1}"#), Some(r#"[{"a":1}]"#), Some(1)),
+            (Some(r#"{"a":1}"#), Some(r#"{"b": {"a":1}}"#), Some(0)),
+            (Some(r#"1"#), Some(r#"1"#), Some(1)),
+            (Some(r#"[1,2]"#), Some(r#"[1,2]"#), Some(0)),
+            (Some(r#"[1,2]"#), Some(r#"[[1,2]]"#), Some(1)),
+            (Some(r#"[[1,2]]"#), Some(r#"[[1,2]]"#), Some(0)),
+            (Some(r#"[[1,2]]"#), Some(r#"[[[1,2]]]"#), Some(1)),
+            (None, Some(r#"[[[1,2]]]"#), None),
+            (Some(r#"[[1,2]]"#), None, None),
+            (None, None, None),
+        ];
+        for (js, value, expected) in test_cases {
+            let args: Vec<ScalarValue> = vec![
+                js.map(|js| Json::from_str(js).unwrap()).into(),
+                value.map(|value| Json::from_str(value).unwrap()).into(),
+            ];
+            let output = RpnFnScalarEvaluator::new()
+                .push_params(args.clone())
+                .evaluate(ScalarFuncSig::JsonMemberOfSig)
+                .unwrap();
+            assert_eq!(output, expected, "{:?}", args);
         }
     }
 }

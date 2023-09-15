@@ -14,6 +14,7 @@
 
 #![feature(box_patterns)]
 #![feature(result_flattening)]
+#![feature(let_chains)]
 
 #[macro_use]
 extern crate tikv_util;
@@ -27,8 +28,6 @@ mod observer;
 pub use observer::*;
 mod advance;
 pub use advance::*;
-mod sinker;
-pub use sinker::*;
 mod endpoint;
 pub use endpoint::*;
 mod errors;
@@ -37,4 +36,3 @@ mod scanner;
 pub use scanner::*;
 mod metrics;
 pub use metrics::*;
-mod util;

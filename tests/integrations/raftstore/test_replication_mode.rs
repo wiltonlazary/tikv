@@ -1,23 +1,19 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    sync::{mpsc, Arc},
-    thread,
-    time::Duration,
-};
+use std::{sync::Arc, thread, time::Duration};
 
 use kvproto::replication_modepb::*;
 use pd_client::PdClient;
 use raft::eraftpb::ConfChangeType;
 use test_raftstore::*;
-use tikv_util::{config::*, HandyRwLock};
+use tikv_util::{config::*, mpsc::future, HandyRwLock};
 
 fn prepare_cluster() -> Cluster<ServerCluster> {
     let mut cluster = new_server_cluster(0, 3);
     cluster.pd_client.disable_default_operator();
     cluster.pd_client.configure_dr_auto_sync("zone");
     cluster.cfg.raft_store.pd_store_heartbeat_tick_interval = ReadableDuration::millis(50);
-    cluster.cfg.raft_store.raft_log_gc_threshold = 10;
+    cluster.cfg.raft_store.raft_log_gc_threshold = 1;
     cluster.add_label(1, "zone", "ES");
     cluster.add_label(2, "zone", "ES");
     cluster.add_label(3, "zone", "WS");
@@ -53,7 +49,7 @@ fn test_dr_auto_sync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -75,7 +71,7 @@ fn test_dr_auto_sync() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -83,7 +79,7 @@ fn test_dr_auto_sync() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -105,7 +101,7 @@ fn test_sync_recover_after_apply_snapshot() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -113,7 +109,7 @@ fn test_sync_recover_after_apply_snapshot() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -189,7 +185,7 @@ fn test_check_conf_change() {
         res.get_header()
             .get_error()
             .get_message()
-            .contains("unsafe to perform conf change"),
+            .contains("promoted commit index"),
         "{:?}",
         res
     );
@@ -252,7 +248,7 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -260,7 +256,7 @@ fn test_switching_replication_mode() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());
@@ -288,17 +284,15 @@ fn test_switching_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
         .async_command_on_node(1, request, cb)
         .unwrap();
-    assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    );
-    must_get_none(&cluster.get_engine(1), b"k3");
+    // sync recover should not block write. ref https://github.com/tikv/tikv/issues/14975.
+    assert_eq!(rx.recv_timeout(Duration::from_millis(100)).is_ok(), true);
+    must_get_equal(&cluster.get_engine(1), b"k3", b"v3");
     let state = cluster.pd_client.region_replication_status(region.get_id());
     assert_eq!(state.state_id, 3);
     assert_eq!(state.state, RegionReplicationState::SimpleMajority);
@@ -309,6 +303,26 @@ fn test_switching_replication_mode() {
     let state = cluster.pd_client.region_replication_status(region.get_id());
     assert_eq!(state.state_id, 3);
     assert_eq!(state.state, RegionReplicationState::IntegrityOverLabel);
+
+    cluster.add_send_filter(IsolationFilterFactory::new(3));
+    let mut request = new_request(
+        region.get_id(),
+        region.get_region_epoch().clone(),
+        vec![new_put_cf_cmd("default", b"k4", b"v4")],
+        false,
+    );
+    request.mut_header().set_peer(new_peer(1, 1));
+    let (cb, mut rx) = make_cb(&request);
+    cluster
+        .sim
+        .rl()
+        .async_command_on_node(1, request, cb)
+        .unwrap();
+    // already enable group commit.
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(100)),
+        Err(future::RecvTimeoutError::Timeout)
+    );
 }
 
 #[test]
@@ -329,7 +343,7 @@ fn test_replication_mode_allowlist() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -337,7 +351,7 @@ fn test_replication_mode_allowlist() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
 
     // clear allowlist.
@@ -417,7 +431,7 @@ fn test_migrate_replication_mode() {
         false,
     );
     request.mut_header().set_peer(new_peer(1, 1));
-    let (cb, rx) = make_cb(&request);
+    let (cb, mut rx) = make_cb(&request);
     cluster
         .sim
         .rl()
@@ -425,7 +439,7 @@ fn test_migrate_replication_mode() {
         .unwrap();
     assert_eq!(
         rx.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
+        Err(future::RecvTimeoutError::Timeout)
     );
     must_get_none(&cluster.get_engine(1), b"k2");
     let state = cluster.pd_client.region_replication_status(region.get_id());

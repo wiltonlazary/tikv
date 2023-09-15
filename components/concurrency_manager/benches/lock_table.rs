@@ -1,7 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 #![feature(test)]
-#![feature(bench_black_box)]
 
 use std::{borrow::Cow, hint::black_box, mem::forget};
 
@@ -33,6 +32,7 @@ fn prepare_cm() -> ConcurrencyManager {
                 10.into(),
                 1,
                 20.into(),
+                false,
             ));
         });
         // Leak the guard so the lock won't be removed.

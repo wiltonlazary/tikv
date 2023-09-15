@@ -47,6 +47,7 @@ where
             need_old_value: false,
             is_retry_request: false,
             assertion_level: AssertionLevel::Off,
+            txn_source: 0,
         };
         prewrite(
             &mut txn,
@@ -55,11 +56,12 @@ where
             Mutation::make_put(Key::from_raw(k), v.clone()),
             &None,
             SkipPessimisticCheck,
+            None,
         )
         .unwrap();
     }
     let write_data = WriteData::from_modifies(txn.into_modifies());
-    let _ = engine.async_write(&ctx, write_data, Box::new(move |_| {}));
+    let _ = futures::executor::block_on(tikv_kv::write(engine, &ctx, write_data, None));
     let keys: Vec<Key> = kvs.iter().map(|(k, _)| Key::from_raw(k)).collect();
     let snapshot = engine.snapshot(Default::default()).unwrap();
     (snapshot, keys)
@@ -97,6 +99,7 @@ fn mvcc_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &B
                     need_old_value: false,
                     is_retry_request: false,
                     assertion_level: AssertionLevel::Off,
+                    txn_source: 0,
                 };
                 prewrite(
                     &mut txn,
@@ -105,6 +108,7 @@ fn mvcc_prewrite<E: Engine, F: EngineFactory<E>>(b: &mut Bencher<'_>, config: &B
                     mutation,
                     &None,
                     SkipPessimisticCheck,
+                    None,
                 )
                 .unwrap();
             }

@@ -251,7 +251,10 @@
 #![cfg_attr(test, feature(test))]
 #![feature(min_specialization)]
 #![feature(assert_matches)]
-#![feature(generic_associated_types)]
+#![feature(linked_list_cursors)]
+#![feature(let_chains)]
+#![feature(str_split_remainder)]
+#![feature(extract_if)]
 
 #[macro_use(fail_point)]
 extern crate fail;
@@ -278,12 +281,16 @@ mod engine;
 pub use crate::engine::*;
 mod file_system;
 pub use crate::file_system::*;
+mod flush;
+pub use flush::*;
 mod import;
 pub use import::*;
 mod misc;
 pub use misc::*;
 mod snapshot;
 pub use crate::snapshot::*;
+mod snapshot_misc;
+pub use crate::snapshot_misc::SnapshotMiscExt;
 mod sst;
 pub use crate::sst::*;
 mod write_batch;
@@ -295,6 +302,8 @@ mod sst_partitioner;
 pub use crate::sst_partitioner::*;
 mod range_properties;
 pub use crate::{mvcc_properties::*, range_properties::*};
+mod tablet;
+pub use tablet::*;
 mod ttl_properties;
 pub use crate::ttl_properties::*;
 mod perf_context;
@@ -303,6 +312,8 @@ mod flow_control_factors;
 pub use crate::flow_control_factors::*;
 mod table_properties;
 pub use crate::table_properties::*;
+mod checkpoint;
+pub use crate::checkpoint::*;
 
 // These modules contain more general traits, some of which may be implemented
 // by multiple types.
@@ -332,7 +343,7 @@ pub use crate::range::*;
 
 mod raft_engine;
 pub use raft_engine::{
-    CacheStats, RaftEngine, RaftEngineDebug, RaftEngineReadOnly, RaftLogBatch, RaftLogGcTask,
+    CacheStats, RaftEngine, RaftEngineDebug, RaftEngineReadOnly, RaftLogBatch,
     RAFT_LOG_MULTI_GET_CNT,
 };
 

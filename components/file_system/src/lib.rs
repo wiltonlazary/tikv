@@ -34,7 +34,10 @@ use std::{
 };
 
 pub use file::{File, OpenOptions};
-pub use io_stats::{get_io_type, init as init_io_stats_collector, set_io_type};
+pub use io_stats::{
+    fetch_io_bytes, get_io_type, get_thread_io_bytes_total, init as init_io_stats_collector,
+    set_io_type,
+};
 pub use metrics_manager::{BytesFetcher, MetricsManager};
 use online_config::ConfigValue;
 use openssl::{
@@ -72,6 +75,7 @@ pub enum IoType {
     Gc = 8,
     Import = 9,
     Export = 10,
+    RewriteLog = 11,
 }
 
 impl IoType {
@@ -88,6 +92,7 @@ impl IoType {
             IoType::Gc => "gc",
             IoType::Import => "import",
             IoType::Export => "export",
+            IoType::RewriteLog => "log_rewrite",
         }
     }
 }
@@ -111,10 +116,10 @@ impl Drop for WithIoType {
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct IoBytes {
-    read: u64,
-    write: u64,
+    pub read: u64,
+    pub write: u64,
 }
 
 impl std::ops::Sub for IoBytes {
@@ -125,6 +130,13 @@ impl std::ops::Sub for IoBytes {
             read: self.read.saturating_sub(other.read),
             write: self.write.saturating_sub(other.write),
         }
+    }
+}
+
+impl std::ops::AddAssign for IoBytes {
+    fn add_assign(&mut self, rhs: Self) {
+        self.read += rhs.read;
+        self.write += rhs.write;
     }
 }
 
@@ -145,8 +157,13 @@ impl IoPriority {
         }
     }
 
-    fn unsafe_from_u32(i: u32) -> Self {
-        unsafe { std::mem::transmute(i) }
+    fn from_u32(i: u32) -> Self {
+        match i {
+            0 => IoPriority::Low,
+            1 => IoPriority::Medium,
+            2 => IoPriority::High,
+            _ => panic!("unknown io priority {}", i),
+        }
     }
 }
 
@@ -426,7 +443,7 @@ pub fn reserve_space_for_recover<P: AsRef<Path>>(data_dir: P, file_size: u64) ->
         delete_file_if_exist(&path)?;
     }
     fn do_reserve(dir: &Path, path: &Path, file_size: u64) -> io::Result<()> {
-        let f = File::create(&path)?;
+        let f = File::create(path)?;
         f.allocate(file_size)?;
         f.sync_all()?;
         sync_dir(dir)
@@ -483,7 +500,7 @@ mod tests {
 
         // Ensure it works for non-existent file.
         let non_existent_file = dir_path.join("non_existent_file");
-        get_file_size(&non_existent_file).unwrap_err();
+        get_file_size(non_existent_file).unwrap_err();
     }
 
     #[test]
@@ -504,7 +521,7 @@ mod tests {
         assert_eq!(file_exists(&existent_file), true);
 
         let non_existent_file = dir_path.join("non_existent_file");
-        assert_eq!(file_exists(&non_existent_file), false);
+        assert_eq!(file_exists(non_existent_file), false);
     }
 
     #[test]
@@ -525,7 +542,7 @@ mod tests {
         assert_eq!(file_exists(&existent_file), false);
 
         let non_existent_file = dir_path.join("non_existent_file");
-        delete_file_if_exist(&non_existent_file).unwrap();
+        delete_file_if_exist(non_existent_file).unwrap();
     }
 
     fn gen_rand_file<P: AsRef<Path>>(path: P, size: usize) -> u32 {

@@ -16,11 +16,11 @@ use crate::{
     metadata::{store::SlashEtcStore, MetadataEvent},
 };
 
-fn test_meta_cli() -> MetadataClient<SlashEtcStore> {
+pub fn test_meta_cli() -> MetadataClient<SlashEtcStore> {
     MetadataClient::new(SlashEtcStore::default(), 42)
 }
 
-fn simple_task(name: &str) -> StreamTask {
+pub fn simple_task(name: &str) -> StreamTask {
     let mut task = StreamTask::default();
     task.info.set_name(name.to_owned());
     task.info.set_start_ts(1);
@@ -54,21 +54,7 @@ async fn test_basic() -> Result<()> {
     cli.insert_task_with_range(&task, ranges).await?;
     let remote_ranges = cli.ranges_of_task(name).await?.inner;
     assert_range_matches(remote_ranges, ranges);
-    let overlap_ranges = cli
-        .range_overlap_of_task(name, (b"7".to_vec(), b"9".to_vec()))
-        .await?
-        .inner;
-    assert_range_matches(overlap_ranges, &[(b"6", b"8"), (b"8", b"9")]);
-    let overlap_ranges = cli
-        .range_overlap_of_task(name, (b"1".to_vec(), b"5".to_vec()))
-        .await?
-        .inner;
-    assert_range_matches(overlap_ranges, &[(b"1", b"2"), (b"4", b"5")]);
-    let overlap_ranges = cli
-        .range_overlap_of_task(name, (b"1".to_vec(), b"4".to_vec()))
-        .await?
-        .inner;
-    assert_range_matches(overlap_ranges, &[(b"1", b"2")]);
+
     Ok(())
 }
 

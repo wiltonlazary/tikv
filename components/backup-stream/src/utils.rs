@@ -3,6 +3,7 @@
 use core::pin::Pin;
 use std::{
     borrow::Borrow,
+    cell::RefCell,
     collections::{hash_map::RandomState, BTreeMap, HashMap},
     ops::{Bound, RangeBounds},
     path::Path,
@@ -20,6 +21,7 @@ use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use futures::{channel::mpsc, executor::block_on, ready, task::Poll, FutureExt, StreamExt};
 use kvproto::{
     brpb::CompressionType,
+    metapb::Region,
     raft_cmdpb::{CmdType, Request},
 };
 use raft::StateRole;
@@ -142,7 +144,7 @@ pub struct StopWatch(Instant);
 
 impl StopWatch {
     /// Create a new stopwatch via current time.
-    pub fn new() -> Self {
+    pub fn by_now() -> Self {
         Self(Instant::now_coarse())
     }
 
@@ -313,6 +315,10 @@ impl<K: Ord, V> SegmentMap<K, V> {
     pub fn get_inner(&mut self) -> &mut BTreeMap<K, SegmentValue<K, V>> {
         &mut self.0
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// transform a [`RaftCmdRequest`] to `(key, value, cf)` triple.
@@ -336,7 +342,7 @@ pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, CfName),
 /// `try_send!(s: Scheduler<T>, task: T)` tries to send a task to the scheduler,
 /// once meet an error, would report it, with the current file and line (so it
 /// is made as a macro). returns whether it success.
-#[macro_export(crate)]
+#[macro_export]
 macro_rules! try_send {
     ($s:expr, $task:expr) => {
         match $s.schedule($task) {
@@ -360,7 +366,7 @@ macro_rules! try_send {
 /// `backup_stream_debug`. because once we enable debug log for all crates, it
 /// would soon get too verbose to read. using this macro now we can enable debug
 /// log level for the crate only (even compile time...).
-#[macro_export(crate)]
+#[macro_export]
 macro_rules! debug {
     ($($t: tt)+) => {
         if cfg!(feature = "backup-stream-debug") {
@@ -437,15 +443,6 @@ pub fn should_track_lock(l: &Lock) -> bool {
 pub struct CallbackWaitGroup {
     running: AtomicUsize,
     on_finish_all: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
-}
-
-/// A shortcut for making an opaque future type for return type or argument
-/// type, which is sendable and not borrowing any variables.  
-///
-/// `fut![T]` == `impl Future<Output = T> + Send + 'static`
-#[macro_export(crate)]
-macro_rules! future {
-    ($t:ty) => { impl core::future::Future<Output = $t> + Send + 'static };
 }
 
 impl CallbackWaitGroup {
@@ -601,18 +598,18 @@ pub fn is_overlapping(range: (&[u8], &[u8]), range2: (&[u8], &[u8])) -> bool {
 }
 
 /// read files asynchronously in sequence
-pub struct FilesReader {
-    files: Vec<File>,
+pub struct FilesReader<R> {
+    files: Vec<R>,
     index: usize,
 }
 
-impl FilesReader {
-    pub fn new(files: Vec<File>) -> Self {
+impl<R> FilesReader<R> {
+    pub fn new(files: Vec<R>) -> Self {
         FilesReader { files, index: 0 }
     }
 }
 
-impl AsyncRead for FilesReader {
+impl<R: AsyncRead + Unpin> AsyncRead for FilesReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -638,7 +635,7 @@ impl AsyncRead for FilesReader {
 #[async_trait::async_trait]
 pub trait CompressionWriter: AsyncWrite + Sync + Send {
     /// call the `File.sync_all()` to flush immediately to disk.
-    async fn done(mut self: Pin<&mut Self>) -> Result<()>;
+    async fn done(&mut self) -> Result<()>;
 }
 
 /// a writer dispatcher for different compression type.
@@ -647,11 +644,11 @@ pub trait CompressionWriter: AsyncWrite + Sync + Send {
 pub async fn compression_writer_dispatcher(
     local_path: impl AsRef<Path>,
     compression_type: CompressionType,
-) -> Result<Pin<Box<dyn CompressionWriter>>> {
+) -> Result<Box<dyn CompressionWriter + Unpin>> {
     let inner = BufWriter::with_capacity(128 * 1024, File::create(local_path.as_ref()).await?);
     match compression_type {
-        CompressionType::Unknown => Ok(Box::pin(NoneCompressionWriter::new(inner))),
-        CompressionType::Zstd => Ok(Box::pin(ZstdCompressionWriter::new(inner))),
+        CompressionType::Unknown => Ok(Box::new(NoneCompressionWriter::new(inner))),
+        CompressionType::Zstd => Ok(Box::new(ZstdCompressionWriter::new(inner))),
         _ => Err(Error::Other(box_err!(format!(
             "the compression type is unimplemented, compression type id {:?}",
             compression_type
@@ -691,7 +688,7 @@ impl AsyncWrite for NoneCompressionWriter {
 
 #[async_trait::async_trait]
 impl CompressionWriter for NoneCompressionWriter {
-    async fn done(mut self: Pin<&mut Self>) -> Result<()> {
+    async fn done(&mut self) -> Result<()> {
         let bufwriter = &mut self.inner;
         bufwriter.flush().await?;
         bufwriter.get_ref().sync_all().await?;
@@ -700,19 +697,27 @@ impl CompressionWriter for NoneCompressionWriter {
 }
 
 /// use zstd compression algorithm
-pub struct ZstdCompressionWriter {
-    inner: ZstdEncoder<BufWriter<File>>,
+pub struct ZstdCompressionWriter<R> {
+    inner: ZstdEncoder<R>,
 }
 
-impl ZstdCompressionWriter {
-    pub fn new(inner: BufWriter<File>) -> Self {
+impl<R: AsyncWrite> ZstdCompressionWriter<R> {
+    pub fn new(inner: R) -> Self {
         ZstdCompressionWriter {
             inner: ZstdEncoder::with_quality(inner, Level::Fastest),
         }
     }
+
+    pub fn get_ref(&self) -> &R {
+        self.inner.get_ref()
+    }
+
+    pub fn get_mut(&mut self) -> &mut R {
+        self.inner.get_mut()
+    }
 }
 
-impl AsyncWrite for ZstdCompressionWriter {
+impl<R: AsyncWrite + Unpin> AsyncWrite for ZstdCompressionWriter<R> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -732,13 +737,124 @@ impl AsyncWrite for ZstdCompressionWriter {
 }
 
 #[async_trait::async_trait]
-impl CompressionWriter for ZstdCompressionWriter {
-    async fn done(mut self: Pin<&mut Self>) -> Result<()> {
+impl<R: AsyncWrite + Sync + Send + Unpin> CompressionWriter for ZstdCompressionWriter<R> {
+    async fn done(&mut self) -> Result<()> {
         let encoder = &mut self.inner;
         encoder.shutdown().await?;
         let bufwriter = encoder.get_mut();
         bufwriter.flush().await?;
-        bufwriter.get_ref().sync_all().await?;
+        Ok(())
+    }
+}
+
+/// make a pair of key range to impl Debug which prints [start_key,$end_key).
+pub fn debug_key_range<'ret, 'a: 'ret, 'b: 'ret>(
+    start: &'a [u8],
+    end: &'b [u8],
+) -> impl std::fmt::Debug + 'ret {
+    DebugKeyRange::<'a, 'b>(start, end)
+}
+
+struct DebugKeyRange<'start, 'end>(&'start [u8], &'end [u8]);
+
+impl<'start, 'end> std::fmt::Debug for DebugKeyRange<'start, 'end> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let end_key = if self.1.is_empty() {
+            Either::Left("inf")
+        } else {
+            Either::Right(redact(&self.1))
+        };
+        let end_key: &dyn std::fmt::Display = match &end_key {
+            Either::Left(x) => x,
+            Either::Right(y) => y,
+        };
+        write!(f, "[{},{})", redact(&self.0), end_key)
+    }
+}
+
+/// make a [`Region`](kvproto::metapb::Region) implements [`slog::KV`], which
+/// prints its fields like `[r.id=xxx] [r.ver=xxx] ...`
+pub fn slog_region(r: &Region) -> impl slog::KV + '_ {
+    SlogRegion(r)
+}
+
+/// make a [`Region`](kvproto::metapb::Region) implements
+/// [`Debug`](std::fmt::Debug), which prints its essential fields.
+pub fn debug_region(r: &Region) -> impl std::fmt::Debug + '_ {
+    DebugRegion(r)
+}
+
+struct DebugRegion<'a>(&'a Region);
+
+impl<'a> std::fmt::Debug for DebugRegion<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = self.0;
+        f.debug_struct("Region")
+            .field("id", &r.get_id())
+            .field("ver", &r.get_region_epoch().get_version())
+            .field("conf_ver", &r.get_region_epoch().get_conf_ver())
+            .field(
+                "range",
+                &debug_key_range(r.get_start_key(), r.get_end_key()),
+            )
+            .field(
+                "peers",
+                &debug_iter(r.get_peers().iter().map(|p| p.store_id)),
+            )
+            .finish()
+    }
+}
+
+struct SlogRegion<'a>(&'a Region);
+
+impl<'a> slog::KV for SlogRegion<'a> {
+    fn serialize(
+        &self,
+        _record: &slog::Record<'_>,
+        serializer: &mut dyn slog::Serializer,
+    ) -> slog::Result {
+        let r = self.0;
+        serializer.emit_u64("r.id", r.get_id())?;
+        serializer.emit_u64("r.ver", r.get_region_epoch().get_version())?;
+        serializer.emit_u64("r.conf_ver", r.get_region_epoch().get_conf_ver())?;
+        serializer.emit_arguments(
+            "r.range",
+            &format_args!("{:?}", debug_key_range(r.get_start_key(), r.get_end_key())),
+        )?;
+        serializer.emit_arguments(
+            "r.peers",
+            &format_args!("{:?}", debug_iter(r.get_peers().iter().map(|p| p.store_id))),
+        )?;
+        Ok(())
+    }
+}
+
+/// A shortcut for making an opaque future type for return type or argument
+/// type, which is sendable and not borrowing any variables.  
+///
+/// `future![T]` == `impl Future<Output = T> + Send + 'static`
+#[macro_export]
+macro_rules! future {
+    ($t:ty) => { impl core::future::Future<Output = $t> + Send + 'static };
+}
+
+pub fn debug_iter<D: std::fmt::Debug>(t: impl Iterator<Item = D>) -> impl std::fmt::Debug {
+    DebugIter(RefCell::new(t))
+}
+
+struct DebugIter<D: std::fmt::Debug, T: Iterator<Item = D>>(RefCell<T>);
+
+impl<D: std::fmt::Debug, T: Iterator<Item = D>> std::fmt::Debug for DebugIter<D, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut is_first = true;
+        while let Some(x) = self.0.borrow_mut().next() {
+            if !is_first {
+                write!(f, ",{:?}", x)?;
+            } else {
+                write!(f, "{:?}", x)?;
+                is_first = false;
+            }
+        }
         Ok(())
     }
 }
@@ -755,9 +871,34 @@ mod test {
 
     use engine_traits::WriteOptions;
     use futures::executor::block_on;
+    use kvproto::metapb::{Region, RegionEpoch};
     use tokio::io::{AsyncWriteExt, BufReader};
 
     use crate::utils::{is_in_range, CallbackWaitGroup, SegmentMap};
+
+    #[test]
+    fn test_redact() {
+        log_wrappers::set_redact_info_log(true);
+        let mut region = Region::default();
+        region.set_id(42);
+        region.set_start_key(b"TiDB".to_vec());
+        region.set_end_key(b"TiDC".to_vec());
+        region.set_region_epoch({
+            let mut r = RegionEpoch::default();
+            r.set_version(108);
+            r.set_conf_ver(352);
+            r
+        });
+
+        // Can we make a better way to test this?
+        assert_eq!(
+            "Region { id: 42, ver: 108, conf_ver: 352, range: [?,?), peers:  }",
+            format!("{:?}", super::debug_region(&region))
+        );
+
+        let range = super::debug_key_range(b"alpha", b"omega");
+        assert_eq!("[?,?)", format!("{:?}", range));
+    }
 
     #[test]
     fn test_range_functions() {
@@ -998,7 +1139,7 @@ mod test {
             .await
             .unwrap();
         writer.write_all(content.as_bytes()).await.unwrap();
-        writer.as_mut().done().await.unwrap();
+        writer.done().await.unwrap();
 
         let mut reader = BufReader::new(File::open(path1).await.unwrap());
         let mut read_content = String::new();
@@ -1011,7 +1152,7 @@ mod test {
             .await
             .unwrap();
         writer.write_all(content.as_bytes()).await.unwrap();
-        writer.as_mut().done().await.unwrap();
+        writer.done().await.unwrap();
 
         use async_compression::tokio::bufread::ZstdDecoder;
         let mut reader = ZstdDecoder::new(BufReader::new(File::open(path2).await.unwrap()));

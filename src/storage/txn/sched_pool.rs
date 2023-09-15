@@ -8,17 +8,21 @@ use std::{
 
 use collections::HashMap;
 use file_system::{set_io_type, IoType};
-use kvproto::pdpb::QueryKind;
+use kvproto::{kvrpcpb::CommandPri, pdpb::QueryKind};
+use pd_client::{Feature, FeatureGate};
 use prometheus::local::*;
 use raftstore::store::WriteStats;
+use resource_control::{ControlledFuture, ResourceController, TaskMetadata};
 use tikv_util::{
     sys::SysQuota,
-    yatp_pool::{FuturePool, PoolTicker, YatpPoolBuilder},
+    yatp_pool::{Full, FuturePool, PoolTicker, YatpPoolBuilder},
 };
+use yatp::queue::Extras;
 
 use crate::storage::{
     kv::{destroy_tls_engine, set_tls_engine, Engine, FlowStatsReporter, Statistics},
     metrics::*,
+    test_util::latest_feature_gate,
 };
 
 pub struct SchedLocalMetrics {
@@ -28,18 +32,15 @@ pub struct SchedLocalMetrics {
 }
 
 thread_local! {
-     static TLS_SCHED_METRICS: RefCell<SchedLocalMetrics> = RefCell::new(
+    static TLS_SCHED_METRICS: RefCell<SchedLocalMetrics> = RefCell::new(
         SchedLocalMetrics {
             local_scan_details: HashMap::default(),
             command_keyread_histogram_vec: KV_COMMAND_KEYREAD_HISTOGRAM_VEC.local(),
             local_write_stats:WriteStats::default(),
         }
     );
-}
 
-#[derive(Clone)]
-pub struct SchedPool {
-    pub pool: FuturePool,
+    static TLS_FEATURE_GATE: RefCell<FeatureGate> = RefCell::new(latest_feature_gate());
 }
 
 #[derive(Clone)]
@@ -53,36 +54,211 @@ impl<R: FlowStatsReporter> PoolTicker for SchedTicker<R> {
     }
 }
 
+#[derive(Clone)]
+pub enum QueueType {
+    // separated thread pools for different priority commands
+    Vanilla,
+    // automatically switch between the `single-queue pool` and `priority-queue pool` based on the
+    // resource group settings, only used when the resource control feature is enabled.
+    Dynamic,
+}
+
+#[derive(Clone)]
+struct VanillaQueue {
+    high_worker_pool: FuturePool,
+    worker_pool: FuturePool,
+}
+
+impl VanillaQueue {
+    fn spawn(
+        &self,
+        priority_level: CommandPri,
+        f: impl futures::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), Full> {
+        if priority_level == CommandPri::High {
+            self.high_worker_pool.spawn(f)
+        } else {
+            self.worker_pool.spawn(f)
+        }
+    }
+
+    fn scale_pool_size(&self, pool_size: usize) {
+        self.high_worker_pool
+            .scale_pool_size(std::cmp::max(1, pool_size / 2));
+        self.worker_pool.scale_pool_size(pool_size);
+    }
+
+    fn get_pool_size(&self, priority_level: CommandPri) -> usize {
+        if priority_level == CommandPri::High {
+            self.high_worker_pool.get_pool_size()
+        } else {
+            self.worker_pool.get_pool_size()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PriorityQueue {
+    worker_pool: FuturePool,
+    resource_ctl: Arc<ResourceController>,
+}
+
+impl PriorityQueue {
+    fn spawn(
+        &self,
+        metadata: TaskMetadata<'_>,
+        priority_level: CommandPri,
+        f: impl futures::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), Full> {
+        let fixed_level = match priority_level {
+            CommandPri::High => Some(0),
+            CommandPri::Normal => None,
+            CommandPri::Low => Some(2),
+        };
+        // TODO: maybe use a better way to generate task_id
+        let task_id = rand::random::<u64>();
+        let group_name = metadata.group_name().to_owned();
+        let mut extras = Extras::new_multilevel(task_id, fixed_level);
+        extras.set_metadata(metadata.to_vec());
+        self.worker_pool.spawn_with_extras(
+            ControlledFuture::new(
+                async move {
+                    f.await;
+                },
+                self.resource_ctl.clone(),
+                group_name,
+            ),
+            extras,
+        )
+    }
+
+    fn scale_pool_size(&self, pool_size: usize) {
+        self.worker_pool.scale_pool_size(pool_size);
+    }
+
+    fn get_pool_size(&self) -> usize {
+        self.worker_pool.get_pool_size()
+    }
+}
+
+#[derive(Clone)]
+pub struct SchedPool {
+    vanilla: VanillaQueue,
+    priority: Option<PriorityQueue>,
+    queue_type: QueueType,
+}
+
 impl SchedPool {
     pub fn new<E: Engine, R: FlowStatsReporter>(
         engine: E,
         pool_size: usize,
         reporter: R,
-        name_prefix: &str,
+        feature_gate: FeatureGate,
+        resource_ctl: Option<Arc<ResourceController>>,
     ) -> Self {
-        let engine = Arc::new(Mutex::new(engine));
-        // for low cpu quota env, set the max-thread-count as 4 to allow potential cases
-        // that we need more thread than cpu num.
-        let max_pool_size = std::cmp::max(
-            pool_size,
-            std::cmp::max(4, SysQuota::cpu_cores_quota() as usize),
-        );
-        let pool = YatpPoolBuilder::new(SchedTicker {reporter:reporter.clone()})
-            .thread_count(1, pool_size, max_pool_size)
-            .name_prefix(name_prefix)
-            // Safety: by setting `after_start` and `before_stop`, `FuturePool` ensures
-            // the tls_engine invariants.
-            .after_start(move || {
-                set_tls_engine(engine.lock().unwrap().clone());
-                set_io_type(IoType::ForegroundWrite);
-            })
-            .before_stop(move || unsafe {
-                // Safety: we ensure the `set_` and `destroy_` calls use the same engine type.
-                destroy_tls_engine::<E>();
-                tls_flush(&reporter);
-            })
-            .build_future_pool();
-        SchedPool { pool }
+        let builder = |pool_size: usize, name_prefix: &str| {
+            let engine = Arc::new(Mutex::new(engine.clone()));
+            let feature_gate = feature_gate.clone();
+            let reporter = reporter.clone();
+            // for low cpu quota env, set the max-thread-count as 4 to allow potential cases
+            // that we need more thread than cpu num.
+            let max_pool_size = std::cmp::max(
+                pool_size,
+                std::cmp::max(4, SysQuota::cpu_cores_quota() as usize),
+            );
+            YatpPoolBuilder::new(SchedTicker {reporter:reporter.clone()})
+                .thread_count(1, pool_size, max_pool_size)
+                .name_prefix(name_prefix)
+                // Safety: by setting `after_start` and `before_stop`, `FuturePool` ensures
+                // the tls_engine invariants.
+                .after_start(move || {
+                    set_tls_engine(engine.lock().unwrap().clone());
+                    set_io_type(IoType::ForegroundWrite);
+                    TLS_FEATURE_GATE.with(|c| *c.borrow_mut() = feature_gate.clone());
+                })
+                .before_stop(move || unsafe {
+                    // Safety: we ensure the `set_` and `destroy_` calls use the same engine type.
+                    destroy_tls_engine::<E>();
+                    tls_flush(&reporter);
+                })
+        };
+        let vanilla = VanillaQueue {
+            worker_pool: builder(pool_size, "sched-worker-pool").build_future_pool(),
+            high_worker_pool: builder(std::cmp::max(1, pool_size / 2), "sched-worker-high")
+                .build_future_pool(),
+        };
+        let priority = resource_ctl.as_ref().map(|r| PriorityQueue {
+            worker_pool: builder(pool_size, "sched-worker-priority")
+                .build_priority_future_pool(r.clone()),
+            resource_ctl: r.clone(),
+        });
+        let queue_type = if resource_ctl.is_some() {
+            QueueType::Dynamic
+        } else {
+            QueueType::Vanilla
+        };
+
+        SchedPool {
+            vanilla,
+            priority,
+            queue_type,
+        }
+    }
+
+    pub fn spawn(
+        &self,
+        metadata: TaskMetadata<'_>,
+        priority_level: CommandPri,
+        f: impl futures::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), Full> {
+        match self.queue_type {
+            QueueType::Vanilla => self.vanilla.spawn(priority_level, f),
+            QueueType::Dynamic => {
+                if self.can_use_priority() {
+                    fail_point!("priority_pool_task");
+                    self.priority
+                        .as_ref()
+                        .unwrap()
+                        .spawn(metadata, priority_level, f)
+                } else {
+                    fail_point!("single_queue_pool_task");
+                    self.vanilla.spawn(priority_level, f)
+                }
+            }
+        }
+    }
+
+    pub fn scale_pool_size(&self, pool_size: usize) {
+        match self.queue_type {
+            QueueType::Vanilla => {
+                self.vanilla.scale_pool_size(pool_size);
+            }
+            QueueType::Dynamic => {
+                let priority = self.priority.as_ref().unwrap();
+                priority.scale_pool_size(pool_size);
+                self.vanilla.scale_pool_size(pool_size);
+            }
+        }
+    }
+
+    fn can_use_priority(&self) -> bool {
+        match self.queue_type {
+            QueueType::Vanilla => false,
+            QueueType::Dynamic => self.priority.as_ref().unwrap().resource_ctl.is_customized(),
+        }
+    }
+
+    pub fn get_pool_size(&self, priority_level: CommandPri) -> usize {
+        match self.queue_type {
+            QueueType::Vanilla => self.vanilla.get_pool_size(priority_level),
+            QueueType::Dynamic => {
+                if self.can_use_priority() {
+                    self.priority.as_ref().unwrap().get_pool_size()
+                } else {
+                    self.vanilla.get_pool_size(priority_level)
+                }
+            }
+        }
     }
 }
 
@@ -91,7 +267,7 @@ pub fn tls_collect_scan_details(cmd: &'static str, stats: &Statistics) {
         m.borrow_mut()
             .local_scan_details
             .entry(cmd)
-            .or_insert_with(Default::default)
+            .or_default()
             .add(stats);
     });
 }
@@ -133,4 +309,13 @@ pub fn tls_collect_keyread_histogram_vec(cmd: &str, count: f64) {
             .with_label_values(&[cmd])
             .observe(count);
     });
+}
+
+pub fn tls_can_enable(feature: Feature) -> bool {
+    TLS_FEATURE_GATE.with(|feature_gate| feature_gate.borrow().can_enable(feature))
+}
+
+#[cfg(test)]
+pub fn set_tls_feature_gate(feature_gate: FeatureGate) {
+    TLS_FEATURE_GATE.with(|f| *f.borrow_mut() = feature_gate);
 }

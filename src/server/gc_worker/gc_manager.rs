@@ -197,7 +197,7 @@ fn set_status_metrics(state: GcManagerState) {
     ] {
         AUTO_GC_STATUS_GAUGE_VEC
             .with_label_values(&[s.tag()])
-            .set(if state == *s { 1 } else { 0 });
+            .set((state == *s) as i64);
     }
 }
 
@@ -289,9 +289,8 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider + 'static, E: KvEngine> GcMan
             .name(thd_name!("gc-manager"))
             .spawn_wrapper(move || {
                 tikv_util::thread_group::set_properties(props);
-                tikv_alloc::add_thread_memory_accessor();
+
                 self.run();
-                tikv_alloc::remove_thread_memory_accessor();
             })
             .map_err(|e| box_err!("failed to start gc manager: {:?}", e));
         res.map(|join_handle| GcManagerHandle {
@@ -547,7 +546,9 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider + 'static, E: KvEngine> GcMan
     ) -> GcManagerResult<Option<Key>> {
         // Get the information of the next region to do GC.
         let (region, next_key) = self.get_next_gc_context(from_key);
-        let Some(region) = region else { return Ok(None) };
+        let Some(region) = region else {
+            return Ok(None);
+        };
 
         let hex_start = format!("{:?}", log_wrappers::Value::key(region.get_start_key()));
         let hex_end = format!("{:?}", log_wrappers::Value::key(region.get_end_key()));
@@ -653,7 +654,6 @@ mod tests {
             } => callback,
             GcTask::GcKeys { .. } => unreachable!(),
             GcTask::RawGcKeys { .. } => unreachable!(),
-            GcTask::PhysicalScanLock { .. } => unreachable!(),
             GcTask::OrphanVersions { .. } => unreachable!(),
             GcTask::Validate(_) => unreachable!(),
         };
@@ -809,7 +809,7 @@ mod tests {
 
         // Following code asserts gc_tasks == expected_gc_tasks.
         assert_eq!(gc_tasks.len(), expected_gc_tasks.len());
-        let all_passed = gc_tasks.into_iter().zip(expected_gc_tasks.into_iter()).all(
+        let all_passed = gc_tasks.into_iter().zip(expected_gc_tasks).all(
             |((region, safe_point), (expect_region, expect_safe_point))| {
                 region == expect_region && safe_point == expect_safe_point.into()
             },
@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn test_auto_gc_rewinding() {
-        for regions in vec![
+        for regions in [
             // First region starts with empty and last region ends with empty.
             vec![
                 (b"".to_vec(), b"1".to_vec(), 1),
