@@ -2,28 +2,29 @@
 
 use std::{
     fs,
-    sync::{mpsc::channel, Arc},
+    sync::{Arc, mpsc::channel},
     thread,
     time::Duration,
 };
 
-use engine_traits::{Peekable, CF_DEFAULT, CF_WRITE};
+use engine_traits::{CF_DEFAULT, CF_RAFT, CF_WRITE, Peekable, RaftEngineReadOnly};
 use keys::data_key;
 use kvproto::{
     metapb, pdpb,
     raft_cmdpb::*,
-    raft_serverpb::{ExtraMessageType, RaftMessage},
+    raft_serverpb::{ExtraMessageType, RaftMessage, RegionLocalState},
 };
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
 use raftstore::{
-    store::{Bucket, BucketRange, Callback, WriteResponse},
     Result,
+    store::{Bucket, BucketRange, Callback, WriteResponse},
 };
 use raftstore_v2::router::QueryResult;
 use test_raftstore::*;
 use test_raftstore_macro::test_case;
-use tikv::storage::{kv::SnapshotExt, Snapshot};
+use test_util::eventually;
+use tikv::storage::{Snapshot, kv::SnapshotExt};
 use tikv_util::{config::*, future::block_on_timeout};
 use txn_types::{Key, LastChange, PessimisticLock};
 
@@ -609,7 +610,7 @@ fn test_node_split_region_after_reboot_with_config_change() {
     sleep_ms(200);
     assert_eq!(pd_client.get_split_count(), 0);
 
-    // change the config to make the region splittable
+    // change the config to make the region splitable
     cluster.cfg.coprocessor.region_max_size = Some(ReadableSize(region_max_size / 3));
     cluster.cfg.coprocessor.region_split_size = Some(ReadableSize(region_split_size / 3));
     cluster.cfg.coprocessor.region_bucket_size = ReadableSize(region_split_size / 3);
@@ -824,8 +825,8 @@ fn test_node_split_update_region_right_derive() {
     let new_leader = right
         .get_peers()
         .iter()
+        .find(|&p| p.get_id() != origin_leader.get_id())
         .cloned()
-        .find(|p| p.get_id() != origin_leader.get_id())
         .unwrap();
 
     // Make sure split is done in the new_leader.
@@ -896,6 +897,8 @@ fn test_split_with_epoch_not_match() {
 #[test_case(test_raftstore::new_server_cluster)]
 #[test_case(test_raftstore_v2::new_server_cluster)]
 fn test_split_with_in_memory_pessimistic_locks() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_cluster(0, 3);
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -932,10 +935,14 @@ fn test_split_with_in_memory_pessimistic_locks() {
     {
         let mut locks = txn_ext.pessimistic_locks.write();
         locks
-            .insert(vec![
-                (Key::from_raw(b"a"), lock_a.clone()),
-                (Key::from_raw(b"c"), lock_c.clone()),
-            ])
+            .insert(
+                vec![
+                    (Key::from_raw(b"a"), lock_a.clone()),
+                    (Key::from_raw(b"c"), lock_c.clone()),
+                ],
+                peer_size_limit,
+                instance_size_limit,
+            )
             .unwrap();
     }
 
@@ -976,14 +983,13 @@ fn test_refresh_region_bucket_keys() {
     cluster.run();
     let pd_client = Arc::clone(&cluster.pd_client);
 
+    // case: init bucket info
     cluster.must_put(b"k11", b"v1");
     let mut region = pd_client.get_region(b"k11").unwrap();
-
     let bucket = Bucket {
         keys: vec![b"k11".to_vec()],
         size: 1024 * 1024 * 200,
     };
-
     let mut expected_buckets = metapb::Buckets::default();
     expected_buckets.set_keys(bucket.clone().keys.into());
     expected_buckets
@@ -997,6 +1003,8 @@ fn test_refresh_region_bucket_keys() {
         Option::None,
         Some(expected_buckets.clone()),
     );
+
+    // case: bucket range should refresh if epoch changed
     let conf_ver = region.get_region_epoch().get_conf_ver() + 1;
     region.mut_region_epoch().set_conf_ver(conf_ver);
 
@@ -1018,6 +1026,7 @@ fn test_refresh_region_bucket_keys() {
     );
     assert_eq!(bucket_version2, bucket_version + 1);
 
+    // case: stale epoch will not refresh buckets info
     let conf_ver = 0;
     region.mut_region_epoch().set_conf_ver(conf_ver);
     let bucket_version3 = cluster.refresh_region_bucket_keys(
@@ -1028,6 +1037,7 @@ fn test_refresh_region_bucket_keys() {
     );
     assert_eq!(bucket_version3, bucket_version2);
 
+    // case: bucket split
     // now the buckets is ["", "k12", ""]. further split ["", k12], [k12, ""]
     // buckets into more buckets
     let region = pd_client.get_region(b"k11").unwrap();
@@ -1066,6 +1076,7 @@ fn test_refresh_region_bucket_keys() {
     );
     assert_eq!(bucket_version4, bucket_version3 + 1);
 
+    // case: merge buckets
     // remove k11~k12, k12~k121, k122~[] bucket
     let buckets = vec![
         Bucket {
@@ -1107,7 +1118,7 @@ fn test_refresh_region_bucket_keys() {
 
     assert_eq!(bucket_version5, bucket_version4 + 1);
 
-    // split the region
+    // case: split the region
     pd_client.must_split_region(region, pdpb::CheckPolicy::Usekey, vec![b"k11".to_vec()]);
     let mut buckets = vec![Bucket {
         keys: vec![b"k10".to_vec()],
@@ -1132,7 +1143,7 @@ fn test_refresh_region_bucket_keys() {
         cluster.refresh_region_bucket_keys(&region, buckets, None, Some(expected_buckets.clone()));
     assert_eq!(bucket_version6, bucket_version5 + 1);
 
-    // merge the region
+    // case: merge the region
     pd_client.must_merge(left_id, right.get_id());
     let region = pd_client.get_region(b"k10").unwrap();
     let buckets = vec![Bucket {
@@ -1145,6 +1156,7 @@ fn test_refresh_region_bucket_keys() {
         cluster.refresh_region_bucket_keys(&region, buckets, None, Some(expected_buckets.clone()));
     assert_eq!(bucket_version7, bucket_version6 + 1);
 
+    // case: nothing changed
     let bucket_version8 = cluster.refresh_region_bucket_keys(
         &region,
         vec![],
@@ -1157,9 +1169,9 @@ fn test_refresh_region_bucket_keys() {
 
 #[test]
 fn test_gen_split_check_bucket_ranges() {
-    let count = 5;
-    let mut cluster = new_server_cluster(0, count);
-    cluster.cfg.coprocessor.region_bucket_size = ReadableSize(5);
+    let mut cluster = new_server_cluster(0, 1);
+    let region_bucket_size = ReadableSize::kb(1);
+    cluster.cfg.coprocessor.region_bucket_size = region_bucket_size;
     cluster.cfg.coprocessor.enable_region_bucket = Some(true);
     // disable report buckets; as it will reset the user traffic stats to randomize
     // the test result
@@ -1169,14 +1181,15 @@ fn test_gen_split_check_bucket_ranges() {
     cluster.run();
     let pd_client = Arc::clone(&cluster.pd_client);
 
-    cluster.must_put(b"k11", b"v1");
-    let region = pd_client.get_region(b"k11").unwrap();
+    let mut range = 1..;
+    let mid_key = put_till_size(&mut cluster, region_bucket_size.0, &mut range);
+    let second_key = put_till_size(&mut cluster, region_bucket_size.0, &mut range);
+    let region = pd_client.get_region(&second_key).unwrap();
 
     let bucket = Bucket {
-        keys: vec![b"k11".to_vec()],
-        size: 1024 * 1024 * 200,
+        keys: vec![mid_key.clone()],
+        size: region_bucket_size.0 * 2,
     };
-
     let mut expected_buckets = metapb::Buckets::default();
     expected_buckets.set_keys(bucket.clone().keys.into());
     expected_buckets
@@ -1192,32 +1205,28 @@ fn test_gen_split_check_bucket_ranges() {
         Option::None,
         Some(expected_buckets.clone()),
     );
-    cluster.must_put(b"k10", b"v1");
-    cluster.must_put(b"k12", b"v1");
 
-    let expected_bucket_ranges = vec![
-        BucketRange(vec![], b"k11".to_vec()),
-        BucketRange(b"k11".to_vec(), vec![]),
-    ];
+    // put some data into the right buckets, so the bucket range will be check by
+    // split check.
+    let latest_key = put_till_size(&mut cluster, region_bucket_size.0 + 100, &mut range);
+    let expected_bucket_ranges = vec![BucketRange(mid_key.clone(), vec![])];
     cluster.send_half_split_region_message(&region, Some(expected_bucket_ranges));
 
-    // set fsm.peer.last_bucket_regions
+    // reset bucket stats.
     cluster.refresh_region_bucket_keys(
         &region,
         buckets,
         Option::None,
         Some(expected_buckets.clone()),
     );
-    // because the diff between last_bucket_regions and bucket_regions is zero,
-    // bucket range for split check should be empty.
-    let expected_bucket_ranges = vec![];
-    cluster.send_half_split_region_message(&region, Some(expected_bucket_ranges));
+
+    thread::sleep(Duration::from_millis(100));
+    cluster.send_half_split_region_message(&region, Some(vec![]));
 
     // split the region
-    pd_client.must_split_region(region, pdpb::CheckPolicy::Usekey, vec![b"k11".to_vec()]);
-
-    let left = pd_client.get_region(b"k10").unwrap();
-    let right = pd_client.get_region(b"k12").unwrap();
+    pd_client.must_split_region(region, pdpb::CheckPolicy::Usekey, vec![second_key]);
+    let left = pd_client.get_region(&mid_key).unwrap();
+    let right = pd_client.get_region(&latest_key).unwrap();
     if right.get_id() == 1 {
         // the bucket_ranges should be None to refresh the bucket
         cluster.send_half_split_region_message(&right, None);
@@ -1225,11 +1234,10 @@ fn test_gen_split_check_bucket_ranges() {
         // the bucket_ranges should be None to refresh the bucket
         cluster.send_half_split_region_message(&left, None);
     }
-
+    thread::sleep(Duration::from_millis(300));
     // merge the region
     pd_client.must_merge(left.get_id(), right.get_id());
-    let region = pd_client.get_region(b"k10").unwrap();
-    // the bucket_ranges should be None to refresh the bucket
+    let region = pd_client.get_region(&mid_key).unwrap();
     cluster.send_half_split_region_message(&region, None);
 }
 
@@ -1493,4 +1501,175 @@ fn test_node_split_during_read_index() {
             panic!("{:?}", other);
         }
     }
+}
+
+#[test_case(test_raftstore::new_node_cluster)]
+fn test_clear_uncampaigned_regions_after_split() {
+    let mut cluster = new_cluster(0, 3);
+    cluster.cfg.raft_store.raft_base_tick_interval = ReadableDuration::millis(50);
+    cluster.cfg.raft_store.raft_election_timeout_ticks = 10;
+
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    cluster.run();
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k2", b"v2");
+    cluster.must_put(b"k3", b"v3");
+    // Transfer leader to peer 3.
+    let region = pd_client.get_region(b"k2").unwrap();
+    cluster.must_transfer_leader(region.get_id(), new_peer(3, 3));
+
+    // New split regions will be recorded into uncampaigned region list of
+    // followers (in peer 1 and peer 2).
+    cluster.split_region(
+        &region,
+        b"k2",
+        Callback::write(Box::new(move |_write_resp: WriteResponse| {})),
+    );
+    // Wait the old lease of the leader timeout and followers clear its
+    // uncampaigned region list.
+    thread::sleep(
+        cluster.cfg.raft_store.raft_base_tick_interval.0
+            * cluster.cfg.raft_store.raft_election_timeout_ticks as u32
+            * 3,
+    );
+    // The leader of the parent region should still be peer 3 as no
+    // other peers can become leader.
+    cluster.reset_leader_of_region(region.get_id());
+    assert_eq!(
+        cluster.leader_of_region(region.get_id()).unwrap(),
+        new_peer(3, 3)
+    );
+}
+
+#[test]
+fn test_split_init_raft_state_recovery() {
+    let mut cluster = new_node_cluster(0, 3);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+    cluster.run();
+    cluster.must_put(b"k2", b"v2");
+    let region = cluster.get_region(b"k2");
+
+    // Block prevote so that new peers do not update and persist raft state.
+    cluster.add_send_filter(CloneFilterFactory(DropMessageFilter::new(Arc::new(
+        move |m| {
+            let msg_type = m.get_message().get_msg_type();
+            msg_type != MessageType::MsgRequestPreVote
+        },
+    ))));
+
+    // Split region
+    cluster.split_region(&region, b"k2", Callback::None);
+    // New regions are created with region id 1000.
+    let new_region_id = 1000;
+    eventually(Duration::from_millis(100), Duration::from_secs(5), || {
+        let region_state: Option<RegionLocalState> = cluster
+            .get_engine(2)
+            .get_msg_cf(CF_RAFT, &keys::region_state_key(new_region_id))
+            .unwrap();
+        region_state.is_some()
+    });
+    let new_region = cluster.get_region(b"");
+    assert_eq!(new_region.get_id(), new_region_id);
+    let new_peer_on_store_2 = find_peer(&new_region, 2).unwrap().to_owned();
+
+    // Restart node 2.
+    cluster.stop_node(2);
+
+    // Make sure raft_state is not persisted.
+    let raft_state = cluster
+        .get_raft_engine(2)
+        .get_raft_state(new_region_id)
+        .unwrap();
+    assert!(
+        raft_state.is_none(),
+        "raft state should not be persisted: {:?}",
+        raft_state
+    );
+
+    cluster.run_node(2).unwrap();
+
+    cluster.clear_send_filters();
+
+    // Make sure raft_state is recovered.
+    eventually(Duration::from_millis(100), Duration::from_secs(5), || {
+        let raft_state = cluster
+            .get_raft_engine(2)
+            .get_raft_state(new_region_id)
+            .unwrap();
+        raft_state.is_some()
+    });
+    cluster.must_transfer_leader(new_region_id, new_peer_on_store_2);
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+}
+
+#[test]
+fn test_split_init_raft_state_overwritten_by_snapshot() {
+    let mut cluster = new_node_cluster(0, 3);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+    cluster.run();
+    let region = cluster.get_region(b"k2");
+    let peer1 = find_peer(&region, 1).unwrap().to_owned();
+    cluster.must_transfer_leader(region.get_id(), peer1);
+    cluster.must_put(b"k2", b"v2");
+
+    // New regions are created with region id 1000.
+    let new_region_id = 1000;
+
+    // Block messages to new regions on store 2 so that it does not update and
+    // persist raft state.
+    cluster.add_recv_filter_on_node(
+        2,
+        Box::new(DropMessageFilter::new(Arc::new(move |m| {
+            m.get_region_id() != new_region_id
+        }))),
+    );
+
+    // Split region
+    cluster.split_region(&region, b"k2", Callback::None);
+    eventually(Duration::from_millis(100), Duration::from_secs(5), || {
+        let region_state: Option<RegionLocalState> = cluster
+            .get_engine(2)
+            .get_msg_cf(CF_RAFT, &keys::region_state_key(new_region_id))
+            .unwrap();
+        region_state.is_some()
+    });
+
+    let new_region = cluster.get_region(b"");
+    assert_eq!(new_region.get_id(), new_region_id);
+    let new_peer_on_store_2 = find_peer(&new_region, 2).unwrap().to_owned();
+    pd_client.must_remove_peer(new_region_id, new_peer_on_store_2.clone());
+    let mut new_peer_on_store_2_successor = new_peer_on_store_2.clone();
+    new_peer_on_store_2_successor.set_id(pd_client.alloc_id().unwrap());
+    pd_client.must_add_peer(new_region_id, new_peer_on_store_2_successor.clone());
+
+    // Make sure raft_state is not persisted.
+    let raft_state = cluster
+        .get_raft_engine(2)
+        .get_raft_state(new_region_id)
+        .unwrap();
+    assert!(
+        raft_state.is_none(),
+        "raft state should not be persisted: {:?}",
+        raft_state
+    );
+
+    cluster.clear_recv_filter_on_node(2);
+
+    // Make sure raft_state is persisted.
+    eventually(Duration::from_millis(100), Duration::from_secs(5), || {
+        let raft_state = cluster
+            .get_raft_engine(2)
+            .get_raft_state(new_region_id)
+            .unwrap();
+        raft_state.is_some()
+    });
+
+    cluster.must_transfer_leader(new_region_id, new_peer_on_store_2_successor);
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
 }

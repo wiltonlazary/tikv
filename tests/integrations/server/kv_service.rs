@@ -2,6 +2,7 @@
 
 use std::{
     char::from_u32,
+    collections::HashMap,
     path::Path,
     sync::{atomic::AtomicU64, *},
     thread,
@@ -11,16 +12,16 @@ use std::{
 use api_version::{ApiV1, ApiV1Ttl, ApiV2, KvFormat};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{
-    MiscExt, Peekable, RaftEngine, RaftEngineReadOnly, RaftLogBatch, SyncMutable, CF_DEFAULT,
-    CF_LOCK, CF_RAFT, CF_WRITE,
+    CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, MiscExt, Peekable, RaftEngine, RaftEngineReadOnly,
+    RaftLogBatch, SyncMutable,
 };
-use futures::{executor::block_on, future, SinkExt, StreamExt, TryStreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt, executor::block_on, future};
 use grpcio::*;
 use grpcio_health::{proto::HealthCheckRequest, *};
 use kvproto::{
     coprocessor::*,
     debugpb,
-    kvrpcpb::{PrewriteRequestPessimisticAction::*, *},
+    kvrpcpb::{Action::MinCommitTsPushed, PrewriteRequestPessimisticAction::*, *},
     metapb, raft_serverpb,
     raft_serverpb::*,
     tikvpb::*,
@@ -29,7 +30,7 @@ use pd_client::PdClient;
 use raft::eraftpb;
 use raftstore::{
     coprocessor::CoprocessorHost,
-    store::{fsm::store::StoreMeta, AutoSplitController, SnapManager},
+    store::{AutoSplitController, DiskCheckRunner, SnapManager, fsm::store::StoreMeta},
 };
 use resource_metering::CollectorRegHandle;
 use service::service_manager::GrpcServiceManager;
@@ -48,9 +49,9 @@ use tikv::{
     storage::{config::EngineType, txn::FLASHBACK_BATCH_SIZE},
 };
 use tikv_util::{
-    config::ReadableSize,
-    worker::{dummy_scheduler, LazyWorker},
     HandyRwLock,
+    config::ReadableSize,
+    worker::{LazyWorker, dummy_scheduler},
 };
 use txn_types::{Key, Lock, LockType, TimeStamp};
 
@@ -1407,9 +1408,10 @@ fn test_double_run_node() {
             importer,
             split_check_scheduler,
             AutoSplitController::default(),
-            ConcurrencyManager::new(1.into()),
+            ConcurrencyManager::new_for_test(1.into()),
             CollectorRegHandle::new_for_test(),
             None,
+            DiskCheckRunner::dummy(),
             GrpcServiceManager::dummy(),
             Arc::new(AtomicU64::new(0)),
         )
@@ -1758,6 +1760,106 @@ fn test_batch_commands() {
 
 #[test_case(test_raftstore::must_new_cluster_and_kv_client)]
 #[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_health_feedback() {
+    let (cluster, client, _ctx) = new_cluster();
+    let store_id = *cluster.store_metas.iter().next().unwrap().0;
+    assert_ne!(store_id, 0);
+
+    let (mut sender, mut receiver) = client.batch_commands().unwrap();
+
+    let mut batch_req = BatchCommandsRequest::default();
+    batch_req.mut_requests().push(Default::default());
+    batch_req.mut_request_ids().push(1);
+
+    block_on(sender.send((batch_req.clone(), WriteFlags::default()))).unwrap();
+    let resp = block_on(receiver.next()).unwrap().unwrap();
+    assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
+
+    block_on(sender.send((batch_req.clone(), WriteFlags::default()))).unwrap();
+    let resp = block_on(receiver.next()).unwrap().unwrap();
+    assert!(!resp.has_health_feedback());
+
+    thread::sleep(Duration::from_millis(1100));
+    block_on(sender.send((batch_req, WriteFlags::default()))).unwrap();
+    let resp = block_on(receiver.next()).unwrap().unwrap();
+    assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
+
+    block_on(sender.close()).unwrap();
+    block_on(receiver.for_each(|_| future::ready(())));
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_explicit_get_health_feedback() {
+    let (cluster, client, _ctx) = new_cluster();
+    let store_id = *cluster.store_metas.iter().next().unwrap().0;
+    assert_ne!(store_id, 0);
+
+    let (mut sender, mut receiver) = client.batch_commands().unwrap();
+
+    let mut batch_req = BatchCommandsRequest::default();
+    batch_req.mut_request_ids().push(1);
+    {
+        let mut req = BatchCommandsRequestRequest::default();
+        req.cmd = Some(BatchCommandsRequest_Request_oneof_cmd::GetHealthFeedback(
+            Default::default(),
+        ));
+        batch_req.mut_requests().push(req);
+    }
+
+    block_on(sender.send((batch_req.clone(), WriteFlags::default()))).unwrap();
+    let resp = block_on(receiver.next()).unwrap().unwrap();
+    assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
+    assert_eq!(resp.request_ids[0], 1);
+    assert!(
+        resp.get_responses()[0]
+            .get_get_health_feedback()
+            .has_health_feedback()
+    );
+    assert_eq!(
+        resp.get_responses()[0]
+            .get_get_health_feedback()
+            .get_health_feedback(),
+        resp.get_health_feedback()
+    );
+    let first_feedback_seq = resp.get_health_feedback().get_feedback_seq_no();
+
+    batch_req.mut_request_ids()[0] = 2;
+    block_on(sender.send((batch_req.clone(), WriteFlags::default()))).unwrap();
+    let resp = block_on(receiver.next()).unwrap().unwrap();
+    assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
+    assert_eq!(resp.request_ids[0], 2);
+    assert!(
+        resp.get_responses()[0]
+            .get_get_health_feedback()
+            .has_health_feedback()
+    );
+    assert_eq!(
+        resp.get_responses()[0]
+            .get_get_health_feedback()
+            .get_health_feedback(),
+        resp.get_health_feedback()
+    );
+    assert_eq!(
+        resp.get_health_feedback().get_feedback_seq_no(),
+        first_feedback_seq + 1
+    );
+
+    block_on(sender.close()).unwrap();
+    block_on(receiver.for_each(|_| future::ready(())));
+
+    // Non-batched API
+    let resp = client.get_health_feedback(&Default::default()).unwrap();
+    assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
 fn test_empty_commands() {
     let (_cluster, client, _ctx) = new_cluster();
     let (mut sender, receiver) = client.batch_commands().unwrap();
@@ -1828,7 +1930,7 @@ fn test_prewrite_check_max_commit_ts() {
     let (cluster, client, ctx) = new_cluster();
 
     let cm = cluster.sim.read().unwrap().get_concurrency_manager(1);
-    cm.update_max_ts(100.into());
+    cm.update_max_ts(100.into(), "").unwrap();
 
     let mut req = PrewriteRequest::default();
     req.set_context(ctx.clone());
@@ -2247,7 +2349,7 @@ fn test_get_lock_wait_info_api() {
         // The lock should be in waiting state here.
         let req = GetLockWaitInfoRequest::default();
         let resp = client.get_lock_wait_info(&req).unwrap();
-        if resp.entries.len() != 0 {
+        if !resp.entries.is_empty() {
             entries = Some(resp.entries.to_vec());
             break;
         }
@@ -2583,11 +2685,11 @@ fn test_commands_write_detail() {
     pessimistic_lock_req.set_primary_lock(k.clone());
     pessimistic_lock_req.set_lock_ttl(3000);
     let pessimistic_lock_resp = client.kv_pessimistic_lock(&pessimistic_lock_req).unwrap();
-    check_scan_detail(
-        pessimistic_lock_resp
-            .get_exec_details_v2()
-            .get_scan_detail_v2(),
-    );
+    let pessimistic_lock_scan_detail = pessimistic_lock_resp
+        .get_exec_details_v2()
+        .get_scan_detail_v2();
+    check_scan_detail(pessimistic_lock_scan_detail);
+    assert!(pessimistic_lock_scan_detail.get_total_versions() > 0);
     check_write_detail(
         pessimistic_lock_resp
             .get_exec_details_v2()
@@ -2637,8 +2739,8 @@ fn test_commands_write_detail() {
     );
 
     let mut check_txn_status_req = CheckTxnStatusRequest::default();
-    check_txn_status_req.set_context(ctx);
-    check_txn_status_req.set_primary_key(k);
+    check_txn_status_req.set_context(ctx.clone());
+    check_txn_status_req.set_primary_key(k.clone());
     check_txn_status_req.set_lock_ts(20);
     check_txn_status_req.set_rollback_if_not_exist(true);
     let check_txn_status_resp = client.kv_check_txn_status(&check_txn_status_req).unwrap();
@@ -2654,6 +2756,26 @@ fn test_commands_write_detail() {
             .get_process_nanos()
             > 0
     );
+
+    // Verify MVCC scan stats are carried into exec details for txn write RPCs.
+    // Use an optimistic prewrite (for_update_ts == 0) after the key has a committed
+    // version, so it will check write CF and produce non-zero `total_versions`.
+    let mut mutation = Mutation::default();
+    mutation.set_op(Op::Put);
+    mutation.set_key(k.clone());
+    mutation.set_value(b"value2".to_vec());
+    let mut optimistic_prewrite_req = PrewriteRequest::default();
+    optimistic_prewrite_req.set_mutations(vec![mutation].into());
+    optimistic_prewrite_req.set_context(ctx);
+    optimistic_prewrite_req.set_primary_lock(k);
+    optimistic_prewrite_req.set_start_version(40);
+    optimistic_prewrite_req.set_lock_ttl(3000);
+    let optimistic_prewrite_resp = client.kv_prewrite(&optimistic_prewrite_req).unwrap();
+    let optimistic_prewrite_scan_detail = optimistic_prewrite_resp
+        .get_exec_details_v2()
+        .get_scan_detail_v2();
+    check_scan_detail(optimistic_prewrite_scan_detail);
+    assert!(optimistic_prewrite_scan_detail.get_total_versions() > 0);
 }
 
 #[test_case(test_raftstore::must_new_cluster_and_kv_client)]
@@ -2717,6 +2839,20 @@ fn test_rpc_wall_time() {
                 .get_total_rpc_wall_time_ns()
                 > 0
         );
+        assert!(
+            resp.get_get()
+                .get_exec_details_v2()
+                .get_time_detail_v2()
+                .get_kv_grpc_process_time_ns()
+                > 0
+        );
+        assert!(
+            resp.get_get()
+                .get_exec_details_v2()
+                .get_time_detail_v2()
+                .get_kv_grpc_wait_time_ns()
+                > 0
+        );
     }
 }
 
@@ -2756,4 +2892,918 @@ fn test_pessimistic_lock_execution_tracking() {
     );
 
     handle.join().unwrap();
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_mvcc_scan_memory_and_cf_locks() {
+    let (cluster, client, ctx) = new_cluster();
+
+    // Create both pessimistic and prewrite locks.
+    // The peer in memory limit is 512KiB, generate 1KiB key for pessimistic lock.
+    // So Writing 512 pessimistic locks may exceed the memory limit and later
+    // pessimistic locks would be written to the lock cf.
+    let byte_slice: &[u8] = &[b'k'; 512];
+    let start_ts = 11;
+    let prewrite_start_ts = start_ts - 1;
+    let num_keys = 1040;
+    let prewrite_primary_key = b"prewrite_primary";
+    let val = b"value";
+    let format_key = |i| format!("{:?}{:04}", byte_slice, i).as_bytes().to_vec();
+    for i in 0..num_keys {
+        let key = format_key(i);
+        if i % 2 == 0 {
+            must_kv_pessimistic_lock(&client, ctx.clone(), key, start_ts);
+        } else {
+            let mut mutation = Mutation::default();
+            mutation.set_op(Op::Put);
+            mutation.set_key(key);
+            mutation.set_value(val.to_vec());
+            must_kv_prewrite_with(
+                &client,
+                ctx.clone(),
+                vec![mutation],
+                vec![],
+                prewrite_primary_key.to_vec(),
+                start_ts - 1,
+                0,
+                false,
+                false,
+            );
+        }
+    }
+    // Ensure the pessimistic locks are written to the memory. The first key should
+    // be written into the memory and the last key should be put to lock cf as
+    // memory limit is exceeded.
+    let engine = cluster.get_engine(1);
+    let cf_res = engine
+        .get_value_cf(
+            CF_LOCK,
+            keys::data_key(Key::from_raw(format_key(0).as_slice()).as_encoded()).as_slice(),
+        )
+        .unwrap();
+    assert!(cf_res.is_none());
+    let cf_res = engine
+        .get_value_cf(
+            CF_LOCK,
+            keys::data_key(Key::from_raw(format_key(num_keys - 2).as_slice()).as_encoded())
+                .as_slice(),
+        )
+        .unwrap();
+    assert!(cf_res.is_some());
+
+    // Scan lock, the pessimistic and prewrite results are returned.
+    // When limit is 0 or it's larger than num_keys, all keys should be returned.
+    // When limit is less than 512, in-memory pessimistic locks and prewrite locks
+    // should be returned.
+    // When limit is larger than 512, in-memory and lock cf pessimistic locks and
+    // prewrite locks should be returned.
+    for scan_limit in [0, 128, 256, 512, num_keys, num_keys * 2] {
+        let scan_ts = 20;
+        let scan_lock_max_version = scan_ts;
+        let mut scan_lock_req = ScanLockRequest::default();
+        scan_lock_req.set_context(ctx.clone());
+        scan_lock_req.max_version = scan_lock_max_version;
+        scan_lock_req.limit = scan_limit as u32;
+        let scan_lock_resp = client.kv_scan_lock(&scan_lock_req).unwrap();
+        assert!(!scan_lock_resp.has_region_error());
+        let expected_key_num = if scan_limit == 0 || scan_limit >= num_keys {
+            num_keys
+        } else {
+            scan_limit
+        };
+        assert_eq!(scan_lock_resp.locks.len(), expected_key_num);
+
+        for (i, lock_info) in (0..expected_key_num).zip(scan_lock_resp.locks.iter()) {
+            let key = format_key(i);
+            if i % 2 == 0 {
+                assert_eq!(lock_info.lock_type, Op::PessimisticLock);
+                assert_eq!(lock_info.lock_version, start_ts);
+                assert_eq!(lock_info.key, key);
+            } else {
+                assert_eq!(
+                    lock_info.lock_type,
+                    Op::Put,
+                    "i={:?} lock_info={:?} expected_key_num={:?}, scan_limit={:?}",
+                    i,
+                    lock_info,
+                    expected_key_num,
+                    scan_limit
+                );
+                assert_eq!(lock_info.primary_lock, prewrite_primary_key);
+                assert_eq!(lock_info.lock_version, prewrite_start_ts);
+                assert_eq!(lock_info.key, key);
+            }
+        }
+    }
+
+    // Scan with smaller ts returns empty result.
+    let mut scan_lock_req = ScanLockRequest::default();
+    scan_lock_req.set_context(ctx.clone());
+    scan_lock_req.max_version = prewrite_start_ts - 1;
+    let scan_lock_resp = client.kv_scan_lock(&scan_lock_req).unwrap();
+    assert!(!scan_lock_resp.has_region_error());
+    assert_eq!(scan_lock_resp.locks.len(), 0);
+
+    // Roll back the prewrite locks.
+    let rollback_start_version = prewrite_start_ts;
+    let mut rollback_req = BatchRollbackRequest::default();
+    rollback_req.set_context(ctx.clone());
+    rollback_req.start_version = rollback_start_version;
+    let keys = (0..num_keys)
+        .filter(|i| i % 2 != 0)
+        .map(|i| format_key(i))
+        .collect();
+    rollback_req.set_keys(keys);
+    let rollback_resp = client.kv_batch_rollback(&rollback_req).unwrap();
+    assert!(!rollback_resp.has_region_error());
+    assert!(!rollback_resp.has_error());
+
+    // Scan lock again after removing prewrite locks.
+    let mut scan_lock_req = ScanLockRequest::default();
+    scan_lock_req.set_context(ctx.clone());
+    scan_lock_req.max_version = start_ts + 1;
+    let scan_lock_resp = client.kv_scan_lock(&scan_lock_req).unwrap();
+    assert!(!scan_lock_resp.has_region_error());
+    assert_eq!(scan_lock_resp.locks.len(), num_keys / 2);
+    for (i, lock_info) in (0..num_keys / 2).zip(scan_lock_resp.locks.iter()) {
+        let key = format_key(i * 2);
+        assert_eq!(lock_info.lock_version, start_ts);
+        assert_eq!(lock_info.key, key);
+        assert_eq!(lock_info.lock_type, Op::PessimisticLock);
+    }
+
+    // Pessimistic rollabck all the locks. Scan lock should return empty result.
+    let mut pessimsitic_rollback_req = PessimisticRollbackRequest::default();
+    pessimsitic_rollback_req.start_version = start_ts;
+    pessimsitic_rollback_req.for_update_ts = start_ts;
+    pessimsitic_rollback_req.set_context(ctx.clone());
+    let keys = (0..num_keys)
+        .filter(|i| i % 2 == 0)
+        .map(|i| format_key(i))
+        .collect();
+    pessimsitic_rollback_req.set_keys(keys);
+    let pessimistic_rollback_resp = client
+        .kv_pessimistic_rollback(&pessimsitic_rollback_req)
+        .unwrap();
+    assert!(!pessimistic_rollback_resp.has_region_error());
+
+    // Scan lock again after all the cleanup.
+    let mut scan_lock_req = ScanLockRequest::default();
+    scan_lock_req.set_context(ctx);
+    scan_lock_req.max_version = start_ts + 1;
+    let scan_lock_resp = client.kv_scan_lock(&scan_lock_req).unwrap();
+    assert!(!scan_lock_resp.has_region_error());
+    assert_eq!(scan_lock_resp.locks.len(), 0);
+}
+
+#[test_case(test_raftstore::must_new_and_configure_cluster)]
+#[test_case(test_raftstore_v2::must_new_and_configure_cluster)]
+fn test_pessimistic_rollback_with_read_first() {
+    for enable_in_memory_lock in [true, false] {
+        let (cluster, leader, ctx) = new_cluster(|cluster| {
+            cluster.cfg.pessimistic_txn.pipelined = enable_in_memory_lock;
+            cluster.cfg.pessimistic_txn.in_memory = enable_in_memory_lock;
+
+            // Disable region split.
+            const MAX_REGION_SIZE: u64 = 1024;
+            const MAX_SPLIT_KEY: u64 = 1 << 31;
+            cluster.cfg.coprocessor.region_max_size = Some(ReadableSize::gb(MAX_REGION_SIZE));
+            cluster.cfg.coprocessor.region_split_size = Some(ReadableSize::gb(MAX_REGION_SIZE));
+            cluster.cfg.coprocessor.region_max_keys = Some(MAX_SPLIT_KEY);
+            cluster.cfg.coprocessor.region_split_keys = Some(MAX_SPLIT_KEY);
+        });
+        let env = Arc::new(Environment::new(1));
+        let leader_store_id = leader.get_store_id();
+        let channel = ChannelBuilder::new(env).connect(&cluster.sim.rl().get_addr(leader_store_id));
+        let client = TikvClient::new(channel);
+
+        let format_key = |prefix: char, i: usize| format!("{}{:04}", prefix, i).as_bytes().to_vec();
+        let (k1, k2, k3) = (format_key('k', 1), format_key('k', 2), format_key('k', 3));
+
+        // Basic case, two keys could be rolled back within one pessimistic rollback
+        // request.
+        let start_ts = 10;
+        must_kv_pessimistic_lock(&client, ctx.clone(), k1.clone(), start_ts);
+        must_kv_pessimistic_lock(&client, ctx.clone(), k2, start_ts);
+        must_lock_cnt(
+            &client,
+            ctx.clone(),
+            start_ts + 10,
+            k1.as_slice(),
+            k3.as_slice(),
+            Op::PessimisticLock,
+            2,
+            100,
+        );
+        must_kv_pessimistic_rollback_with_scan_first(&client, ctx.clone(), start_ts, start_ts);
+        must_lock_cnt(
+            &client,
+            ctx.clone(),
+            start_ts + 10,
+            k1.as_slice(),
+            k3.as_slice(),
+            Op::PessimisticLock,
+            0,
+            100,
+        );
+
+        // Acquire pessimistic locks for more than 256(RESOLVE_LOCK_BATCH_SIZE) keys.
+        let start_ts = 11;
+        let num_keys = 1000;
+        let prewrite_primary_key = format_key('k', 1);
+        let val = b"value";
+        for i in 0..num_keys {
+            let key = format_key('k', i);
+            if i % 2 == 0 {
+                must_kv_pessimistic_lock(&client, ctx.clone(), key, start_ts);
+            } else {
+                let mut mutation = Mutation::default();
+                mutation.set_op(Op::Put);
+                mutation.set_key(key);
+                mutation.set_value(val.to_vec());
+                must_kv_prewrite(
+                    &client,
+                    ctx.clone(),
+                    vec![mutation],
+                    prewrite_primary_key.clone(),
+                    start_ts,
+                );
+            }
+        }
+
+        // Pessimistic roll back one key.
+        must_kv_pessimistic_rollback(&client, ctx.clone(), format_key('k', 0), start_ts, start_ts);
+        must_lock_cnt(
+            &client,
+            ctx.clone(),
+            start_ts + 10,
+            format_key('k', 0).as_slice(),
+            format_key('k', num_keys + 1).as_slice(),
+            Op::PessimisticLock,
+            num_keys / 2 - 1,
+            0,
+        );
+
+        // All the pessimistic locks belonging to the same transaction are pessimistic
+        // rolled back within one request.
+        must_kv_pessimistic_rollback_with_scan_first(&client, ctx.clone(), start_ts, start_ts);
+        must_lock_cnt(
+            &client,
+            ctx.clone(),
+            start_ts + 10,
+            format_key('k', 0).as_slice(),
+            format_key('k', num_keys + 1).as_slice(),
+            Op::PessimisticLock,
+            0,
+            0,
+        );
+        must_lock_cnt(
+            &client,
+            ctx,
+            start_ts + 10,
+            format_key('k', 0).as_slice(),
+            format_key('k', num_keys + 1).as_slice(),
+            Op::Put,
+            num_keys / 2,
+            0,
+        );
+    }
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_pipelined_dml_flush() {
+    let (_cluster, client, ctx) = new_cluster();
+    // k1 is put
+    let (k1, v) = (b"key".to_vec(), b"value".to_vec());
+    // k2 is deletion
+    let k2 = b"key2".to_vec();
+    // k3 is not touched
+    let k3 = b"key3".to_vec();
+    let pk = b"primary".to_vec();
+    let mut flush_req = FlushRequest::default();
+    flush_req.set_mutations(
+        vec![
+            Mutation {
+                op: Op::Put,
+                key: pk.clone(),
+                value: v.clone(),
+                ..Default::default()
+            },
+            Mutation {
+                op: Op::Put,
+                key: k1.clone(),
+                value: v.clone(),
+                ..Default::default()
+            },
+            Mutation {
+                op: Op::Del,
+                key: k2.clone(),
+                value: vec![],
+                ..Default::default()
+            },
+        ]
+        .into(),
+    );
+    flush_req.set_context(ctx.clone());
+    flush_req.set_start_ts(1);
+    flush_req.set_primary_key(pk.clone());
+    flush_req.set_generation(1);
+    let flush_resp = client.kv_flush(&flush_req).unwrap();
+    assert!(!flush_resp.has_region_error());
+    assert!(flush_resp.get_errors().is_empty());
+
+    let mut batch_get_req = BufferBatchGetRequest::default();
+    batch_get_req.set_context(ctx.clone());
+    batch_get_req.set_keys(vec![k1.clone(), k2.clone(), k3.clone()].into());
+    batch_get_req.set_version(1);
+    let batch_get_resp = client.kv_buffer_batch_get(&batch_get_req).unwrap();
+    assert!(!batch_get_resp.has_region_error());
+    let pairs = batch_get_resp.get_pairs();
+    assert_eq!(pairs.len(), 2);
+    assert!(!pairs[0].has_error());
+    assert_eq!(pairs[0].get_key(), k1.as_slice());
+    assert_eq!(pairs[0].get_value(), v.as_slice());
+    assert_eq!(pairs[1].get_key(), k2.as_slice());
+    assert!(pairs[1].get_value().is_empty());
+
+    let mut commit_req = CommitRequest::default();
+    commit_req.set_context(ctx.clone());
+    commit_req.set_start_version(1);
+    commit_req.set_commit_version(2);
+    commit_req.set_keys(vec![pk.clone(), k1.clone()].into());
+    let commit_resp = client.kv_commit(&commit_req).unwrap();
+    assert!(!commit_resp.has_region_error());
+    assert!(!commit_resp.has_error(), "{:?}", commit_resp.get_error());
+
+    let mut get_req = GetRequest::default();
+    get_req.set_context(ctx);
+    get_req.set_key(k1);
+    get_req.set_version(10);
+    let get_resp = client.kv_get(&get_req).unwrap();
+    assert!(!get_resp.has_region_error());
+    assert!(
+        !get_resp.has_error(),
+        "get error {:?}",
+        get_resp.get_error()
+    );
+    assert_eq!(get_resp.get_value(), v);
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_pipelined_dml_write_conflict() {
+    let (_cluster, client, ctx) = new_cluster();
+    let (k, v) = (b"key".to_vec(), b"value".to_vec());
+
+    // flush x flush
+    let mut req = FlushRequest::default();
+    req.set_mutations(
+        vec![Mutation {
+            op: Op::Put,
+            key: k.clone(),
+            value: v.clone(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    req.set_generation(1);
+    req.set_context(ctx.clone());
+    req.set_start_ts(1);
+    req.set_primary_key(k.clone());
+    let flush_resp = client.kv_flush(&req).unwrap();
+    assert!(!flush_resp.has_region_error());
+    assert!(flush_resp.get_errors().is_empty());
+
+    // another conflicting flush should return error
+    let mut req = req.clone();
+    req.set_start_ts(2);
+    let resp = client.kv_flush(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_errors().first().unwrap().has_locked());
+
+    // flush x prerwite
+    let mut req = PrewriteRequest::default();
+    req.set_context(ctx.clone());
+    req.set_mutations(
+        vec![Mutation {
+            op: Op::Put,
+            key: k.clone(),
+            value: v.clone(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    req.set_start_version(2);
+    req.set_primary_lock(k.clone());
+    let resp = client.kv_prewrite(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.errors.first().unwrap().has_locked());
+
+    // flush x pessimistic lock
+    let mut req = PessimisticLockRequest::default();
+    req.set_context(ctx.clone());
+    req.set_primary_lock(k.clone());
+    req.set_start_version(2);
+    req.set_for_update_ts(2);
+    req.set_mutations(
+        vec![Mutation {
+            op: Op::PessimisticLock,
+            key: k.clone(),
+            value: [].into(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    let resp = client.kv_pessimistic_lock(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_errors().first().unwrap().has_locked());
+
+    // prewrite x flush
+    let k = b"key2".to_vec();
+    let mut prewrite_req = PrewriteRequest::default();
+    prewrite_req.set_context(ctx.clone());
+    prewrite_req.set_mutations(
+        vec![Mutation {
+            op: Op::Put,
+            key: k.clone(),
+            value: v.clone(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    prewrite_req.set_start_version(1);
+    prewrite_req.set_primary_lock(k.clone());
+    let resp = client.kv_prewrite(&prewrite_req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.errors.is_empty());
+
+    let mut req = FlushRequest::default();
+    req.set_mutations(
+        vec![Mutation {
+            op: Op::Put,
+            key: k.clone(),
+            value: v.clone(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    req.set_generation(2);
+    req.set_context(ctx.clone());
+    req.set_start_ts(2);
+    req.set_primary_key(k.clone());
+    let resp = client.kv_flush(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_errors().first().unwrap().has_locked());
+
+    // pessimistic lock x flush
+    let k = b"key3".to_vec();
+    let mut req = PessimisticLockRequest::default();
+    req.set_context(ctx.clone());
+    req.set_primary_lock(k.clone());
+    req.set_start_version(1);
+    req.set_for_update_ts(1);
+    req.set_mutations(
+        vec![Mutation {
+            op: Op::PessimisticLock,
+            key: k.clone(),
+            value: [].into(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    let resp = client.kv_pessimistic_lock(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_errors().is_empty());
+
+    let mut req = FlushRequest::default();
+    req.set_mutations(
+        vec![Mutation {
+            op: Op::Put,
+            key: k.clone(),
+            value: v.clone(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    req.set_generation(3);
+    req.set_context(ctx.clone());
+    req.set_start_ts(2);
+    req.set_primary_key(k.clone());
+    let resp = client.kv_flush(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_errors().first().unwrap().has_locked());
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_pipelined_dml_read_write_conflict() {
+    let (_cluster, client, ctx) = new_cluster();
+    let (k, v) = (b"key".to_vec(), b"value".to_vec());
+
+    // flushed lock can be observed by another read, and its min_commit_ts can be
+    // pushed
+    let mut req = FlushRequest::default();
+    req.set_mutations(
+        vec![Mutation {
+            op: Op::Put,
+            key: k.clone(),
+            value: v.clone(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    req.set_generation(1);
+    req.set_context(ctx.clone());
+    req.set_start_ts(1);
+    req.set_primary_key(k.clone());
+    let resp = client.kv_flush(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_errors().is_empty());
+
+    let mut req = GetRequest::default();
+    req.set_context(ctx.clone());
+    req.set_version(2);
+    req.set_key(k.clone());
+    let resp = client.kv_get(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_error().has_locked());
+
+    // reader pushing the lock's min_commit_ts
+    let mut req = CheckTxnStatusRequest::default();
+    req.set_context(ctx.clone());
+    req.set_primary_key(k.clone());
+    req.set_lock_ts(1);
+    req.set_caller_start_ts(2);
+    req.set_current_ts(2);
+    let resp = client.kv_check_txn_status(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(!resp.has_error());
+    assert_eq!(resp.get_action(), MinCommitTsPushed);
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_pipelined_dml_buffer_get_other_key() {
+    let (_cluster, client, ctx) = new_cluster();
+    let k = b"key".to_vec();
+    let mut req = PessimisticLockRequest::default();
+    req.set_context(ctx.clone());
+    req.set_primary_lock(k.clone());
+    req.set_start_version(1);
+    req.set_for_update_ts(1);
+    req.set_mutations(
+        vec![Mutation {
+            op: Op::PessimisticLock,
+            key: k.clone(),
+            value: [].into(),
+            ..Default::default()
+        }]
+        .into(),
+    );
+    let resp = client.kv_pessimistic_lock(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_errors().is_empty());
+
+    let mut req = BufferBatchGetRequest::default();
+    req.set_context(ctx.clone());
+    req.set_keys(vec![k.clone()].into());
+    req.set_version(2);
+    let resp = client.kv_buffer_batch_get(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_pairs().is_empty());
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_pipelined_dml_buffer_get_unordered_keys() {
+    let (_cluster, client, ctx) = new_cluster();
+    let keys = vec![
+        b"key1".to_vec(),
+        b"key2".to_vec(),
+        b"key3".to_vec(),
+        b"key4".to_vec(),
+    ];
+
+    // flushed lock can be observed by another read
+    let mut req = FlushRequest::default();
+    req.set_mutations(
+        keys.iter()
+            .map(|key| Mutation {
+                op: Op::Put,
+                key: key.clone(),
+                value: key.clone(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    req.set_generation(1);
+    req.set_context(ctx.clone());
+    req.set_start_ts(1);
+    req.set_primary_key(keys[0].clone());
+    let resp = client.kv_flush(&req).unwrap();
+    assert!(!resp.has_region_error());
+    assert!(resp.get_errors().is_empty());
+
+    let mut reversed_keys = keys.clone();
+    reversed_keys.reverse();
+    let duplicated_keys = keys
+        .clone()
+        .iter()
+        .flat_map(|key| vec![key.clone(), key.clone()])
+        .collect();
+    let cases = vec![keys.clone(), reversed_keys, duplicated_keys];
+    for case in cases {
+        let mut req = BufferBatchGetRequest::default();
+        req.set_keys(case.into());
+        req.set_context(ctx.clone());
+        req.set_version(1);
+        let resp = client.kv_buffer_batch_get(&req).unwrap();
+        let pairs = resp.get_pairs();
+        assert_eq!(pairs.len(), 4);
+        let pairs_map = pairs
+            .iter()
+            .map(|pair| (pair.get_key().to_vec(), pair.get_value().to_vec()))
+            .collect::<HashMap<_, _>>();
+        for key in &keys {
+            assert_eq!(pairs_map.get(key).unwrap(), key.as_slice());
+        }
+    }
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_check_cluster_id() {
+    let (cluster, client, ctx) = new_cluster();
+    let k1 = b"k1";
+    let v1 = b"v1";
+    let ts = 1;
+    let mut mutation = Mutation::default();
+    mutation.set_op(Op::Put);
+    mutation.set_key(k1.to_vec());
+    mutation.set_value(v1.to_vec());
+    must_kv_prewrite(&client, ctx.clone(), vec![mutation], k1.to_vec(), ts);
+    must_kv_commit(&client, ctx.clone(), vec![k1.to_vec()], ts, ts + 1, ts + 1);
+
+    // Test unary requests, cluster id is not set.
+    let mut get_req = GetRequest::default();
+    get_req.set_context(ctx.clone());
+    get_req.key = k1.to_vec();
+    get_req.version = 10;
+    let get_resp = client.kv_get(&get_req).unwrap();
+    assert!(!get_resp.has_region_error());
+    assert!(
+        !get_resp.has_error(),
+        "get error {:?}",
+        get_resp.get_error()
+    );
+    assert_eq!(get_resp.get_value(), v1);
+
+    // Test unary request, cluster id is set correctly.
+    get_req.mut_context().cluster_id = ctx.cluster_id;
+    let get_resp = client.kv_get(&get_req).unwrap();
+    assert!(!get_resp.has_region_error());
+    assert!(
+        !get_resp.has_error(),
+        "get error {:?}",
+        get_resp.get_error()
+    );
+    assert_eq!(get_resp.get_value(), v1);
+
+    // Test unary request, cluster id is set incorrectly.
+    let cm = cluster.sim.read().unwrap().get_concurrency_manager(1);
+    let max_ts_before_req = cm.max_ts();
+    get_req.mut_context().cluster_id = ctx.cluster_id + 1;
+    get_req.version = max_ts_before_req.next().next().into_inner();
+    let get_resp = client.kv_get(&get_req);
+    let mut error_match = false;
+    if let Error::RpcFailure(status) = get_resp.unwrap_err() {
+        if status.code() == RpcStatusCode::INVALID_ARGUMENT {
+            error_match = true;
+        }
+    }
+    assert!(error_match);
+    assert_eq!(max_ts_before_req, cm.max_ts());
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_check_cluster_id_for_batch_cmds() {
+    let (_cluster, client, ctx) = new_cluster();
+    let k1 = b"k1";
+    let v1 = b"v1";
+    let ts = 1;
+    // Prewrite and commit.
+    let mut mutation = Mutation::default();
+    mutation.set_op(Op::Put);
+    mutation.set_key(k1.to_vec());
+    mutation.set_value(v1.to_vec());
+    must_kv_prewrite(&client, ctx.clone(), vec![mutation], k1.to_vec(), ts);
+    must_kv_commit(&client, ctx.clone(), vec![k1.to_vec()], ts, ts + 1, ts + 1);
+
+    // Test batch command requests.
+    for set_cluster_id in [false, true] {
+        let batch_req_num = 10usize;
+        for invalid_req_index in [0, 5, 9, 20] {
+            let (mut sender, receiver) = client.batch_commands().unwrap();
+            let mut batch_req = BatchCommandsRequest::default();
+            for i in 0..batch_req_num {
+                let mut get = GetRequest::default();
+                get.version = ts + 10;
+                get.key = k1.to_vec();
+                get.set_context(ctx.clone());
+                if set_cluster_id {
+                    get.mut_context().cluster_id = ctx.cluster_id;
+                    if i == invalid_req_index {
+                        get.mut_context().cluster_id = ctx.cluster_id + 100;
+                    }
+                }
+                let mut req = batch_commands_request::Request::default();
+                req.cmd = Some(batch_commands_request::request::Cmd::Get(get));
+                batch_req.mut_requests().push(req);
+                batch_req.mut_request_ids().push(i as u64);
+            }
+            block_on(sender.send((batch_req, WriteFlags::default()))).unwrap();
+            block_on(sender.close()).unwrap();
+            let (tx, rx) = mpsc::sync_channel(1);
+
+            thread::spawn(move || {
+                let mut count = 0;
+                for x in block_on(
+                    receiver
+                        .map(move |b| match b {
+                            Ok(batch) => batch.get_responses().len(),
+                            Err(..) => 0,
+                        })
+                        .collect::<Vec<usize>>(),
+                ) {
+                    count += x;
+                }
+                tx.send(count).unwrap();
+            });
+            let received_cnt = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if !set_cluster_id || invalid_req_index >= batch_req_num {
+                assert_eq!(received_cnt, batch_req_num);
+            } else {
+                assert!(received_cnt < batch_req_num);
+            }
+        }
+    }
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_prewrite_future_execution_time() {
+    let (cluster, client, ctx) = new_cluster();
+
+    let start_ts = block_on(cluster.pd_client.get_tso()).unwrap();
+    let mut req = PrewriteRequest::default();
+    req.set_context(ctx.clone());
+    req.set_primary_lock(b"key".to_vec());
+    let mut mutation = Mutation::default();
+    mutation.set_op(Op::Put);
+    mutation.set_key(b"key".to_vec());
+    mutation.set_value(b"value".to_vec());
+    req.mut_mutations().push(mutation);
+    req.set_start_version(start_ts.into_inner());
+    req.set_lock_ttl(20000);
+    req.set_use_async_commit(true);
+    let resp = client.kv_prewrite(&req).unwrap();
+
+    assert!(
+        resp.get_exec_details_v2()
+            .get_time_detail_v2()
+            .get_process_wall_time_ns()
+            != 0
+            && resp
+                .get_exec_details_v2()
+                .get_time_detail_v2()
+                .get_process_suspend_wall_time_ns()
+                != 0,
+        "{:?}",
+        resp
+    );
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_get_with_need_commit_ts() {
+    let (_cluster, client, ctx) = new_cluster();
+
+    let mut ts = 100;
+    let k = b"k1".to_vec();
+    write_and_read_key(&client, &ctx, &mut ts, k.clone(), b"v1".to_vec());
+    {
+        // GetRequest with need_commit_ts = true
+        let mut req = GetRequest::default();
+        req.set_context(ctx.clone());
+        req.set_version(ts);
+        req.set_key(k.clone());
+        req.set_need_commit_ts(true);
+
+        let resp = client.kv_get(&req).unwrap();
+        assert!(resp.region_error.is_none());
+        assert!(resp.error.is_none());
+        assert_eq!(resp.get_value(), b"v1");
+        assert_eq!(resp.get_commit_ts(), 102);
+    }
+
+    {
+        // GetRequest with need_commit_ts should ignore committed_locks
+        ts = 1000;
+        let mut mutation = Mutation::default();
+        mutation.set_op(Op::Put);
+        mutation.set_key(k.clone());
+        mutation.set_value(b"v1".to_vec());
+        must_kv_prewrite(&client, ctx.clone(), vec![mutation], b"k1".to_vec(), ts);
+
+        let mut req = GetRequest::default();
+        let mut ctx = ctx.clone();
+        ctx.set_committed_locks(vec![ts]);
+        req.set_context(ctx);
+        req.set_version(ts + 10);
+        req.set_key(k.clone());
+        req.set_need_commit_ts(true);
+
+        let resp = client.kv_get(&req).unwrap();
+        let lock_info = resp.error.unwrap().locked.unwrap();
+        assert_eq!(lock_info.key, k.clone());
+        assert_eq!(lock_info.lock_version, 1000);
+    }
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_batch_get_with_need_commit_ts() {
+    let (_cluster, client, ctx) = new_cluster();
+
+    let k1 = b"k1".to_vec();
+    let k2 = b"k2".to_vec();
+    let k3 = b"k3".to_vec();
+    let k4 = b"k4".to_vec();
+    for (i, k) in vec![k1.clone(), k2.clone(), k3.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        let mut ts = 100 * (i as u64 + 1);
+        let val = format!("v{}", i + 1).into_bytes();
+        write_and_read_key(&client, &ctx, &mut ts, k, val);
+    }
+
+    let mut mutation = Mutation::default();
+    mutation.set_op(Op::Put);
+    mutation.set_key(k3.clone());
+    mutation.set_value(b"v33".to_vec());
+    must_kv_prewrite(&client, ctx.clone(), vec![mutation], k3.clone(), 1000);
+
+    let mut req = BatchGetRequest::default();
+    let mut ctx = ctx.clone();
+    ctx.set_committed_locks(vec![1000]);
+    req.set_context(ctx.clone());
+    req.set_version(5000);
+    req.set_keys(vec![k1.clone(), k2.clone(), k3.clone(), k4.clone()].into());
+    req.set_need_commit_ts(true);
+    let resp = client.kv_batch_get(&req).unwrap();
+
+    assert!(resp.region_error.is_none());
+    assert!(resp.error.is_none());
+    assert_eq!(resp.pairs.len(), 3);
+    let pair1 = &resp.pairs[0];
+    assert_eq!(pair1.key, b"k1");
+    assert_eq!(pair1.value, b"v1");
+    assert_eq!(pair1.commit_ts, 102);
+    let pair2 = &resp.pairs[1];
+    assert_eq!(pair2.key, b"k2");
+    assert_eq!(pair2.value, b"v2");
+    assert_eq!(pair2.commit_ts, 202);
+    // If `need_commit_ts` is set to true, committed_locks should be ignored,
+    // and it should always return an error when met a lock.
+    let pair3 = &resp.pairs[2];
+    let lock_info = pair3.clone().error.unwrap().locked.unwrap();
+    assert_eq!(lock_info.key, k3.clone());
+    assert_eq!(lock_info.lock_version, 1000);
+
+    // If `need_commit_ts` is false, the return commit_ts should be 0
+    let mut req = BatchGetRequest::default();
+    req.set_context(ctx.clone());
+    req.set_version(5000);
+    req.set_keys(vec![k1.clone(), k2.clone(), k3.clone()].into());
+    let resp = client.kv_batch_get(&req).unwrap();
+    assert_eq!(resp.pairs.len(), 3);
+    let pair1 = &resp.pairs[0];
+    assert_eq!(pair1.key, b"k1");
+    assert_eq!(pair1.value, b"v1");
+    assert_eq!(pair1.commit_ts, 0);
+    let pair2 = &resp.pairs[1];
+    assert_eq!(pair2.key, b"k2");
+    assert_eq!(pair2.value, b"v2");
+    assert_eq!(pair2.commit_ts, 0);
+    let pair3 = &resp.pairs[2];
+    assert_eq!(pair3.key, b"k3");
+    // without `need_commit_ts` set, it can read the value of the lock in
+    // committed_locks
+    assert_eq!(pair3.value, b"v33");
+    assert_eq!(pair3.commit_ts, 0);
 }

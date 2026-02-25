@@ -106,14 +106,14 @@ impl<'a> BitAndIterator<'a> {
     }
 }
 
-impl<'a> Iterator for BitAndIterator<'a> {
+impl Iterator for BitAndIterator<'_> {
     type Item = bool;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.cnt == self.output_rows {
             return None;
         }
-        if self.cnt % BITS == 0 {
+        if self.cnt.is_multiple_of(BITS) {
             let mut result: u64 = 0xffffffffffffffff;
             let idx = self.cnt / BITS;
             for i in self.vecs {

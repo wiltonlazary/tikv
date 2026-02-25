@@ -1,5 +1,6 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
+mod future;
 mod metrics;
 mod slab;
 mod tls;
@@ -9,7 +10,8 @@ use std::time::Instant;
 use kvproto::kvrpcpb as pb;
 
 pub use self::{
-    slab::{TrackerToken, GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN},
+    future::{FutureTrack, track},
+    slab::{GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN, TrackerToken, TrackerTokenArray},
     tls::*,
 };
 
@@ -17,8 +19,6 @@ pub use self::{
 pub struct Tracker {
     pub req_info: RequestInfo,
     pub metrics: RequestMetrics,
-    // TODO: Add request stage info
-    // pub current_stage: RequestStage,
 }
 
 impl Tracker {
@@ -27,6 +27,23 @@ impl Tracker {
             req_info,
             metrics: Default::default(),
         }
+    }
+
+    /// This function is used to merge the time detail of the request into the
+    /// `TimeDetailV2` of the request.
+    // Note: This function uses merge because the
+    // [`tikv::coprocessor::tracker::Tracker`] sets the `TimeDetailV2`, and we
+    // don't want to overwrite the its result.
+    pub fn merge_time_detail(&self, detail_v2: &mut pb::TimeDetailV2) {
+        detail_v2.set_kv_grpc_process_time_ns(
+            detail_v2.kv_grpc_process_time_ns + self.metrics.grpc_process_nanos,
+        );
+        detail_v2.set_process_wall_time_ns(
+            detail_v2.process_wall_time_ns + self.metrics.future_process_nanos,
+        );
+        detail_v2.set_process_suspend_wall_time_ns(
+            detail_v2.process_suspend_wall_time_ns + self.metrics.future_suspend_nanos,
+        );
     }
 
     pub fn write_scan_detail(&self, detail_v2: &mut pb::ScanDetailV2) {
@@ -40,6 +57,19 @@ impl Tracker {
         detail_v2.set_read_index_propose_wait_nanos(self.metrics.read_index_propose_wait_nanos);
         detail_v2.set_read_index_confirm_wait_nanos(self.metrics.read_index_confirm_wait_nanos);
         detail_v2.set_read_pool_schedule_wait_nanos(self.metrics.read_pool_schedule_wait_nanos);
+
+        // NOTE: These stats are mainly for write operations. Read operations populate
+        // MVCC scan stats by `Statistics::write_scan_detail` before calling this
+        // function. So only fill them when unset to avoid clobbering existing values.
+        if detail_v2.get_total_versions() == 0 {
+            detail_v2.set_total_versions(self.metrics.mvcc_total_versions);
+        }
+        if detail_v2.get_processed_versions() == 0 {
+            detail_v2.set_processed_versions(self.metrics.mvcc_processed_versions);
+        }
+        if detail_v2.get_processed_versions_size() == 0 {
+            detail_v2.set_processed_versions_size(self.metrics.mvcc_processed_versions_size);
+        }
     }
 
     pub fn write_write_detail(&self, detail: &mut pb::WriteDetail) {
@@ -81,13 +111,18 @@ impl Tracker {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct RequestInfo {
     pub region_id: u64,
     pub start_ts: u64,
     pub task_id: u64,
     pub resource_group_tag: Vec<u8>,
+    pub begin: Instant,
+
+    // Information recorded after the task is scheduled.
     pub request_type: RequestType,
+    pub cid: u64,
+    pub is_external_req: bool,
 }
 
 impl RequestInfo {
@@ -97,7 +132,10 @@ impl RequestInfo {
             start_ts,
             task_id: ctx.get_task_id(),
             resource_group_tag: ctx.get_resource_group_tag().to_vec(),
+            begin: Instant::now(),
             request_type,
+            cid: 0,
+            is_external_req: ctx.get_request_source().contains("external"),
         }
     }
 }
@@ -125,10 +163,13 @@ pub enum RequestType {
     CoprocessorDag,
     CoprocessorAnalyze,
     CoprocessorChecksum,
+    KvFlush,
+    KvBufferBatchGet,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct RequestMetrics {
+    pub grpc_process_nanos: u64,
     pub get_snapshot_nanos: u64,
     pub read_index_propose_wait_nanos: u64,
     pub read_index_confirm_wait_nanos: u64,
@@ -144,6 +185,15 @@ pub struct RequestMetrics {
     pub latch_wait_nanos: u64,
     pub scheduler_process_nanos: u64,
     pub scheduler_throttle_nanos: u64,
+
+    // MVCC scan stats for txn commands, to be written into `ScanDetailV2`.
+    pub mvcc_total_versions: u64,
+    pub mvcc_processed_versions: u64,
+    pub mvcc_processed_versions_size: u64,
+
+    pub future_process_nanos: u64,
+    pub future_suspend_nanos: u64,
+
     // temp instant used in raftstore metrics, first be the instant when creating the write
     // callback, then reset when it is ready to apply
     pub write_instant: Option<Instant>,
@@ -167,4 +217,63 @@ pub struct RequestMetrics {
     pub apply_thread_wait_nanos: u64,
     pub apply_write_wal_nanos: u64,
     pub apply_write_memtable_nanos: u64,
+
+    // recorded outside the read_pool thread, accessed inside the read_pool thread for topsql usage
+    pub grpc_req_size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    fn new_req_info() -> RequestInfo {
+        RequestInfo {
+            region_id: 0,
+            start_ts: 0,
+            task_id: 0,
+            resource_group_tag: vec![],
+            begin: Instant::now(),
+            request_type: RequestType::default(),
+            cid: 0,
+            is_external_req: false,
+        }
+    }
+
+    #[test]
+    fn test_write_scan_detail_sets_mvcc_scan_stats_when_unset_and_is_idempotent() {
+        let mut tracker = Tracker::new(new_req_info());
+        tracker.metrics.mvcc_processed_versions = 3;
+        tracker.metrics.mvcc_total_versions = 5;
+        tracker.metrics.mvcc_processed_versions_size = 7;
+
+        let mut detail_v2 = pb::ScanDetailV2::default();
+
+        tracker.write_scan_detail(&mut detail_v2);
+        tracker.write_scan_detail(&mut detail_v2);
+
+        assert_eq!(detail_v2.get_processed_versions(), 3);
+        assert_eq!(detail_v2.get_total_versions(), 5);
+        assert_eq!(detail_v2.get_processed_versions_size(), 7);
+    }
+
+    #[test]
+    fn test_write_scan_detail_does_not_override_existing_mvcc_scan_stats() {
+        let mut tracker = Tracker::new(new_req_info());
+        tracker.metrics.mvcc_processed_versions = 3;
+        tracker.metrics.mvcc_total_versions = 5;
+        tracker.metrics.mvcc_processed_versions_size = 7;
+
+        let mut detail_v2 = pb::ScanDetailV2::default();
+        detail_v2.set_processed_versions(11);
+        detail_v2.set_total_versions(13);
+        detail_v2.set_processed_versions_size(17);
+
+        tracker.write_scan_detail(&mut detail_v2);
+
+        assert_eq!(detail_v2.get_processed_versions(), 11);
+        assert_eq!(detail_v2.get_total_versions(), 13);
+        assert_eq!(detail_v2.get_processed_versions_size(), 17);
+    }
 }

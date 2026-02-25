@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{mpsc::sync_channel, Mutex},
+    sync::{Mutex, mpsc::sync_channel},
     time::Duration,
 };
 
@@ -12,10 +12,11 @@ use test_raftstore::*;
 use test_raftstore_macro::test_case;
 use tikv::config::ConfigurableDb;
 use tikv_util::{
+    HandyRwLock,
     config::ReadableDuration,
     sys::thread::{self, Pid},
+    thread_name_prefix::RAFTSTORE_V2_THREAD,
     time::Instant,
-    HandyRwLock,
 };
 
 #[test]
@@ -122,7 +123,8 @@ fn get_poller_thread_ids() -> Vec<Pid> {
 }
 
 fn get_raft_poller_thread_ids() -> Vec<Pid> {
-    get_poller_thread_ids_by_prefix(vec!["rs-"])
+    let prefix = format!("{}-", RAFTSTORE_V2_THREAD);
+    get_poller_thread_ids_by_prefix(vec![prefix.as_str()])
 }
 
 fn get_poller_thread_ids_by_prefix(prefixs: Vec<&str>) -> Vec<Pid> {
@@ -623,8 +625,8 @@ fn test_increase_snap_generator_pool_size() {
     let t = Instant::now();
     while t.saturating_elapsed() < Duration::from_secs(1) {
         let val = engine.get_value(b"zkey0030").unwrap();
-        if val.is_some() {
-            assert_eq!(val.unwrap(), b"val");
+        if let Some(val) = val {
+            assert_eq!(val, b"val");
             break;
         }
     }

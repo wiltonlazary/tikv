@@ -19,7 +19,7 @@ use grpcio::{
     WriteFlags,
 };
 use kvproto::{deadlock::*, metapb::Region};
-use pd_client::{PdClient, INVALID_ID};
+use pd_client::{INVALID_ID, PdClient};
 use raft::StateRole;
 use raftstore::{
     coprocessor::{
@@ -30,19 +30,20 @@ use raftstore::{
 };
 use security::SecurityManager;
 use tikv_util::{
+    Either,
     future::paired_future_callback,
     time::{Duration, Instant},
     worker::{FutureRunnable, FutureScheduler, Stopped},
 };
 use tokio::task::spawn_local;
-use txn_types::TimeStamp;
+use txn_types::{LockInfoExt, TimeStamp};
 
 use super::{
+    Error, Result,
     client::{self, Client},
     config::Config,
     metrics::*,
     waiter_manager::Scheduler as WaiterMgrScheduler,
-    Error, Result,
 };
 use crate::{
     server::resolve::StoreAddrResolver,
@@ -361,7 +362,7 @@ impl DetectTable {
 }
 
 /// The role of the detector.
-#[derive(Debug, Default, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
 pub enum Role {
     /// The node is the leader of the detector.
     Leader,
@@ -829,22 +830,34 @@ where
                 DetectType::CleanUpWaitFor => DeadlockRequestType::CleanUpWaitFor,
                 DetectType::CleanUp => DeadlockRequestType::CleanUp,
             };
-            let mut entry = WaitForEntry::default();
-            entry.set_txn(txn_ts.into_inner());
-            if let Some(wait_info) = wait_info.as_ref() {
-                entry.set_wait_for_txn(wait_info.lock_digest.ts.into_inner());
-                entry.set_key_hash(wait_info.lock_digest.hash);
+            let entries = if let Some(wait_info) = wait_info.as_ref() {
+                Either::Left(wait_info.lock_info.iter_locks().map(|l| {
+                    let mut entry = WaitForEntry::default();
+                    entry.set_txn(txn_ts.into_inner());
+                    entry.set_key(diag_ctx.key.clone());
+                    entry.set_resource_group_tag(diag_ctx.resource_group_tag.clone());
+                    entry.set_wait_for_txn(l.lock_version);
+                    entry.set_key_hash(wait_info.lock_digest.hash);
+                    entry
+                }))
+            } else {
+                let mut entry = WaitForEntry::default();
+                entry.set_txn(txn_ts.into_inner());
+                entry.set_key(diag_ctx.key);
+                entry.set_resource_group_tag(diag_ctx.resource_group_tag);
+                Either::Right(std::iter::once(entry))
+            };
+            for entry in entries {
+                let mut req = DeadlockRequest::default();
+                req.set_tp(tp);
+                req.set_entry(entry);
+                if leader_client.detect(req).is_err() {
+                    // The client is disconnected. Take it for retry.
+                    self.leader_client.take();
+                    return false;
+                }
             }
-            entry.set_key(diag_ctx.key);
-            entry.set_resource_group_tag(diag_ctx.resource_group_tag);
-            let mut req = DeadlockRequest::default();
-            req.set_tp(tp);
-            req.set_entry(entry);
-            if leader_client.detect(req).is_ok() {
-                return true;
-            }
-            // The client is disconnected. Take it for retry.
-            self.leader_client.take();
+            return true;
         }
         false
     }
@@ -860,31 +873,47 @@ where
         match tp {
             DetectType::Detect => {
                 let wait_info = wait_info.unwrap();
-                if let Some((deadlock_key_hash, mut wait_chain)) = detect_table.detect(
-                    txn_ts,
-                    wait_info.lock_digest.ts,
-                    wait_info.lock_digest.hash,
-                    &diag_ctx.key,
-                    &diag_ctx.resource_group_tag,
-                ) {
-                    let mut last_entry = WaitForEntry::default();
-                    last_entry.set_txn(txn_ts.into_inner());
-                    last_entry.set_wait_for_txn(wait_info.lock_digest.ts.into_inner());
-                    last_entry.set_key_hash(wait_info.lock_digest.hash);
-                    last_entry.set_key(diag_ctx.key.clone());
-                    last_entry.set_resource_group_tag(diag_ctx.resource_group_tag);
-                    wait_chain.push(last_entry);
-                    self.waiter_mgr_scheduler.deadlock(
+                for lock_info in wait_info.lock_info.iter_locks() {
+                    if let Some((deadlock_key_hash, mut wait_chain)) = detect_table.detect(
                         txn_ts,
-                        diag_ctx.key.clone(),
-                        wait_info.lock_digest,
-                        deadlock_key_hash,
-                        wait_chain,
-                    );
+                        lock_info.lock_version.into(),
+                        wait_info.lock_digest.hash,
+                        &diag_ctx.key,
+                        &diag_ctx.resource_group_tag,
+                    ) {
+                        let mut last_entry = WaitForEntry::default();
+                        last_entry.set_txn(txn_ts.into_inner());
+                        last_entry.set_wait_for_txn(lock_info.lock_version);
+                        last_entry.set_key_hash(wait_info.lock_digest.hash);
+                        last_entry.set_key(diag_ctx.key.clone());
+                        last_entry.set_resource_group_tag(diag_ctx.resource_group_tag);
+                        wait_chain.push(last_entry);
+                        let lock = LockDigest {
+                            ts: lock_info.lock_version.into(),
+                            hash: wait_info.lock_digest.hash,
+                        };
+                        self.waiter_mgr_scheduler.deadlock(
+                            txn_ts,
+                            diag_ctx.key.clone(),
+                            lock,
+                            deadlock_key_hash,
+                            wait_chain,
+                        );
+                        break;
+                    }
                 }
             }
             DetectType::CleanUpWaitFor => {
-                detect_table.clean_up_wait_for(txn_ts, wait_info.unwrap().lock_digest)
+                let wait_info = wait_info.unwrap();
+                for lock_info in wait_info.lock_info.iter_locks() {
+                    detect_table.clean_up_wait_for(
+                        txn_ts,
+                        LockDigest {
+                            ts: lock_info.lock_version.into(),
+                            hash: wait_info.lock_digest.hash,
+                        },
+                    );
+                }
             }
             DetectType::CleanUp => detect_table.clean_up(txn_ts),
         }
@@ -1114,7 +1143,7 @@ pub mod tests {
     use tikv_util::worker::FutureWorker;
 
     use super::*;
-    use crate::server::resolve::Callback;
+    use crate::server::resolve;
 
     #[test]
     fn test_detect_table() {
@@ -1139,7 +1168,7 @@ pub mod tests {
             3
         );
         detect_table.clean_up(2.into());
-        assert_eq!(detect_table.wait_for_map.contains_key(&2.into()), false);
+        assert!(!detect_table.wait_for_map.contains_key(&2.into()));
 
         // After cycle is broken, no deadlock.
         assert_eq!(detect_table.detect(3.into(), 1.into(), 1, &[], &[]), None);
@@ -1233,7 +1262,7 @@ pub mod tests {
                 hash: 2,
             },
         );
-        assert_eq!(detect_table.wait_for_map.contains_key(&3.into()), false);
+        assert!(!detect_table.wait_for_map.contains_key(&3.into()));
 
         // Clean up non-exist entry
         detect_table.clean_up(3.into());
@@ -1462,15 +1491,6 @@ pub mod tests {
 
     impl PdClient for MockPdClient {}
 
-    #[derive(Clone)]
-    pub(crate) struct MockResolver;
-
-    impl StoreAddrResolver for MockResolver {
-        fn resolve(&self, _store_id: u64, _cb: Callback) -> Result<()> {
-            Err(Error::Other(box_err!("unimplemented")))
-        }
-    }
-
     fn start_deadlock_detector(
         host: &mut CoprocessorHost<KvTestEngine>,
     ) -> (FutureWorker<Task>, Scheduler) {
@@ -1480,7 +1500,7 @@ pub mod tests {
         let detector_runner = Detector::new(
             1,
             Arc::new(MockPdClient {}),
-            MockResolver {},
+            resolve::MockStoreAddrResolver::default(),
             Arc::new(SecurityManager::new(&SecurityConfig::default()).unwrap()),
             waiter_mgr_scheduler,
             &Config::default(),
@@ -1570,19 +1590,19 @@ pub mod tests {
         host.on_region_changed(&region, RegionChangeEvent::Create, StateRole::Follower);
         check_role(Role::Follower);
         for &follower_role in &follower_roles {
-            host.on_role_change(&region, RoleChange::new(follower_role));
+            host.on_role_change(&region, RoleChange::new_for_test(follower_role));
             check_role(Role::Follower);
-            host.on_role_change(&invalid, RoleChange::new(StateRole::Leader));
+            host.on_role_change(&invalid, RoleChange::new_for_test(StateRole::Leader));
             check_role(Role::Follower);
-            host.on_role_change(&other, RoleChange::new(StateRole::Leader));
+            host.on_role_change(&other, RoleChange::new_for_test(StateRole::Leader));
             check_role(Role::Follower);
-            host.on_role_change(&region, RoleChange::new(StateRole::Leader));
+            host.on_role_change(&region, RoleChange::new_for_test(StateRole::Leader));
             check_role(Role::Leader);
-            host.on_role_change(&invalid, RoleChange::new(follower_role));
+            host.on_role_change(&invalid, RoleChange::new_for_test(follower_role));
             check_role(Role::Leader);
-            host.on_role_change(&other, RoleChange::new(follower_role));
+            host.on_role_change(&other, RoleChange::new_for_test(follower_role));
             check_role(Role::Leader);
-            host.on_role_change(&region, RoleChange::new(follower_role));
+            host.on_role_change(&region, RoleChange::new_for_test(follower_role));
             check_role(Role::Follower);
         }
 

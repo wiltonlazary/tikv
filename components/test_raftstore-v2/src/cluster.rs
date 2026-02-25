@@ -13,12 +13,12 @@ use encryption_export::DataKeyManager;
 use engine_rocks::{RocksSnapshot, RocksStatistics};
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{
-    KvEngine, Peekable, RaftEngine, RaftEngineReadOnly, RaftLogBatch, ReadOptions, SyncMutable,
-    TabletRegistry, CF_DEFAULT,
+    CF_DEFAULT, KvEngine, Peekable, RaftEngine, RaftEngineReadOnly, RaftLogBatch, ReadOptions,
+    SyncMutable, TabletRegistry,
 };
 use file_system::IoRateLimiter;
-use futures::{executor::block_on, future::BoxFuture, Future};
-use keys::{data_key, validate_data_key, DATA_PREFIX_KEY};
+use futures::{Future, executor::block_on, future::BoxFuture};
+use keys::{DATA_PREFIX_KEY, data_key, validate_data_key};
 use kvproto::{
     errorpb::Error as PbError,
     kvrpcpb::ApiVersion,
@@ -35,39 +35,42 @@ use kvproto::{
 };
 use pd_client::PdClient;
 use raftstore::{
-    store::{
-        cmd_resp, initial_region, region_meta::RegionMeta, util::check_key_in_region, Bucket,
-        BucketRange, Callback, RegionSnapshot, TabletSnapManager, WriteResponse,
-        INIT_EPOCH_CONF_VER, INIT_EPOCH_VER,
-    },
     Error, Result,
+    store::{
+        Bucket, BucketRange, Callback, INIT_EPOCH_CONF_VER, INIT_EPOCH_VER, RaftCmdExtraOpts,
+        RegionSnapshot, TabletSnapManager, WriteResponse, cmd_resp, initial_region,
+        region_meta::RegionMeta, util::check_key_in_region,
+    },
 };
 use raftstore_v2::{
+    SimpleWriteEncoder, StoreMeta, StoreRouter,
     router::{DebugInfoChannel, PeerMsg, QueryResult, StoreMsg, StoreTick},
-    write_initial_states, SimpleWriteEncoder, StoreMeta, StoreRouter,
+    write_initial_states,
 };
 use resource_control::ResourceGroupManager;
 use tempfile::TempDir;
 use test_pd_client::TestPdClient;
 use test_raftstore::{
-    check_raft_cmd_request, is_error_response, new_admin_request, new_delete_cmd,
-    new_delete_range_cmd, new_get_cf_cmd, new_peer, new_prepare_merge, new_put_cf_cmd, new_put_cmd,
-    new_region_detail_cmd, new_region_leader_cmd, new_request, new_status_request, new_store,
-    new_tikv_config_with_api_ver, new_transfer_leader_cmd, sleep_ms, Config, Filter, FilterFactory,
-    PartitionFilterFactory, RawEngine,
+    Config, Filter, FilterFactory, PartitionFilterFactory, RawEngine, check_raft_cmd_request,
+    is_error_response, new_admin_request, new_delete_cmd, new_delete_range_cmd, new_get_cf_cmd,
+    new_peer, new_prepare_merge, new_put_cf_cmd, new_put_cmd, new_region_detail_cmd,
+    new_region_leader_cmd, new_request, new_status_request, new_store,
+    new_tikv_config_with_api_ver, new_transfer_leader_cmd, sleep_ms,
 };
-use tikv::{server::Result as ServerResult, storage::config::EngineType};
+use tikv::{config::TikvConfig, server::Result as ServerResult, storage::config::EngineType};
 use tikv_util::{
-    box_err, box_try, debug, error,
+    HandyRwLock, box_err, box_try, debug, error,
     future::block_on_timeout,
     safe_panic,
     thread_group::GroupProperties,
     time::{Instant, ThreadReadId},
     warn,
     worker::LazyWorker,
-    HandyRwLock,
 };
 use txn_types::WriteBatchFlags;
+
+// MAX duration waiting for releasing store metas, default: 10s.
+const MAX_WAIT_RELEASE_INTERVAL: u32 = 1000;
 
 // We simulate 3 or 5 nodes, each has a store.
 // Sometimes, we use fixed id to test, which means the id
@@ -285,7 +288,16 @@ pub trait Simulator<EK: KvEngine> {
     fn async_command_on_node(
         &mut self,
         node_id: u64,
+        request: RaftCmdRequest,
+    ) -> BoxFuture<'static, RaftCmdResponse> {
+        self.async_command_on_node_with_opts(node_id, request, RaftCmdExtraOpts::default())
+    }
+
+    fn async_command_on_node_with_opts(
+        &mut self,
+        node_id: u64,
         mut request: RaftCmdRequest,
+        opts: RaftCmdExtraOpts,
     ) -> BoxFuture<'static, RaftCmdResponse> {
         let region_id = request.get_header().get_region_id();
 
@@ -316,7 +328,11 @@ pub trait Simulator<EK: KvEngine> {
                     _ => unreachable!(),
                 }
             }
-            PeerMsg::simple_write(Box::new(request.take_header()), write_encoder.encode())
+            PeerMsg::simple_write_with_opt(
+                Box::new(request.take_header()),
+                write_encoder.encode(),
+                opts,
+            )
         };
 
         self.async_peer_msg_on_node(node_id, region_id, msg)
@@ -389,10 +405,7 @@ impl<T: Simulator<EK>, EK: KvEngine> Cluster<T, EK> {
         let mut tikv_cfg = new_tikv_config_with_api_ver(id, api_version);
         tikv_cfg.storage.engine = EngineType::RaftKv2;
         Cluster {
-            cfg: Config {
-                tikv: tikv_cfg,
-                prefer_mem: true,
-            },
+            cfg: Config::new(tikv_cfg, true),
             count,
             tablet_registries: HashMap::default(),
             key_managers_map: HashMap::default(),
@@ -413,6 +426,11 @@ impl<T: Simulator<EK>, EK: KvEngine> Cluster<T, EK> {
             pd_client,
             engine_creator,
         }
+    }
+
+    pub fn set_cfg(&mut self, mut cfg: TikvConfig) {
+        cfg.cfg_path = self.cfg.tikv.cfg_path.clone();
+        self.cfg.tikv = cfg;
     }
 
     pub fn id(&self) -> u64 {
@@ -1275,6 +1293,20 @@ impl<T: Simulator<EK>, EK: KvEngine> Cluster<T, EK> {
             .async_command_on_node(leader.get_store_id(), req)
     }
 
+    pub fn async_request_with_opts(
+        &mut self,
+        mut req: RaftCmdRequest,
+        opts: RaftCmdExtraOpts,
+    ) -> Result<BoxFuture<'static, RaftCmdResponse>> {
+        let region_id = req.get_header().get_region_id();
+        let leader = self.leader_of_region(region_id).unwrap();
+        req.mut_header().set_peer(leader.clone());
+        Ok(self
+            .sim
+            .wl()
+            .async_command_on_node_with_opts(leader.get_store_id(), req, opts))
+    }
+
     pub fn async_put(
         &mut self,
         key: &[u8],
@@ -1612,7 +1644,6 @@ impl<T: Simulator<EK>, EK: KvEngine> Cluster<T, EK> {
         )
     }
 
-    #[allow(clippy::let_underscore_future)]
     pub fn merge_region(&mut self, source: u64, target: u64, _cb: Callback<RocksSnapshot>) {
         // FIXME: callback is ignored.
         let mut req = self.new_prepare_merge(source, target);
@@ -1687,6 +1718,50 @@ impl<T: Simulator<EK>, EK: KvEngine> Cluster<T, EK> {
                 panic!("region {} is not removed after 60s.", region_id);
             }
             thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub fn must_empty_region_removed_records(&mut self, region_id: u64) {
+        let timer = Instant::now();
+        loop {
+            thread::sleep(Duration::from_millis(100));
+
+            let leader = match self.leader_of_region(region_id) {
+                None => continue,
+                Some(l) => l,
+            };
+            let region_state = self.region_local_state(region_id, leader.get_store_id());
+            if region_state.get_removed_records().is_empty() {
+                return;
+            }
+            if timer.saturating_elapsed() > Duration::from_secs(5) {
+                panic!(
+                    "merged records and removed records must be empty, {:?}",
+                    region_state
+                );
+            }
+        }
+    }
+
+    pub fn must_empty_region_merged_records(&mut self, region_id: u64) {
+        let timer = Instant::now();
+        loop {
+            thread::sleep(Duration::from_millis(100));
+
+            let leader = match self.leader_of_region(region_id) {
+                None => continue,
+                Some(l) => l,
+            };
+            let region_state = self.region_local_state(region_id, leader.get_store_id());
+            if region_state.get_merged_records().is_empty() {
+                return;
+            }
+            if timer.saturating_elapsed() > Duration::from_secs(5) {
+                panic!(
+                    "merged records and removed records must be empty, {:?}",
+                    region_state
+                );
+            }
         }
     }
 
@@ -1804,15 +1879,17 @@ impl<T: Simulator<EK>, EK: KvEngine> Cluster<T, EK> {
         }
         self.leaders.clear();
         for store_meta in self.store_metas.values() {
-            while Arc::strong_count(store_meta) != 1 {
+            // Limits the loop count of checking.
+            let mut idx = 0;
+            while Arc::strong_count(store_meta) != 1 && idx < MAX_WAIT_RELEASE_INTERVAL {
                 std::thread::sleep(Duration::from_millis(10));
+                idx += 1;
             }
         }
         self.store_metas.clear();
         for sst_worker in self.sst_workers.drain(..) {
             sst_worker.stop_worker();
         }
-
         debug!("all nodes are shut down.");
     }
 

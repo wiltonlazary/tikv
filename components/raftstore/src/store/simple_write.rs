@@ -1,7 +1,5 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::assert_matches::debug_assert_matches;
-
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::{
     import_sstpb::SstMeta,
@@ -11,7 +9,7 @@ use protobuf::{CodedInputStream, Message};
 use slog::Logger;
 use tikv_util::slog_panic;
 
-use crate::store::{msg::ErrorCallback, WriteCallback};
+use crate::store::{WriteCallback, msg::ErrorCallback};
 
 // MAGIC number to hint simple write codec is used. If it's a protobuf message,
 // the first one or several bytes are for field tag, which can't be zero.
@@ -49,7 +47,6 @@ where
     channels: Vec<C>,
     size_limit: usize,
     write_type: WriteType,
-    notify_proposed: bool,
 }
 
 impl<C> SimpleWriteReqEncoder<C>
@@ -57,14 +54,10 @@ where
     C: ErrorCallback + WriteCallback,
 {
     /// Create a request encoder.
-    ///
-    /// If `notify_proposed` is true, channels will be called `notify_proposed`
-    /// when it's appended.
     pub fn new(
         header: Box<RaftRequestHeader>,
         bin: SimpleWriteBinary,
         size_limit: usize,
-        notify_proposed: bool,
     ) -> SimpleWriteReqEncoder<C> {
         let mut buf = Vec::with_capacity(256);
         buf.push(MAGIC_PREFIX);
@@ -77,7 +70,6 @@ where
             channels: vec![],
             size_limit,
             write_type: bin.write_type,
-            notify_proposed,
         }
     }
 
@@ -112,16 +104,8 @@ where
     }
 
     #[inline]
-    pub fn add_response_channel(&mut self, mut ch: C) {
-        if self.notify_proposed {
-            ch.notify_proposed();
-        }
+    pub fn add_response_channel(&mut self, ch: C) {
         self.channels.push(ch);
-    }
-
-    #[inline]
-    pub fn notify_proposed(&self) -> bool {
-        self.notify_proposed
     }
 
     #[inline]
@@ -184,30 +168,30 @@ impl SimpleWriteEncoder {
 
     #[inline]
     pub fn put(&mut self, cf: &str, key: &[u8], value: &[u8]) {
-        debug_assert_matches!(
+        debug_assert!(matches!(
             self.write_type,
             WriteType::Unspecified | WriteType::PutDelete
-        );
+        ));
         encode(SimpleWrite::Put(Put { cf, key, value }), &mut self.buf);
         self.write_type = WriteType::PutDelete;
     }
 
     #[inline]
     pub fn delete(&mut self, cf: &str, key: &[u8]) {
-        debug_assert_matches!(
+        debug_assert!(matches!(
             self.write_type,
             WriteType::Unspecified | WriteType::PutDelete
-        );
+        ));
         encode(SimpleWrite::Delete(Delete { cf, key }), &mut self.buf);
         self.write_type = WriteType::PutDelete;
     }
 
     #[inline]
     pub fn delete_range(&mut self, cf: &str, start_key: &[u8], end_key: &[u8], notify_only: bool) {
-        debug_assert_matches!(
+        debug_assert!(matches!(
             self.write_type,
             WriteType::Unspecified | WriteType::DeleteRange
-        );
+        ));
         encode(
             SimpleWrite::DeleteRange(DeleteRange {
                 cf,
@@ -222,7 +206,10 @@ impl SimpleWriteEncoder {
 
     #[inline]
     pub fn ingest(&mut self, sst: Vec<SstMeta>) {
-        debug_assert_matches!(self.write_type, WriteType::Unspecified | WriteType::Ingest);
+        debug_assert!(matches!(
+            self.write_type,
+            WriteType::Unspecified | WriteType::Ingest
+        ));
         encode(SimpleWrite::Ingest(sst), &mut self.buf);
         self.write_type = WriteType::Ingest;
     }
@@ -245,7 +232,7 @@ pub struct SimpleWriteReqDecoder<'a> {
 impl<'a> SimpleWriteReqDecoder<'a> {
     pub fn new(
         fallback: impl FnOnce(&'a [u8], u64, u64) -> RaftCmdRequest,
-        logger: &Logger,
+        logger: Option<&Logger>,
         buf: &'a [u8],
         index: u64,
         term: u64,
@@ -255,13 +242,22 @@ impl<'a> SimpleWriteReqDecoder<'a> {
                 let mut is = CodedInputStream::from_bytes(&buf[1..]);
                 let header = match is.read_message() {
                     Ok(h) => h,
-                    Err(e) => slog_panic!(
-                        logger,
-                        "data corrupted";
-                        "term" => term,
-                        "index" => index,
-                        "error" => ?e
-                    ),
+                    Err(e) => {
+                        if let Some(logger) = logger {
+                            slog_panic!(
+                                logger,
+                                "data corrupted";
+                                "term" => term,
+                                "index" => index,
+                                "error" => ?e
+                            )
+                        } else {
+                            panic!(
+                                "data corrupted term: {}, index: {}, error {:?}",
+                                term, index, e
+                            )
+                        }
+                    }
                 };
                 let read = is.pos();
                 Ok(SimpleWriteReqDecoder {
@@ -532,7 +528,6 @@ fn decode<'a>(buf: &mut &'a [u8]) -> Option<SimpleWrite<'a>> {
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
 
     use kvproto::raft_cmdpb::{CmdType, Request};
     use slog::o;
@@ -558,7 +553,6 @@ mod tests {
             header.clone(),
             bin,
             usize::MAX,
-            false,
         );
 
         let mut encoder = SimpleWriteEncoder::with_capacity(512);
@@ -570,13 +564,12 @@ mod tests {
             header.clone(),
             bin,
             0,
-            false,
         );
 
         let (bytes, _) = req_encoder.encode();
         let logger = slog_global::borrow_global().new(o!());
         let mut decoder =
-            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
+            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap();
         assert_eq!(*decoder.header(), *header);
         let write = decoder.next().unwrap();
         let SimpleWrite::Put(put) = write else {
@@ -592,10 +585,11 @@ mod tests {
         };
         assert_eq!(delete.cf, CF_WRITE);
         assert_eq!(delete.key, &delete_key);
-        assert_matches!(decoder.next(), None);
+        assert!(decoder.next().is_none());
 
         let (bytes, _) = req_encoder2.encode();
-        decoder = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
+        decoder =
+            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap();
         let write = decoder.next().unwrap();
         let SimpleWrite::DeleteRange(dr) = write else {
             panic!("should be delete range")
@@ -627,18 +621,17 @@ mod tests {
             .collect();
         encoder.ingest(exp.clone());
         let bin = encoder.encode();
-        let req_encoder = SimpleWriteReqEncoder::<Callback<engine_rocks::RocksSnapshot>>::new(
-            header, bin, 0, false,
-        );
+        let req_encoder =
+            SimpleWriteReqEncoder::<Callback<engine_rocks::RocksSnapshot>>::new(header, bin, 0);
         let (bytes, _) = req_encoder.encode();
         let mut decoder =
-            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
+            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap();
         let write = decoder.next().unwrap();
         let SimpleWrite::Ingest(ssts) = write else {
             panic!("should be ingest")
         };
         assert_eq!(exp, ssts);
-        assert_matches!(decoder.next(), None);
+        assert!(decoder.next().is_none());
     }
 
     #[test]
@@ -678,7 +671,7 @@ mod tests {
         let bytes = raft_cmd.write_to_bytes().unwrap();
         let logger = slog_global::borrow_global().new(o!());
         let decoded =
-            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap_err();
+            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap_err();
         // SimpleWriteReqDecoder should be able to decode naive RaftCmdRequest.
         assert_eq!(decoded, raft_cmd);
 
@@ -693,7 +686,6 @@ mod tests {
                 header.clone(),
                 bin.clone(),
                 512,
-                false,
             );
 
         let mut header2 = Box::<RaftRequestHeader>::default();
@@ -710,7 +702,6 @@ mod tests {
                 header.clone(),
                 bin2.clone(),
                 512,
-                false,
             );
         assert!(!req_encoder2.amend(&header, &bin));
 
@@ -722,7 +713,7 @@ mod tests {
 
         let (bytes, _) = req_encoder.encode();
         let mut decoder =
-            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bytes, 0, 0).unwrap();
+            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bytes, 0, 0).unwrap();
         assert_eq!(*decoder.header(), *header);
         let req = decoder.next().unwrap();
         let SimpleWrite::Put(put) = req else {
@@ -747,12 +738,11 @@ mod tests {
             header.clone(),
             SimpleWriteEncoder::with_capacity(512).encode(),
             512,
-            false,
         );
         let (bin, _) = req_encoder.encode();
         assert_eq!(
             header.as_ref(),
-            SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
+            SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
                 .unwrap()
                 .to_raft_cmd_request()
                 .get_header(),
@@ -765,10 +755,9 @@ mod tests {
             header.clone(),
             encoder.encode(),
             512,
-            false,
         );
         let (bin, _) = req_encoder.encode();
-        let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
+        let req = SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
             .unwrap()
             .to_raft_cmd_request();
         assert_eq!(req.get_requests().len(), 1);
@@ -783,10 +772,9 @@ mod tests {
             header.clone(),
             encoder.encode(),
             512,
-            false,
         );
         let (bin, _) = req_encoder.encode();
-        let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
+        let req = SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
             .unwrap()
             .to_raft_cmd_request();
         assert_eq!(req.get_requests().len(), 1);
@@ -800,10 +788,9 @@ mod tests {
             header.clone(),
             encoder.encode(),
             512,
-            false,
         );
         let (bin, _) = req_encoder.encode();
-        let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
+        let req = SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
             .unwrap()
             .to_raft_cmd_request();
         assert_eq!(req.get_requests().len(), 1);
@@ -828,10 +815,9 @@ mod tests {
             header,
             encoder.encode(),
             512,
-            false,
         );
         let (bin, _) = req_encoder.encode();
-        let req = SimpleWriteReqDecoder::new(decoder_fallback, &logger, &bin, 0, 0)
+        let req = SimpleWriteReqDecoder::new(decoder_fallback, Some(&logger), &bin, 0, 0)
             .unwrap()
             .to_raft_cmd_request();
         assert_eq!(req.get_requests().len(), 5);

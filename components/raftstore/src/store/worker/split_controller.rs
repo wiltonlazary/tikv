@@ -1,33 +1,41 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    cmp::{min, Ordering},
-    collections::{BinaryHeap, HashMap, HashSet},
+    cmp::{Ordering, min},
+    collections::{BinaryHeap, HashSet},
     slice::{Iter, IterMut},
-    sync::{mpsc::Receiver, Arc},
+    sync::{Arc, mpsc::Receiver},
     time::{Duration, SystemTime},
 };
 
+use collections::HashMap;
 use kvproto::{
     kvrpcpb::KeyRange,
     metapb::{self, Peer},
     pdpb::QueryKind,
 };
-use pd_client::{BucketMeta, BucketStat};
+use pd_client::{BucketMeta, BucketStat, RegionWriteCfCopDetail};
 use rand::Rng;
 use resource_metering::RawRecords;
 use tikv_util::{
     config::Tracker,
     debug, info,
     metrics::ThreadInfoStatistics,
-    store::{is_read_query, QueryStats},
+    store::{QueryStats, is_read_query},
+    thread_name_prefix::{
+        GRPC_SERVER_THREAD, UNIFIED_READ_POOL_THREAD, matches_thread_name_prefix,
+    },
+    time::Instant,
     warn,
 };
 
 use crate::store::{
     metrics::*,
     util::build_key_range,
-    worker::{split_config::get_sample_num, FlowStatistics, SplitConfig, SplitConfigManager},
+    worker::{
+        FlowStatistics, SplitConfig, SplitConfigManager, SplitValidator,
+        split_config::get_sample_num,
+    },
 };
 
 const DEFAULT_MAX_SAMPLE_LOOP_COUNT: usize = 10000;
@@ -331,6 +339,7 @@ impl Recorder {
 pub struct RegionInfo {
     pub sample_num: usize,
     pub query_stats: QueryStats,
+    pub cop_detail: RegionWriteCfCopDetail,
     pub peer: Peer,
     pub key_ranges: Vec<KeyRange>,
     pub flow: FlowStatistics,
@@ -341,6 +350,7 @@ impl RegionInfo {
         RegionInfo {
             sample_num,
             query_stats: QueryStats::default(),
+            cop_detail: RegionWriteCfCopDetail::default(),
             key_ranges: Vec::with_capacity(sample_num),
             peer: Peer::default(),
             flow: FlowStatistics::default(),
@@ -442,6 +452,7 @@ impl ReadStats {
         end: Option<&[u8]>,
         write: &FlowStatistics,
         data: &FlowStatistics,
+        write_cf_cop_detail: &RegionWriteCfCopDetail,
     ) {
         let num = self.sample_num;
         let region_info = self
@@ -450,27 +461,30 @@ impl ReadStats {
             .or_insert_with(|| RegionInfo::new(num));
         region_info.flow.add(write);
         region_info.flow.add(data);
+        region_info.cop_detail.add(write_cf_cop_detail);
         // the bucket of the follower only have the version info and not needs to be
         // recorded the hot bucket.
-        if let Some(buckets) = buckets && !buckets.sizes.is_empty() {
-            let bucket_stat = self
-                .region_buckets
-                .entry(region_id)
-                .and_modify(|current| {
-                    if current.meta < *buckets {
-                        let mut new = BucketStat::from_meta(buckets.clone());
-                        std::mem::swap(current, &mut new);
-                        current.merge(&new);
-                    }
-                })
-                .or_insert_with(|| BucketStat::from_meta(buckets.clone()));
-            let mut delta = metapb::BucketStats::default();
-            delta.set_read_bytes(vec![(write.read_bytes + data.read_bytes) as u64]);
-            delta.set_read_keys(vec![(write.read_keys + data.read_keys) as u64]);
-            bucket_stat.add_flows(
-                &[start.unwrap_or_default(), end.unwrap_or_default()],
-                &delta,
-            );
+        if let Some(buckets) = buckets {
+            if !buckets.sizes.is_empty() {
+                let bucket_stat = self
+                    .region_buckets
+                    .entry(region_id)
+                    .and_modify(|current| {
+                        if current.meta < *buckets {
+                            let mut new = BucketStat::from_meta(buckets.clone());
+                            std::mem::swap(current, &mut new);
+                            current.merge(&new);
+                        }
+                    })
+                    .or_insert_with(|| BucketStat::from_meta(buckets.clone()));
+                let mut delta = metapb::BucketStats::default();
+                delta.set_read_bytes(vec![(write.read_bytes + data.read_bytes) as u64]);
+                delta.set_read_keys(vec![(write.read_keys + data.read_keys) as u64]);
+                bucket_stat.add_flows(
+                    &[start.unwrap_or_default(), end.unwrap_or_default()],
+                    &delta,
+                );
+            }
         }
     }
 
@@ -645,11 +659,15 @@ impl AutoSplitController {
 
     // collect the read stats from read_stats_vec and dispatch them to a Region
     // HashMap.
-    fn collect_read_stats(read_stats_vec: Vec<ReadStats>) -> HashMap<u64, Vec<RegionInfo>> {
+    fn collect_read_stats(
+        ctx: &mut AutoSplitControllerContext,
+        read_stats_receiver: &Receiver<ReadStats>,
+    ) -> HashMap<u64, Vec<RegionInfo>> {
+        let read_stats_vec = ctx.batch_recv_read_stats(read_stats_receiver);
         // RegionID -> Vec<RegionInfo>, collect the RegionInfo from different threads.
         let mut region_infos_map = HashMap::default();
         let capacity = read_stats_vec.len();
-        for read_stats in read_stats_vec {
+        for read_stats in read_stats_vec.drain(..) {
             for (region_id, region_info) in read_stats.region_infos {
                 let region_infos = region_infos_map
                     .entry(region_id)
@@ -662,19 +680,27 @@ impl AutoSplitController {
 
     // collect the CPU stats from cpu_stats_vec and dispatch them to a Region
     // HashMap.
-    fn collect_cpu_stats(
-        &self,
-        cpu_stats_vec: Vec<Arc<RawRecords>>,
-    ) -> HashMap<u64, (f64, Option<KeyRange>)> {
+    fn collect_cpu_stats<'c>(
+        &mut self,
+        ctx: &'c mut AutoSplitControllerContext,
+        cpu_stats_receiver: &Receiver<Arc<RawRecords>>,
+    ) -> &'c HashMap<u64, (f64, Option<KeyRange>)> {
         // RegionID -> (CPU usage, Hottest Key Range), calculate the CPU usage and its
         // hottest key range.
-        let mut region_cpu_map = HashMap::default();
         if !self.should_check_region_cpu() {
-            return region_cpu_map;
+            return ctx.empty_region_cpu_map();
         }
+
+        let (
+            cpu_stats_vec,
+            CpuStatsCache {
+                region_cpu_map,
+                hottest_key_range_cpu_time_map,
+            },
+        ) = ctx.batch_recv_cpu_stats(cpu_stats_receiver);
         // Calculate the Region CPU usage.
         let mut collect_interval_ms = 0;
-        let mut region_key_range_cpu_time_map = HashMap::new();
+        let mut region_key_range_cpu_time_map = HashMap::default();
         cpu_stats_vec.iter().for_each(|cpu_stats| {
             cpu_stats.records.iter().for_each(|(tag, record)| {
                 // Calculate the Region ID -> CPU Time.
@@ -701,7 +727,6 @@ impl AutoSplitController {
             }
         });
         // Choose the hottest key range for each Region.
-        let mut hottest_key_range_cpu_time_map = HashMap::with_capacity(region_cpu_map.len());
         region_key_range_cpu_time_map
             .iter()
             .for_each(|((region_id, key_range), cpu_time)| {
@@ -725,7 +750,7 @@ impl AutoSplitController {
         thread_stats
             .get_cpu_usages()
             .iter()
-            .filter(|(thread_name, _)| thread_name.contains(name))
+            .filter(|(thread_name, _)| matches_thread_name_prefix(thread_name, name))
             .fold(0, |cpu_usage_sum, (_, cpu_usage)| {
                 // `cpu_usage` is in [0, 100].
                 cpu_usage_sum + cpu_usage
@@ -737,18 +762,21 @@ impl AutoSplitController {
     // be split according to all the stats info the recorder has collected before.
     pub fn flush(
         &mut self,
-        read_stats_vec: Vec<ReadStats>,
-        cpu_stats_vec: Vec<Arc<RawRecords>>,
-        thread_stats: &ThreadInfoStatistics,
+        ctx: &mut AutoSplitControllerContext,
+        read_stats_receiver: &Receiver<ReadStats>,
+        cpu_stats_receiver: &Receiver<Arc<RawRecords>>,
+        thread_stats: &mut ThreadInfoStatistics,
+        split_validator: &SplitValidator,
     ) -> (Vec<usize>, Vec<SplitInfo>) {
         let mut top_cpu_usage = vec![];
         let mut top_qps = BinaryHeap::with_capacity(TOP_N);
-        let region_infos_map = Self::collect_read_stats(read_stats_vec);
-        let region_cpu_map = self.collect_cpu_stats(cpu_stats_vec);
+        let region_infos_map = Self::collect_read_stats(ctx, read_stats_receiver);
+        let region_cpu_map = self.collect_cpu_stats(ctx, cpu_stats_receiver);
         // Prepare some diagnostic info.
+        thread_stats.record();
         let (grpc_thread_usage, unified_read_pool_thread_usage) = (
-            Self::collect_thread_usage(thread_stats, "grpc-server"),
-            Self::collect_thread_usage(thread_stats, "unified-read-po"),
+            Self::collect_thread_usage(thread_stats, GRPC_SERVER_THREAD),
+            Self::collect_thread_usage(thread_stats, UNIFIED_READ_POOL_THREAD),
         );
         // Update first before calculating the latest average gRPC poll CPU usage.
         self.update_grpc_thread_usage(grpc_thread_usage);
@@ -770,6 +798,9 @@ impl AutoSplitController {
         // Start to record the read stats info.
         let mut split_infos = vec![];
         for (region_id, region_infos) in region_infos_map {
+            if split_validator.is_disabled(region_id) {
+                continue;
+            }
             let qps_prefix_sum = prefix_sum(region_infos.iter(), RegionInfo::get_read_qps);
             // region_infos is not empty, so it's safe to unwrap here.
             let qps = *qps_prefix_sum.last().unwrap();
@@ -831,18 +862,21 @@ impl AutoSplitController {
             if recorder.is_ready() {
                 let key = recorder.collect(&self.cfg);
                 if !key.is_empty() {
+                    info!("load base split region";
+                        "region_id" => region_id,
+                        "qps" => qps,
+                        "byte" => byte,
+                        "cpu_usage" => cpu_usage,
+                        "split_key" => log_wrappers::Value::key(&key),
+                        "start_key" => log_wrappers::Value::key(&recorder.hottest_key_range.as_ref().unwrap_or_default().start_key),
+                        "end_key" => log_wrappers::Value::key(&recorder.hottest_key_range.as_ref().unwrap_or_default().end_key),
+                    );
                     split_infos.push(SplitInfo::with_split_key(
                         region_id,
                         recorder.peer.clone(),
                         key,
                     ));
                     LOAD_BASE_SPLIT_EVENT.ready_to_split.inc();
-                    info!("load base split region";
-                        "region_id" => region_id,
-                        "qps" => qps,
-                        "byte" => byte,
-                        "cpu_usage" => cpu_usage,
-                    );
                     self.recorders.remove(&region_id);
                 } else if is_unified_read_pool_busy && is_region_busy {
                     LOAD_BASE_SPLIT_EVENT.cpu_load_fit.inc();
@@ -868,23 +902,18 @@ impl AutoSplitController {
                 });
                 let region_id = top_cpu_usage[0];
                 let recorder = self.recorders.get_mut(&region_id).unwrap();
-                if recorder.hottest_key_range.is_some() {
+                if let Some(hottest_key_range) = recorder.hottest_key_range.as_ref() {
                     split_infos.push(SplitInfo::with_start_end_key(
                         region_id,
                         recorder.peer.clone(),
-                        recorder
-                            .hottest_key_range
-                            .as_ref()
-                            .unwrap()
-                            .start_key
-                            .clone(),
-                        recorder.hottest_key_range.as_ref().unwrap().end_key.clone(),
+                        hottest_key_range.start_key.clone(),
+                        hottest_key_range.end_key.clone(),
                     ));
                     LOAD_BASE_SPLIT_EVENT.ready_to_split_cpu_top.inc();
                     info!("load base split region";
                         "region_id" => region_id,
-                        "start_key" => log_wrappers::Value::key(&recorder.hottest_key_range.as_ref().unwrap().start_key),
-                        "end_key" => log_wrappers::Value::key(&recorder.hottest_key_range.as_ref().unwrap().end_key),
+                        "start_key" => log_wrappers::Value::key(&hottest_key_range.start_key),
+                        "end_key" => log_wrappers::Value::key(&hottest_key_range.end_key),
                         "cpu_usage" => recorder.cpu_usage,
                     );
                 } else {
@@ -936,8 +965,89 @@ impl AutoSplitController {
     }
 }
 
+#[derive(Default)]
+pub struct CpuStatsCache {
+    region_cpu_map: HashMap<u64, (f64, Option<KeyRange>)>,
+    hottest_key_range_cpu_time_map: HashMap<u64, u32>,
+}
+
+pub struct AutoSplitControllerContext {
+    read_stats_vec: Vec<ReadStats>,
+    cpu_stats_vec: Vec<Arc<RawRecords>>,
+    cpu_stats_cache: CpuStatsCache,
+    batch_recv_len: usize,
+
+    last_gc_time: Instant,
+    gc_duration: Duration,
+}
+
+impl AutoSplitControllerContext {
+    pub fn new(batch_recv_len: usize) -> Self {
+        AutoSplitControllerContext {
+            read_stats_vec: Vec::default(),
+            cpu_stats_vec: Vec::default(),
+            cpu_stats_cache: CpuStatsCache::default(),
+            batch_recv_len,
+            last_gc_time: Instant::now_coarse(),
+            // 30 seconds is a balance between efficient memory usage and
+            // maintaining performance under load.
+            gc_duration: Duration::from_secs(30),
+        }
+    }
+
+    pub fn batch_recv_read_stats(
+        &mut self,
+        read_stats_receiver: &Receiver<ReadStats>,
+    ) -> &mut Vec<ReadStats> {
+        self.read_stats_vec.clear();
+
+        while let Ok(read_stats) = read_stats_receiver.try_recv() {
+            self.read_stats_vec.push(read_stats);
+            if self.read_stats_vec.len() == self.batch_recv_len {
+                break;
+            }
+        }
+        &mut self.read_stats_vec
+    }
+
+    pub fn batch_recv_cpu_stats(
+        &mut self,
+        cpu_stats_receiver: &Receiver<Arc<RawRecords>>,
+    ) -> (&mut Vec<Arc<RawRecords>>, &mut CpuStatsCache) {
+        self.cpu_stats_vec.clear();
+        self.cpu_stats_cache.region_cpu_map.clear();
+        self.cpu_stats_cache.hottest_key_range_cpu_time_map.clear();
+
+        while let Ok(cpu_stats) = cpu_stats_receiver.try_recv() {
+            self.cpu_stats_vec.push(cpu_stats);
+            if self.cpu_stats_vec.len() == self.batch_recv_len {
+                break;
+            }
+        }
+        (&mut self.cpu_stats_vec, &mut self.cpu_stats_cache)
+    }
+
+    pub fn empty_region_cpu_map(&mut self) -> &HashMap<u64, (f64, Option<KeyRange>)> {
+        self.cpu_stats_cache.region_cpu_map.clear();
+        &self.cpu_stats_cache.region_cpu_map
+    }
+
+    pub fn maybe_gc(&mut self) {
+        let now = Instant::now_coarse();
+        if now.saturating_duration_since(self.last_gc_time) > self.gc_duration {
+            self.read_stats_vec = Vec::default();
+            self.cpu_stats_vec = Vec::default();
+            self.cpu_stats_cache = CpuStatsCache::default();
+
+            self.last_gc_time = now;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc::{self, TryRecvError};
+
     use online_config::{ConfigChange, ConfigManager, ConfigValue};
     use resource_metering::{RawRecord, TagInfos};
     use tikv_util::config::{ReadableSize, VersionTrack};
@@ -1187,6 +1297,30 @@ mod tests {
         fail::remove("mock_region_is_busy");
     }
 
+    fn new_auto_split_controller_ctx(
+        read_stats: Vec<ReadStats>,
+        cpu_stats: Vec<Arc<RawRecords>>,
+    ) -> (
+        AutoSplitControllerContext,
+        Receiver<ReadStats>,
+        Receiver<Arc<RawRecords>>,
+    ) {
+        let len = std::cmp::max(read_stats.len(), cpu_stats.len());
+        let (read_stats_sender, read_stats_receiver) = mpsc::sync_channel(len);
+        let (cpu_stats_sender, cpu_stats_receiver) = mpsc::sync_channel(len);
+        for s in cpu_stats {
+            cpu_stats_sender.try_send(s).unwrap();
+        }
+        for s in read_stats {
+            read_stats_sender.try_send(s).unwrap();
+        }
+        (
+            AutoSplitControllerContext::new(len),
+            read_stats_receiver,
+            cpu_stats_receiver,
+        )
+    }
+
     fn check_split_key(mode: &[u8], qps_stats: Vec<ReadStats>, split_keys: Vec<&[u8]>) {
         let mode = String::from_utf8(Vec::from(mode)).unwrap();
         let mut hub = AutoSplitController::default();
@@ -1194,8 +1328,15 @@ mod tests {
         hub.cfg.sample_threshold = 0;
 
         for i in 0..10 {
-            let (_, split_infos) =
-                hub.flush(qps_stats.clone(), vec![], &ThreadInfoStatistics::default());
+            let (mut ctx, read_stats_receiver, cpu_stats_receiver) =
+                new_auto_split_controller_ctx(qps_stats.clone(), vec![]);
+            let (_, split_infos) = hub.flush(
+                &mut ctx,
+                &read_stats_receiver,
+                &cpu_stats_receiver,
+                &mut ThreadInfoStatistics::default(),
+                &SplitValidator::new(),
+            );
             if (i + 1) % hub.cfg.detect_times != 0 {
                 continue;
             }
@@ -1227,10 +1368,14 @@ mod tests {
         hub.cfg.sample_threshold = 0;
 
         for i in 0..10 {
+            let (mut ctx, read_stats_receiver, cpu_stats_receiver) =
+                new_auto_split_controller_ctx(qps_stats.clone(), cpu_stats.clone());
             let (_, split_infos) = hub.flush(
-                qps_stats.clone(),
-                cpu_stats.clone(),
-                &ThreadInfoStatistics::default(),
+                &mut ctx,
+                &read_stats_receiver,
+                &cpu_stats_receiver,
+                &mut ThreadInfoStatistics::default(),
+                &SplitValidator::new(),
             );
             if (i + 1) % hub.cfg.detect_times != 0 {
                 continue;
@@ -1271,7 +1416,7 @@ mod tests {
                 region_id,
                 peer_id: 0,
                 key_ranges: vec![(key_range.start_key.clone(), key_range.end_key.clone())],
-                extra_attachment: vec![],
+                extra_attachment: Arc::new(vec![]),
             });
             raw_records.records.insert(
                 key_range_tag.clone(),
@@ -1279,6 +1424,10 @@ mod tests {
                     cpu_time: cpu_times[idx],
                     read_keys: 0,
                     write_keys: 0,
+                    network_in_bytes: 0,
+                    network_out_bytes: 0,
+                    logical_read_bytes: 0,
+                    logical_write_bytes: 0,
                 },
             );
         }
@@ -1315,7 +1464,16 @@ mod tests {
                 );
             }
             qps_stats_vec.push(qps_stats);
-            hub.flush(qps_stats_vec, vec![], &ThreadInfoStatistics::default());
+
+            let (mut ctx, read_stats_receiver, cpu_stats_receiver) =
+                new_auto_split_controller_ctx(qps_stats_vec.clone(), vec![]);
+            hub.flush(
+                &mut ctx,
+                &read_stats_receiver,
+                &cpu_stats_receiver,
+                &mut ThreadInfoStatistics::default(),
+                &SplitValidator::new(),
+            );
         }
 
         // Test the empty key ranges.
@@ -1328,7 +1486,16 @@ mod tests {
             qps_stats.add_query_num(1, &Peer::default(), KeyRange::default(), QueryKind::Get);
         }
         qps_stats_vec.push(qps_stats);
-        hub.flush(qps_stats_vec, vec![], &ThreadInfoStatistics::default());
+
+        let (mut ctx, read_stats_receiver, cpu_stats_receiver) =
+            new_auto_split_controller_ctx(qps_stats_vec, vec![]);
+        hub.flush(
+            &mut ctx,
+            &read_stats_receiver,
+            &cpu_stats_receiver,
+            &mut ThreadInfoStatistics::default(),
+            &SplitValidator::new(),
+        );
     }
 
     fn check_sample_length(key_ranges: Vec<Vec<KeyRange>>) {
@@ -1675,8 +1842,10 @@ mod tests {
 
     #[test]
     fn test_collect_cpu_stats() {
-        let auto_split_controller = AutoSplitController::default();
-        let region_cpu_map = auto_split_controller.collect_cpu_stats(vec![]);
+        let mut auto_split_controller = AutoSplitController::default();
+
+        let (mut ctx, _, cpu_stats_receiver) = new_auto_split_controller_ctx(vec![], vec![]);
+        let region_cpu_map = auto_split_controller.collect_cpu_stats(&mut ctx, &cpu_stats_receiver);
         assert!(region_cpu_map.is_empty());
 
         let ab_key_range_tag = Arc::new(TagInfos {
@@ -1684,14 +1853,14 @@ mod tests {
             region_id: 1,
             peer_id: 0,
             key_ranges: vec![(b"a".to_vec(), b"b".to_vec())],
-            extra_attachment: vec![],
+            extra_attachment: Arc::new(vec![]),
         });
         let cd_key_range_tag = Arc::new(TagInfos {
             store_id: 0,
             region_id: 1,
             peer_id: 0,
             key_ranges: vec![(b"c".to_vec(), b"d".to_vec())],
-            extra_attachment: vec![],
+            extra_attachment: Arc::new(vec![]),
         });
         let multiple_key_ranges_tag = Arc::new(TagInfos {
             store_id: 0,
@@ -1701,14 +1870,14 @@ mod tests {
                 (b"a".to_vec(), b"b".to_vec()),
                 (b"c".to_vec(), b"d".to_vec()),
             ],
-            extra_attachment: vec![],
+            extra_attachment: Arc::new(vec![]),
         });
         let empty_key_range_tag = Arc::new(TagInfos {
             store_id: 0,
             region_id: 1,
             peer_id: 0,
             key_ranges: vec![],
-            extra_attachment: vec![],
+            extra_attachment: Arc::new(vec![]),
         });
 
         let test_cases = vec![
@@ -1735,6 +1904,10 @@ mod tests {
                     cpu_time: test_case.0,
                     read_keys: 0,
                     write_keys: 0,
+                    network_in_bytes: 0,
+                    network_out_bytes: 0,
+                    logical_read_bytes: 0,
+                    logical_write_bytes: 0,
                 },
             );
             // ["c", "d"] with (test_case.1)ms CPU time.
@@ -1744,6 +1917,10 @@ mod tests {
                     cpu_time: test_case.1,
                     read_keys: 0,
                     write_keys: 0,
+                    network_in_bytes: 0,
+                    network_out_bytes: 0,
+                    logical_read_bytes: 0,
+                    logical_write_bytes: 0,
                 },
             );
             // Multiple key ranges with (test_case.2)ms CPU time.
@@ -1753,6 +1930,10 @@ mod tests {
                     cpu_time: test_case.2,
                     read_keys: 0,
                     write_keys: 0,
+                    network_in_bytes: 0,
+                    network_out_bytes: 0,
+                    logical_read_bytes: 0,
+                    logical_write_bytes: 0,
                 },
             );
             // Empty key range with (test_case.3)ms CPU time.
@@ -1762,10 +1943,17 @@ mod tests {
                     cpu_time: test_case.3,
                     read_keys: 0,
                     write_keys: 0,
+                    network_in_bytes: 0,
+                    network_out_bytes: 0,
+                    logical_read_bytes: 0,
+                    logical_write_bytes: 0,
                 },
             );
+
+            let (mut ctx, _, cpu_stats_receiver) =
+                new_auto_split_controller_ctx(vec![], vec![Arc::new(raw_records)]);
             let region_cpu_map =
-                auto_split_controller.collect_cpu_stats(vec![Arc::new(raw_records)]);
+                auto_split_controller.collect_cpu_stats(&mut ctx, &cpu_stats_receiver);
             assert_eq!(
                 region_cpu_map.len(),
                 1,
@@ -1866,12 +2054,22 @@ mod tests {
         for _i in 0..10 {
             other_qps_stats.push(default_qps_stats());
         }
+        let (read_stats_sender, read_stats_receiver) = mpsc::sync_channel(other_qps_stats.len());
+        let (_, cpu_stats_receiver) = mpsc::sync_channel(other_qps_stats.len());
+        let mut ctx = AutoSplitControllerContext::new(other_qps_stats.len());
+        let mut threads = ThreadInfoStatistics::default();
+
         b.iter(|| {
             let mut hub = AutoSplitController::default();
+            for s in other_qps_stats.clone() {
+                read_stats_sender.send(s).unwrap();
+            }
             hub.flush(
-                other_qps_stats.clone(),
-                vec![],
-                &ThreadInfoStatistics::default(),
+                &mut ctx,
+                &read_stats_receiver,
+                &cpu_stats_receiver,
+                &mut threads,
+                &SplitValidator::new(),
             );
         });
     }
@@ -1911,5 +2109,103 @@ mod tests {
                 QueryKind::Get,
             );
         });
+    }
+
+    #[test]
+    fn test_auto_split_controller_ctx_batch_recv() {
+        let batch_limit = 3;
+        let mut ctx = AutoSplitControllerContext::new(batch_limit);
+        for len in [0, 2, 3, 5, 6] {
+            let (read_stats_sender, read_stats_receiver) = mpsc::sync_channel(len);
+            let (cpu_stats_sender, cpu_stats_receiver) = mpsc::sync_channel(len);
+
+            let read_stats = ReadStats::default();
+            let cpu_stats = Arc::new(RawRecords::default());
+            for _ in 0..len {
+                read_stats_sender.try_send(read_stats.clone()).unwrap();
+                cpu_stats_sender.try_send(cpu_stats.clone()).unwrap();
+            }
+            // If channel is full, should return error.
+            assert!(read_stats_sender.try_send(read_stats.clone()).is_err());
+            assert!(cpu_stats_sender.try_send(cpu_stats.clone()).is_err());
+            loop {
+                let batch = ctx.batch_recv_read_stats(&read_stats_receiver);
+                if batch.is_empty() {
+                    break;
+                }
+                assert!(
+                    batch.len() == batch_limit || batch.len() == len % batch_limit,
+                    "{:?}",
+                    (len, batch.len())
+                );
+            }
+            assert_eq!(
+                read_stats_receiver.try_recv().unwrap_err(),
+                TryRecvError::Empty
+            );
+
+            loop {
+                let (batch, cache) = ctx.batch_recv_cpu_stats(&cpu_stats_receiver);
+                if batch.is_empty() {
+                    break;
+                }
+                assert!(
+                    batch.len() == batch_limit || batch.len() == len % batch_limit,
+                    "{:?}",
+                    (len, batch.len())
+                );
+                assert!(cache.region_cpu_map.is_empty());
+                assert!(cache.hottest_key_range_cpu_time_map.is_empty());
+                // The cache should be empty after the batch_recv_cpu_stats.
+                cache.region_cpu_map.insert(1, (0.0, None));
+                cache.hottest_key_range_cpu_time_map.insert(1, 1);
+            }
+            assert_eq!(
+                read_stats_receiver.try_recv().unwrap_err(),
+                TryRecvError::Empty
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_split_controller_empty_region_cpu_map() {
+        let mut ctx = AutoSplitControllerContext::new(1);
+        ctx.cpu_stats_cache.region_cpu_map.insert(1, (0.0, None));
+        assert!(ctx.empty_region_cpu_map().is_empty());
+    }
+
+    #[test]
+    fn test_auto_split_controller_empty_gc() {
+        let mut ctx = AutoSplitControllerContext::new(1);
+        ctx.cpu_stats_cache.region_cpu_map.insert(1, (0.0, None));
+        ctx.cpu_stats_cache
+            .hottest_key_range_cpu_time_map
+            .insert(1, 1);
+        ctx.cpu_stats_vec.push(Arc::new(RawRecords::default()));
+        ctx.read_stats_vec.push(ReadStats::default());
+
+        ctx.last_gc_time = Instant::now_coarse();
+        ctx.maybe_gc();
+
+        assert!(!ctx.cpu_stats_cache.region_cpu_map.is_empty());
+        assert!(
+            !ctx.cpu_stats_cache
+                .hottest_key_range_cpu_time_map
+                .is_empty()
+        );
+        assert!(!ctx.cpu_stats_vec.is_empty());
+        assert!(!ctx.read_stats_vec.is_empty());
+
+        ctx.last_gc_time = Instant::now_coarse() - 2 * ctx.gc_duration;
+        ctx.maybe_gc();
+
+        assert!(ctx.cpu_stats_cache.region_cpu_map.is_empty());
+        assert!(
+            ctx.cpu_stats_cache
+                .hottest_key_range_cpu_time_map
+                .is_empty()
+        );
+        assert!(ctx.cpu_stats_vec.is_empty());
+        assert!(ctx.read_stats_vec.is_empty());
     }
 }

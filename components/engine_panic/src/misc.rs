@@ -55,11 +55,7 @@ impl MiscExt for PanicEngine {
         panic!()
     }
 
-    fn ingest_maybe_slowdown_writes(&self, cf: &str) -> Result<bool> {
-        panic!()
-    }
-
-    fn get_sst_key_ranges(&self, cf: &str, level: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    fn ingest_maybe_slowdown_writes(&self, cf: &str, inflight_ingest_cnt: u64) -> Result<bool> {
         panic!()
     }
 
@@ -72,6 +68,14 @@ impl MiscExt for PanicEngine {
     }
 
     fn sync_wal(&self) -> Result<()> {
+        panic!()
+    }
+
+    fn disable_manual_compaction(&self) -> Result<()> {
+        panic!()
+    }
+
+    fn enable_manual_compaction(&self) -> Result<()> {
         panic!()
     }
 
@@ -127,6 +131,11 @@ impl MiscExt for PanicEngine {
     }
 
     fn get_accumulated_flush_count_cf(cf: &str) -> Result<u64> {
+        panic!()
+    }
+
+    type DiskEngine = PanicEngine;
+    fn get_disk_engine(&self) -> &Self::DiskEngine {
         panic!()
     }
 }

@@ -5,13 +5,15 @@ use std::{sync::Arc, time::Duration};
 use collections::HashMap;
 use engine_traits::{KvEngine, RaftEngine};
 use kvproto::{metapb, pdpb};
-use pd_client::{metrics::PD_HEARTBEAT_COUNTER_VEC, BucketStat, PdClient, RegionStat};
+use pd_client::{
+    BucketStat, PdClient, RegionStat, RegionWriteCfCopDetail, metrics::PD_HEARTBEAT_COUNTER_VEC,
+};
 use raftstore::store::{ReadStats, WriteStats};
 use resource_metering::RawRecords;
 use slog::{debug, error, info};
 use tikv_util::{store::QueryStats, time::UnixSecs};
 
-use super::{requests::*, Runner};
+use super::{Runner, requests::*};
 use crate::{
     operation::{RequestHalfSplit, RequestSplit},
     router::{CmdResChannel, PeerMsg},
@@ -140,7 +142,9 @@ where
         let cpu_usage = {
             // Take out the region CPU record.
             let cpu_time_duration = Duration::from_millis(
-                self.region_cpu_records.remove(&region_id).unwrap_or(0) as u64,
+                self.region_cpu_records_since_region_heartbeat
+                    .remove(&region_id)
+                    .unwrap_or(0) as u64,
             );
             let interval_second = unix_secs_now.into_inner() - last_report_ts.into_inner();
             // Keep consistent with the calculation of cpu_usages in a store heartbeat.
@@ -151,6 +155,8 @@ where
                 0
             }
         };
+        let mut cpu_stats = pdpb::CpuStats::default();
+        cpu_stats.set_unified_read(cpu_usage);
 
         let region_stat = RegionStat {
             down_peers: task.down_peers,
@@ -160,10 +166,12 @@ where
             read_bytes: read_bytes_delta,
             read_keys: read_keys_delta,
             query_stats: query_stats.0,
+            cop_detail: RegionWriteCfCopDetail::default(),
             approximate_size,
             approximate_keys,
             last_report_ts,
             cpu_usage,
+            cpu_stats,
         };
         self.store_stat
             .region_bytes_written
@@ -336,9 +344,9 @@ where
         self.is_hb_receiver_scheduled = true;
     }
 
-    pub fn handle_report_region_buckets(&mut self, region_buckets: BucketStat) {
-        let region_id = region_buckets.meta.region_id;
-        self.merge_buckets(region_buckets);
+    pub fn handle_report_region_buckets(&mut self, delta_buckets: BucketStat) {
+        let region_id = delta_buckets.meta.region_id;
+        self.merge_buckets(delta_buckets);
         let report_buckets = self.region_buckets.get_mut(&region_id).unwrap();
         let last_report_ts = if report_buckets.last_report_ts.is_zero() {
             self.start_ts
@@ -382,8 +390,8 @@ where
                 .engine_total_query_num
                 .add_query_stats(&region_info.query_stats.0);
         }
-        for (_, region_buckets) in std::mem::take(&mut stats.region_buckets) {
-            self.merge_buckets(region_buckets);
+        for (_, delta_buckets) in std::mem::take(&mut stats.region_buckets) {
+            self.merge_buckets(delta_buckets);
         }
         if !stats.region_infos.is_empty() {
             self.stats_monitor.maybe_send_read_stats(stats);
@@ -403,30 +411,42 @@ where
     pub fn handle_update_region_cpu_records(&mut self, records: Arc<RawRecords>) {
         // Send Region CPU info to AutoSplitController inside the stats_monitor.
         self.stats_monitor.maybe_send_cpu_stats(&records);
-        Self::calculate_region_cpu_records(self.store_id, records, &mut self.region_cpu_records);
+        Self::calculate_region_cpu_records(
+            self.store_id,
+            records.clone(),
+            &mut self.region_cpu_records_since_region_heartbeat,
+        );
+        Self::calculate_region_cpu_records(
+            self.store_id,
+            records,
+            &mut self.region_cpu_records_since_store_heartbeat,
+        );
     }
 
     pub fn handle_destroy_peer(&mut self, region_id: u64) {
-        match self.region_peers.remove(&region_id) {
-            None => {}
-            Some(_) => {
-                info!(self.logger, "remove peer statistic record in pd"; "region_id" => region_id)
-            }
+        let removed = remove_peer_stat_from_maps(
+            region_id,
+            &mut self.region_peers,
+            &mut self.region_cpu_records_since_region_heartbeat,
+            &mut self.region_cpu_records_since_store_heartbeat,
+        );
+        if removed {
+            info!(self.logger, "remove peer statistic record in pd"; "region_id" => region_id);
         }
     }
 
-    fn merge_buckets(&mut self, mut buckets: BucketStat) {
-        let region_id = buckets.meta.region_id;
+    fn merge_buckets(&mut self, mut delta: BucketStat) {
+        let region_id = delta.meta.region_id;
         self.region_buckets
             .entry(region_id)
             .and_modify(|report_bucket| {
                 let current = &mut report_bucket.current_stat;
-                if current.meta < buckets.meta {
-                    std::mem::swap(current, &mut buckets);
+                if current.meta < delta.meta {
+                    std::mem::swap(current, &mut delta);
                 }
-                current.merge(&buckets);
+                current.merge(&delta);
             })
-            .or_insert_with(|| ReportBucket::new(buckets));
+            .or_insert_with(|| ReportBucket::new(delta));
     }
 
     fn calculate_region_cpu_records(
@@ -442,5 +462,42 @@ where
             // Reporting a region heartbeat later will clear the corresponding record.
             *region_cpu_records.entry(tag.region_id).or_insert(0) += record.cpu_time;
         }
+    }
+}
+
+fn remove_peer_stat_from_maps(
+    region_id: u64,
+    region_peers: &mut HashMap<u64, PeerStat>,
+    region_cpu_records_since_region_heartbeat: &mut HashMap<u64, u32>,
+    region_cpu_records_since_store_heartbeat: &mut HashMap<u64, u32>,
+) -> bool {
+    let removed = region_peers.remove(&region_id).is_some();
+    region_cpu_records_since_region_heartbeat.remove(&region_id);
+    region_cpu_records_since_store_heartbeat.remove(&region_id);
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remove_peer_stat_from_maps() {
+        let mut region_peers = HashMap::default();
+        region_peers.insert(1, PeerStat::default());
+        let mut region_cpu_records_since_region_heartbeat = HashMap::default();
+        region_cpu_records_since_region_heartbeat.insert(1, 10);
+        let mut region_cpu_records_since_store_heartbeat = HashMap::default();
+        region_cpu_records_since_store_heartbeat.insert(1, 12);
+
+        assert!(remove_peer_stat_from_maps(
+            1,
+            &mut region_peers,
+            &mut region_cpu_records_since_region_heartbeat,
+            &mut region_cpu_records_since_store_heartbeat,
+        ));
+        assert!(region_peers.is_empty());
+        assert!(region_cpu_records_since_region_heartbeat.is_empty());
+        assert!(region_cpu_records_since_store_heartbeat.is_empty());
     }
 }

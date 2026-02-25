@@ -2,14 +2,15 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::{TokenStream as TokenStream2, TokenTree};
-use quote::{quote, ToTokens};
-use syn::{parse_macro_input, parse_quote, Ident, ItemFn, Path};
+use quote::{ToTokens, quote};
+use syn::{Ident, ItemFn, Path, parse_macro_input, parse_quote};
 
 /// test_case generate test cases using cluster creation method provided.
 /// It also import the package related util module, which means we should locate
 /// methods using Cluster in the related util modules.
 ///
 /// ex:
+/// ```text
 /// #[test_case(test_raftstore::new_node_cluster)]
 /// #[test_case(test_raftstore::new_server_cluster)]
 /// #[test_case(test_raftstore_v2::new_node_cluster)]
@@ -39,6 +40,7 @@ use syn::{parse_macro_input, parse_quote, Ident, ItemFn, Path};
 ///         let mut cluster = new_cluster(0, 1);
 ///     }
 /// }
+/// ```
 #[proc_macro_attribute]
 pub fn test_case(arg: TokenStream, input: TokenStream) -> TokenStream {
     let mut fn_item = parse_macro_input!(input as ItemFn);

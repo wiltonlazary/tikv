@@ -14,7 +14,7 @@ use crossbeam::{
     channel::SendError,
     queue::{ArrayQueue, SegQueue},
 };
-use futures::{task::AtomicWaker, Stream, StreamExt};
+use futures::{Stream, StreamExt, task::AtomicWaker};
 
 use crate::future::block_on_timeout;
 
@@ -287,8 +287,9 @@ where
 mod tests {
     use std::{
         sync::{
+            Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize},
-            mpsc, Arc, Mutex,
+            mpsc,
         },
         thread, time,
     };
@@ -302,8 +303,6 @@ mod tests {
 
     use super::*;
 
-    // the JoinHandler is useless here, so just ignore this warning.
-    #[allow(clippy::let_underscore_future)]
     fn spawn_and_wait<S: Stream + Send + 'static>(
         rx_builder: impl FnOnce() -> S,
     ) -> (Runtime, Arc<AtomicUsize>) {

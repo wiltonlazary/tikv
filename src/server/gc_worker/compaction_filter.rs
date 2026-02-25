@@ -6,28 +6,29 @@ use std::{
     mem,
     result::Result,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use engine_rocks::{
+    RocksEngine, RocksMvccProperties, RocksWriteBatchVec,
     raw::{
         CompactionFilter, CompactionFilterContext, CompactionFilterDecision,
         CompactionFilterFactory, CompactionFilterValueType,
     },
-    RocksEngine, RocksMvccProperties, RocksWriteBatchVec,
 };
 use engine_traits::{KvEngine, MiscExt, MvccProperties, WriteBatch, WriteOptions};
 use file_system::{IoType, WithIoType};
+use lazy_static::lazy_static;
 use pd_client::{Feature, FeatureGate};
 use prometheus::{local::*, *};
 use raftstore::coprocessor::RegionInfoProvider;
 use tikv_util::{
+    Either,
     time::Instant,
     worker::{ScheduleError, Scheduler},
-    Either,
 };
 use txn_types::{Key, TimeStamp, WriteRef, WriteType};
 
@@ -58,6 +59,12 @@ pub struct GcContext {
     pub(crate) region_info_provider: Arc<dyn RegionInfoProvider + 'static>,
     #[cfg(any(test, feature = "failpoints"))]
     callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
+}
+
+impl GcContext {
+    pub fn safe_point(&self) -> u64 {
+        self.safe_point.load(Ordering::Relaxed)
+    }
 }
 
 // Give all orphan versions an ID to log them.
@@ -147,7 +154,7 @@ where
         safe_point: Arc<AtomicU64>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
-        gc_scheduler: Scheduler<GcTask<EK>>,
+        gc_scheduler: Scheduler<GcTask<<EK as MiscExt>::DiskEngine>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
     );
 }
@@ -162,7 +169,7 @@ where
         _safe_point: Arc<AtomicU64>,
         _cfg_tracker: GcWorkerConfigManager,
         _feature_gate: FeatureGate,
-        _gc_scheduler: Scheduler<GcTask<EK>>,
+        _gc_scheduler: Scheduler<GcTask<<EK as MiscExt>::DiskEngine>>,
         _region_info_provider: Arc<dyn RegionInfoProvider>,
     ) {
         info!("Compaction filter is not supported for this engine.");
@@ -237,10 +244,7 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
             "ratio_threshold" => ratio_threshold,
         );
 
-        if db
-            .as_ref()
-            .map_or(false, RocksEngine::is_stalled_or_stopped)
-        {
+        if db.as_ref().is_some_and(RocksEngine::is_stalled_or_stopped) {
             debug!("skip gc in compaction filter because the DB is stalled");
             return None;
         }
@@ -263,7 +267,7 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
 
         debug!(
             "gc in compaction filter"; "safe_point" => safe_point,
-            "files" => ?context.file_numbers(),
+            "files" => ?context.input_table_properties().iter().map(|(k, _)| k).collect::<Vec<_>>(),
             "bottommost" => context.is_bottommost_level(),
             "manual" => context.is_manual_compaction(),
         );
@@ -282,10 +286,12 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
 
 pub struct DeleteBatch<B> {
     pub batch: Either<B, Vec<Key>>,
+    pub smallest_key: Option<Key>,
+    pub largest_key: Option<Key>,
 }
 
 impl<B: WriteBatch> DeleteBatch<B> {
-    fn new<EK>(db: &Option<EK>) -> Self
+    pub fn new<EK>(db: &Option<EK>) -> Self
     where
         EK: KvEngine<WriteBatch = B>,
     {
@@ -294,11 +300,34 @@ impl<B: WriteBatch> DeleteBatch<B> {
                 Some(db) => Either::Left(db.write_batch_with_cap(DEFAULT_DELETE_BATCH_SIZE)),
                 None => Either::Right(Vec::with_capacity(64)),
             },
+            smallest_key: None,
+            largest_key: None,
         }
     }
 
     // `key` has prefix `DATA_KEY`.
-    fn delete(&mut self, key: &[u8], ts: TimeStamp) -> Result<(), String> {
+    pub fn delete(&mut self, key: &[u8], ts: TimeStamp) -> Result<(), String> {
+        match &self.smallest_key {
+            Some(smallest) => {
+                debug_assert!(key >= smallest.as_encoded().as_slice());
+            }
+            None => {
+                // Smallest key is the first key because compaction processes keys in asending
+                // order.
+                self.smallest_key = Some(Key::from_encoded_slice(key));
+            }
+        }
+        match &self.largest_key {
+            Some(largest) => {
+                debug_assert!(key >= largest.as_encoded().as_slice());
+                self.largest_key = Some(Key::from_encoded_slice(key));
+            }
+            None => {
+                self.largest_key = Some(Key::from_encoded_slice(key));
+            }
+        }
+        debug_assert_le!(self.smallest_key, self.largest_key);
+
         match &mut self.batch {
             Either::Left(batch) => {
                 let key = Key::from_encoded_slice(key).append_ts(ts);
@@ -452,7 +481,6 @@ impl WriteCompactionFilter {
         &mut self,
         _start_level: usize,
         key: &[u8],
-        _sequence: u64,
         value: &[u8],
         value_type: CompactionFilterValueType,
     ) -> Result<CompactionFilterDecision, String> {
@@ -550,6 +578,34 @@ impl WriteCompactionFilter {
         if self.write_batch.count() > DEFAULT_DELETE_BATCH_COUNT || force {
             let err = match &mut self.write_batch.batch {
                 Either::Left(wb) => {
+                    // Acquire latch to prevent concurrency with ingestion operations
+                    // using RocksDB IngestExternalFileOptions.allow_write = true.
+                    let _region_inject_latch_guard = match self.engine.as_ref() {
+                        Some(engine) => {
+                            let smallest_key = self
+                                .write_batch
+                                .smallest_key
+                                .as_ref()
+                                .unwrap()
+                                .as_encoded()
+                                .clone();
+                            let largest_key = self
+                                .write_batch
+                                .largest_key
+                                .as_ref()
+                                .unwrap()
+                                .as_encoded()
+                                .clone();
+                            Some(
+                                engine
+                                    .ingest_latch
+                                    .acquire(smallest_key, keys::next_key(&largest_key)),
+                            )
+                        }
+                        None => None,
+                    };
+                    fail_point!("compaction_filter_ingest_latch_acquired_flush");
+
                     let mut wopts = WriteOptions::default();
                     wopts.set_no_slowdown(true);
                     match do_flush(wb, &wopts) {
@@ -691,16 +747,16 @@ impl CompactionFilter for WriteCompactionFilter {
         &mut self,
         level: usize,
         key: &[u8],
-        sequence: u64,
         value: &[u8],
         value_type: CompactionFilterValueType,
     ) -> CompactionFilterDecision {
+        fail_point!("before_compaction_filter");
         if self.encountered_errors {
             // If there are already some errors, do nothing.
             return CompactionFilterDecision::Keep;
         }
 
-        match self.do_filter(level, key, sequence, value, value_type) {
+        match self.do_filter(level, key, value, value_type) {
             Ok(decision) => decision,
             Err(e) => {
                 warn!("compaction filter meet error: {}", e);
@@ -787,9 +843,9 @@ pub fn check_need_gc(
     };
 
     let (mut sum_props, mut needs_gc) = (MvccProperties::new(), 0);
-    for i in 0..context.file_numbers().len() {
-        let table_props = context.table_properties(i);
-        let user_props = table_props.user_collected_properties();
+    let table_props = context.input_table_properties();
+    for (_, table_prop) in table_props {
+        let user_props = table_prop.user_collected_properties();
         if let Ok(props) = RocksMvccProperties::decode(user_props) {
             sum_props.add(&props);
             let (sst_needs_gc, skip_more_checks) = check_props(&props);
@@ -798,35 +854,34 @@ pub fn check_need_gc(
             }
             if skip_more_checks {
                 // It's the bottommost level or ratio_threshold is less than 1.
-                needs_gc = context.file_numbers().len();
+                needs_gc = table_props.len();
                 break;
             }
         }
     }
 
-    (needs_gc >= ((context.file_numbers().len() + 1) / 2)) || check_props(&sum_props).0
+    (needs_gc >= table_props.len().div_ceil(2)) || check_props(&sum_props).0
 }
 
 #[allow(dead_code)] // Some interfaces are not used with different compile options.
 #[cfg(any(test, feature = "failpoints"))]
 pub mod test_utils {
     use engine_rocks::{
+        RocksEngine,
         raw::{CompactOptions, CompactionOptions},
         util::get_cf_handle,
-        RocksEngine,
     };
-    use engine_traits::{SyncMutable, CF_DEFAULT, CF_WRITE};
+    use engine_traits::{CF_DEFAULT, CF_WRITE, SyncMutable};
     use raftstore::coprocessor::region_info_accessor::MockRegionInfoProvider;
     use tikv_util::{
         config::VersionTrack,
-        worker::{dummy_scheduler, ReceiverWrapper},
+        worker::{ReceiverWrapper, dummy_scheduler},
     };
 
     use super::*;
     use crate::storage::kv::RocksEngine as StorageRocksEngine;
 
     /// Do a global GC with the given safe point.
-    #[allow(clippy::needless_pass_by_ref_mut)]
     pub fn gc_by_compact(engine: &mut StorageRocksEngine, _: &[u8], safe_point: u64) {
         let engine = engine.get_rocksdb();
         // Put a new key-value pair to ensure compaction can be triggered correctly.
@@ -858,7 +913,7 @@ pub mod test_utils {
         pub(super) callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
     }
 
-    impl<'a> TestGcRunner<'a> {
+    impl TestGcRunner<'_> {
         pub fn new(safe_point: u64) -> Self {
             let (gc_scheduler, gc_receiver) = dummy_scheduler();
 
@@ -875,7 +930,7 @@ pub mod test_utils {
         }
     }
 
-    impl<'a> TestGcRunner<'a> {
+    impl TestGcRunner<'_> {
         pub fn safe_point(&mut self, sp: u64) -> &mut Self {
             self.safe_point = sp;
             self
@@ -889,7 +944,7 @@ pub mod test_utils {
                     cfg.ratio_threshold = ratio_threshold;
                 }
                 cfg.enable_compaction_filter = true;
-                GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)))
+                GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)), None)
             };
             let feature_gate = {
                 let feature_gate = FeatureGate::default();
@@ -986,7 +1041,7 @@ pub mod test_utils {
 
 #[cfg(test)]
 pub mod tests {
-    use engine_traits::{DeleteStrategy, MiscExt, Peekable, Range, SyncMutable, CF_WRITE};
+    use engine_traits::{CF_WRITE, DeleteStrategy, MiscExt, Peekable, Range, SyncMutable};
 
     use super::{test_utils::*, *};
     use crate::{
@@ -1238,5 +1293,56 @@ pub mod tests {
         gc_runner.target_level = Some(6);
         gc_runner.safe_point(200).gc(&raw_engine);
         must_get_none(&mut engine, b"zkey", 200);
+    }
+
+    #[test]
+    fn test_delete_batch_smallest_and_largest_key_update() {
+        let mut cfg = DbConfig::default();
+        cfg.writecf.disable_auto_compactions = true;
+        cfg.writecf.dynamic_level_bytes = false;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let builder = TestEngineBuilder::new().path(dir.path());
+        let engine = builder.build_with_cfg(&cfg).unwrap();
+        let raw_engine = engine.get_rocksdb();
+
+        let mut delete_batch = DeleteBatch::new(&Some(raw_engine.clone()));
+
+        let key1 = b"key1";
+        let key2 = b"key2";
+        let key3 = b"key3";
+        let ts1 = TimeStamp::new(100);
+        let ts2 = TimeStamp::new(200);
+        let ts3 = TimeStamp::new(300);
+
+        delete_batch.delete(key1, ts1).unwrap();
+        assert_eq!(
+            delete_batch.smallest_key.as_ref().unwrap().as_encoded(),
+            key1
+        );
+        assert_eq!(
+            delete_batch.largest_key.as_ref().unwrap().as_encoded(),
+            key1
+        );
+
+        delete_batch.delete(key2, ts2).unwrap();
+        assert_eq!(
+            delete_batch.smallest_key.as_ref().unwrap().as_encoded(),
+            key1
+        );
+        assert_eq!(
+            delete_batch.largest_key.as_ref().unwrap().as_encoded(),
+            key2
+        );
+
+        delete_batch.delete(key3, ts3).unwrap();
+        assert_eq!(
+            delete_batch.smallest_key.as_ref().unwrap().as_encoded(),
+            key1
+        );
+        assert_eq!(
+            delete_batch.largest_key.as_ref().unwrap().as_encoded(),
+            key3
+        );
     }
 }

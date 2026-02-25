@@ -30,7 +30,7 @@
 use std::{mem, time::Duration};
 
 use collections::HashMap;
-use engine_traits::{Checkpointer, KvEngine, RaftEngine, RaftLogBatch, CF_LOCK};
+use engine_traits::{CF_LOCK, Checkpointer, KvEngine, RaftEngine, RaftLogBatch};
 use futures::channel::oneshot;
 use kvproto::{
     metapb::RegionEpoch,
@@ -44,11 +44,11 @@ use kvproto::{
 };
 use parking_lot::RwLockUpgradableReadGuard;
 use protobuf::Message;
-use raft::{eraftpb::EntryType, GetEntriesContext, NO_LIMIT};
+use raft::{GetEntriesContext, NO_LIMIT, eraftpb::EntryType};
 use raftstore::{
-    coprocessor::RegionChangeReason,
-    store::{metrics::PEER_ADMIN_CMD_COUNTER, util, LocksStatus, ProposalContext, Transport},
     Error, Result,
+    coprocessor::RegionChangeReason,
+    store::{LocksStatus, ProposalContext, Transport, metrics::PEER_ADMIN_CMD_COUNTER, util},
 };
 use slog::{debug, error, info};
 use tikv_util::{
@@ -56,11 +56,11 @@ use tikv_util::{
 };
 use txn_types::WriteBatchFlags;
 
-use super::{merge_source_path, CatchUpLogs};
+use super::{CatchUpLogs, merge_source_path};
 use crate::{
     batch::StoreContext,
     fsm::ApplyResReporter,
-    operation::{command::parse_at, AdminCmdResult, SimpleWriteReqDecoder},
+    operation::{AdminCmdResult, SimpleWriteReqDecoder, command::parse_at},
     raft::{Apply, Peer},
     router::{CmdResChannel, PeerMsg, RaftRequest},
 };
@@ -214,27 +214,12 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 let mut proposal_ctx = ProposalContext::empty();
                 proposal_ctx.insert(ProposalContext::PREPARE_MERGE);
                 let data = req.write_to_bytes().unwrap();
-                self.propose_with_ctx(store_ctx, data, proposal_ctx.to_vec())
+                self.propose_with_ctx(store_ctx, data, proposal_ctx)
             });
         if r.is_ok() {
             self.proposal_control_mut().set_pending_prepare_merge(false);
         } else {
-            // Match v1::post_propose_fail.
-            // If we just failed to propose PrepareMerge, the pessimistic locks status
-            // may become MergingRegion incorrectly. So, we have to revert it here.
-            // Note: The `is_merging` check from v1 is removed because proposed
-            // `PrepareMerge` rejects all writes (in `ProposalControl::check_conflict`).
-            assert!(
-                !self.proposal_control().is_merging(),
-                "{}",
-                SlogFormat(&self.logger)
-            );
-            self.take_merge_context();
-            self.proposal_control_mut().set_pending_prepare_merge(false);
-            let mut pessimistic_locks = self.txn_context().ext().pessimistic_locks.write();
-            if pessimistic_locks.status == LocksStatus::MergingRegion {
-                pessimistic_locks.status = LocksStatus::Normal;
-            }
+            self.post_prepare_merge_fail();
         }
         r
     }
@@ -339,7 +324,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             }
             let Err(cmd) = SimpleWriteReqDecoder::new(
                 |buf, index, term| parse_at(&self.logger, buf, index, term),
-                &self.logger,
+                Some(&self.logger),
                 entry.get_data(),
                 entry.get_index(),
                 entry.get_term(),
@@ -430,66 +415,72 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         resp: &ExtraMessage,
     ) {
         let region_id = self.region_id();
-        if self.merge_context().is_some()
-            && let Some(PrepareStatus::WaitForTrimStatus { pending_peers, req, .. }) = self
-                .merge_context_mut()
-                .prepare_status
-                .as_mut()
-            && req.is_some()
-        {
-            assert!(resp.has_availability_context());
-            let from_region = resp.get_availability_context().get_from_region_id();
-            let from_epoch = resp.get_availability_context().get_from_region_epoch();
-            let trimmed = resp.get_availability_context().get_trimmed();
-            if let Some(epoch) = pending_peers.get(&from_peer)
-                && util::is_region_epoch_equal(from_epoch, epoch)
+        if self.merge_context().is_some() {
+            if let Some(PrepareStatus::WaitForTrimStatus {
+                pending_peers, req, ..
+            }) = self.merge_context_mut().prepare_status.as_mut()
             {
-                if !trimmed {
-                    info!(
-                        self.logger,
-                        "cancel merge because source peer is not trimmed";
-                        "region_id" => from_region,
-                        "peer_id" => from_peer,
-                    );
-                    self.take_merge_context();
-                    return;
-                } else {
-                    pending_peers.remove(&from_peer);
+                if req.is_some() {
+                    assert!(resp.has_availability_context());
+                    let from_region = resp.get_availability_context().get_from_region_id();
+                    let from_epoch = resp.get_availability_context().get_from_region_epoch();
+                    let trimmed = resp.get_availability_context().get_trimmed();
+                    if let Some(epoch) = pending_peers.get(&from_peer) {
+                        if util::is_region_epoch_equal(from_epoch, epoch) {
+                            if !trimmed {
+                                info!(
+                                    self.logger,
+                                    "cancel merge because source peer is not trimmed";
+                                    "region_id" => from_region,
+                                    "peer_id" => from_peer,
+                                );
+                                self.take_merge_context();
+                                return;
+                            } else {
+                                pending_peers.remove(&from_peer);
+                            }
+                        }
+                    }
+                    if pending_peers.is_empty() {
+                        let mailbox = match store_ctx.router.mailbox(region_id) {
+                            Some(mailbox) => mailbox,
+                            None => {
+                                assert!(
+                                    store_ctx.router.is_shutdown(),
+                                    "{} router should have been closed",
+                                    SlogFormat(&self.logger)
+                                );
+                                return;
+                            }
+                        };
+                        let mut req = req.take().unwrap();
+                        req.mut_header()
+                            .set_flags(WriteBatchFlags::PRE_FLUSH_FINISHED.bits());
+                        let logger = self.logger.clone();
+                        let on_flush_finish = move || {
+                            let (ch, _) = CmdResChannel::pair();
+                            if let Err(e) =
+                                mailbox.force_send(PeerMsg::AdminCommand(RaftRequest::new(req, ch)))
+                            {
+                                error!(
+                                    logger,
+                                    "send PrepareMerge request failed after pre-flush finished";
+                                    "err" => ?e,
+                                );
+                                // We rely on
+                                // `maybe_clean_up_stale_merge_context` to
+                                // clean this up.
+                            }
+                        };
+                        self.start_pre_flush(
+                            store_ctx,
+                            "prepare_merge",
+                            false,
+                            &self.region().clone(),
+                            Box::new(on_flush_finish),
+                        );
+                    }
                 }
-            }
-            if pending_peers.is_empty() {
-                let mailbox = match store_ctx.router.mailbox(region_id) {
-                    Some(mailbox) => mailbox,
-                    None => {
-                        assert!(
-                            store_ctx.router.is_shutdown(),
-                            "{} router should have been closed",
-                            SlogFormat(&self.logger)
-                        );
-                        return;
-                    }
-                };
-                let mut req = req.take().unwrap();
-                req.mut_header().set_flags(WriteBatchFlags::PRE_FLUSH_FINISHED.bits());
-                let logger = self.logger.clone();
-                let on_flush_finish = move || {
-                    let (ch, _) = CmdResChannel::pair();
-                    if let Err(e) = mailbox.force_send(PeerMsg::AdminCommand(RaftRequest::new(req, ch))) {
-                        error!(
-                            logger,
-                            "send PrepareMerge request failed after pre-flush finished";
-                            "err" => ?e,
-                        );
-                        // We rely on `maybe_clean_up_stale_merge_context` to clean this up.
-                    }
-                };
-                self.start_pre_flush(
-                    store_ctx,
-                    "prepare_merge",
-                    false,
-                    &self.region().clone(),
-                    Box::new(on_flush_finish),
-                );
             }
         }
     }
@@ -616,16 +607,15 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         // `propose_prepare_merge`.
         // If the req is still inflight and reaches `propose_prepare_merge` later,
         // `already_checked_trim_status` will restore the status.
-        if let Some(PrepareStatus::WaitForTrimStatus {
-            start_time, ..
-        }) = self
+        if let Some(PrepareStatus::WaitForTrimStatus { start_time, .. }) = self
             .merge_context()
             .as_ref()
             .and_then(|c| c.prepare_status.as_ref())
-            && start_time.saturating_elapsed() > TRIM_CHECK_TIMEOUT
         {
-            info!(self.logger, "cancel merge because trim check timed out");
-            self.take_merge_context();
+            if start_time.saturating_elapsed() > TRIM_CHECK_TIMEOUT {
+                info!(self.logger, "cancel merge because trim check timed out");
+                self.take_merge_context();
+            }
         }
     }
 
@@ -708,6 +698,25 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         );
         self.propose(store_ctx, cmd.write_to_bytes().unwrap())?;
         Ok(())
+    }
+
+    pub fn post_prepare_merge_fail(&mut self) {
+        // Match v1::post_propose_fail.
+        // If we just failed to propose PrepareMerge, the pessimistic locks status
+        // may become MergingRegion incorrectly. So, we have to revert it here.
+        // Note: The `is_merging` check from v1 is removed because proposed
+        // `PrepareMerge` rejects all writes (in `ProposalControl::check_conflict`).
+        assert!(
+            !self.proposal_control().is_merging(),
+            "{}",
+            SlogFormat(&self.logger)
+        );
+        self.take_merge_context();
+        self.proposal_control_mut().set_pending_prepare_merge(false);
+        let mut pessimistic_locks = self.txn_context().ext().pessimistic_locks.write();
+        if pessimistic_locks.status == LocksStatus::MergingRegion {
+            pessimistic_locks.status = LocksStatus::Normal;
+        }
     }
 }
 
@@ -814,6 +823,8 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         store_ctx: &mut StoreContext<EK, ER, T>,
         res: PrepareMergeResult,
     ) {
+        fail::fail_point!("on_apply_res_prepare_merge");
+
         let region = res.region_state.get_region().clone();
         {
             let mut meta = store_ctx.store_meta.lock().unwrap();

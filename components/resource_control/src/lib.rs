@@ -1,21 +1,18 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 #![feature(test)]
-#![feature(local_key_cell_methods)]
 
 use std::sync::Arc;
 
-use online_config::OnlineConfig;
 use pd_client::RpcClient;
-use serde::{Deserialize, Serialize};
 
 mod resource_group;
 pub use resource_group::{
-    ResourceConsumeType, ResourceController, ResourceGroupManager, TaskMetadata,
-    MIN_PRIORITY_UPDATE_INTERVAL,
+    MIN_PRIORITY_UPDATE_INTERVAL, ResourceConsumeType, ResourceController, ResourceGroupManager,
 };
+pub use tikv_util::resource_control::*;
 
 mod future;
-pub use future::{with_resource_limiter, ControlledFuture};
+pub use future::{ControlledFuture, with_resource_limiter};
 
 #[cfg(test)]
 extern crate test;
@@ -26,27 +23,15 @@ pub use service::ResourceManagerService;
 pub mod channel;
 pub use channel::ResourceMetered;
 
+pub mod config;
+
 mod resource_limiter;
 pub use resource_limiter::ResourceLimiter;
 use tikv_util::worker::Worker;
-use worker::{GroupQuotaAdjustWorker, BACKGROUND_LIMIT_ADJUST_DURATION};
+use worker::{BACKGROUND_LIMIT_ADJUST_DURATION, GroupQuotaAdjustWorker};
 
 mod metrics;
 pub mod worker;
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
-#[serde(default)]
-#[serde(rename_all = "kebab-case")]
-pub struct Config {
-    #[online_config(skip)]
-    pub enabled: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
 
 pub fn start_periodic_tasks(
     mgr: &Arc<ResourceGroupManager>,
@@ -66,10 +51,15 @@ pub fn start_periodic_tasks(
     bg_worker.spawn_async_task(async move {
         resource_mgr_service_clone.watch_resource_groups().await;
     });
-    // spawn a task to auto adjust background quota limiter.
+    // spawn a task to auto adjust background quota limiter and priority quota
+    // limiter.
     let mut worker = GroupQuotaAdjustWorker::new(mgr.clone(), io_bandwidth);
+    // We disable the priority worker by default because the current adjust
+    // algorithm is buggy. We may reenable it only we find a better algorithm.
+    // let mut priority_worker = PriorityLimiterAdjustWorker::new(mgr.clone());
     bg_worker.spawn_interval_task(BACKGROUND_LIMIT_ADJUST_DURATION, move || {
         worker.adjust_quota();
+        // priority_worker.adjust();
     });
     // spawn a task to periodically upload resource usage statistics to PD.
     bg_worker.spawn_async_task(async move {

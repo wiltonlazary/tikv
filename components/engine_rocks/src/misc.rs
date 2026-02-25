@@ -5,16 +5,18 @@ use engine_traits::{
     Range, RangeStats, Result, SstWriter, SstWriterBuilder, WriteBatch, WriteBatchExt,
     WriteOptions,
 };
+use fail::fail_point;
 use rocksdb::{FlushOptions, Range as RocksRange};
 use tikv_util::{box_try, keybuilder::KeyBuilder};
 
 use crate::{
+    RocksSstWriter,
     engine::RocksEngine,
     r2e,
     rocks_metrics::{RocksStatisticsReporter, STORE_ENGINE_EVENT_COUNTER_VEC},
     rocks_metrics_defs::*,
     sst::RocksSstWriterBuilder,
-    util, RocksSstWriter,
+    util,
 };
 
 pub const MAX_DELETE_COUNT_BY_KEY: usize = 2048;
@@ -32,6 +34,7 @@ impl RocksEngine {
         cf: &str,
         sst_path: String,
         ranges: &[Range<'_>],
+        allow_write_during_ingestion: bool,
     ) -> Result<bool> {
         let mut written = false;
         let mut ranges = ranges.to_owned();
@@ -40,13 +43,13 @@ impl RocksEngine {
         let mut writer_wrapper: Option<RocksSstWriter> = None;
         let mut data: Vec<Vec<u8>> = vec![];
         let mut last_end_key: Option<Vec<u8>> = None;
-        for r in ranges {
+        for r in &ranges {
             // There may be a range overlap with next range
             if last_end_key
                 .as_ref()
-                .map_or(false, |key| key.as_slice() > r.start_key)
+                .is_some_and(|key| key.as_slice() > r.start_key)
             {
-                written |= self.delete_all_in_range_cf_by_key(wopts, cf, &r)?;
+                written |= self.delete_all_in_range_cf_by_key(wopts, cf, r)?;
                 continue;
             }
             last_end_key = Some(r.end_key.to_owned());
@@ -72,7 +75,11 @@ impl RocksEngine {
                 } else {
                     data.push(it.key().to_vec());
                 }
-                if data.len() > MAX_DELETE_COUNT_BY_KEY {
+                let max_delete_count_by_key = (|| {
+                    fail_point!("manually_set_max_delete_count_by_key", |_| { 0 });
+                    MAX_DELETE_COUNT_BY_KEY
+                })();
+                if data.len() > max_delete_count_by_key {
                     let builder = RocksSstWriterBuilder::new().set_db(self).set_cf(cf);
                     let mut writer = builder.build(sst_path.as_str())?;
                     for key in data.iter() {
@@ -87,7 +94,29 @@ impl RocksEngine {
 
         if let Some(writer) = writer_wrapper {
             writer.finish()?;
-            self.ingest_external_file_cf(cf, &[sst_path.as_str()])?;
+            let (min_start_key, max_end_key) = ranges.iter().fold(
+                (ranges[0].start_key, ranges[0].end_key),
+                |(min_start, max_end), range| {
+                    (
+                        std::cmp::min(min_start, range.start_key),
+                        std::cmp::max(max_end, range.end_key),
+                    )
+                },
+            );
+            let range_to_lock = if allow_write_during_ingestion {
+                Some(Range {
+                    start_key: min_start_key,
+                    end_key: max_end_key,
+                })
+            } else {
+                None
+            };
+            self.ingest_external_file_cf(
+                cf,
+                &[sst_path.as_str()],
+                range_to_lock,
+                allow_write_during_ingestion,
+            )?;
         } else {
             let mut wb = self.write_batch();
             for key in data.iter() {
@@ -188,17 +217,14 @@ impl MiscExt for RocksEngine {
                     .map(|(_, time)| (handle, time))
             })
             .min_by(|(_, a), (_, b)| a.cmp(b))
-            && age_threshold.map_or(true, |threshold| time <= threshold)
+            && age_threshold.is_none_or(|threshold| time <= threshold)
         {
             let mut fopts = FlushOptions::default();
             fopts.set_wait(wait);
             fopts.set_allow_write_stall(true);
             fopts.set_check_if_compaction_disabled(true);
             fopts.set_expected_oldest_key_time(time);
-            self
-                .as_inner()
-                .flush_cf(handle, &fopts)
-                .map_err(r2e)?;
+            self.as_inner().flush_cf(handle, &fopts).map_err(r2e)?;
             return Ok(true);
         }
         Ok(false)
@@ -269,8 +295,17 @@ impl MiscExt for RocksEngine {
                     written |= self.delete_all_in_range_cf_by_key(wopts, cf, r)?;
                 }
             }
-            DeleteStrategy::DeleteByWriter { sst_path } => {
-                written |= self.delete_all_in_range_cf_by_ingest(wopts, cf, sst_path, ranges)?;
+            DeleteStrategy::DeleteByWriter {
+                sst_path,
+                allow_write_during_ingestion,
+            } => {
+                written |= self.delete_all_in_range_cf_by_ingest(
+                    wopts,
+                    cf,
+                    sst_path,
+                    ranges,
+                    allow_write_during_ingestion,
+                )?;
             }
         }
         Ok(written)
@@ -284,7 +319,10 @@ impl MiscExt for RocksEngine {
             .get_approximate_memtable_stats_cf(handle, &range))
     }
 
-    fn ingest_maybe_slowdown_writes(&self, cf: &str) -> Result<bool> {
+    // Checks if ingesting additional SSTs might trigger write slowdown, based
+    // on a conservative estimate of the L0 file count after ingesting the SSTs
+    // that are already inflight for ingestion.
+    fn ingest_maybe_slowdown_writes(&self, cf: &str, inflight_ingest_cnt: u64) -> Result<bool> {
         let handle = util::get_cf_handle(self.as_inner(), cf)?;
         if let Some(n) = util::get_cf_num_files_at_level(self.as_inner(), handle, 0) {
             let options = self.as_inner().get_options_cf(handle);
@@ -292,29 +330,14 @@ impl MiscExt for RocksEngine {
             let compaction_trigger = options.get_level_zero_file_num_compaction_trigger() as u64;
             // Leave enough buffer to tolerate heavy write workload,
             // which may flush some memtables in a short time.
-            if n > u64::from(slowdown_trigger) / 2 && n >= compaction_trigger {
+            let worse_case_l0_file_count = n + inflight_ingest_cnt;
+            if worse_case_l0_file_count > u64::from(slowdown_trigger) / 2
+                && worse_case_l0_file_count >= compaction_trigger
+            {
                 return Ok(true);
             }
         }
         Ok(false)
-    }
-
-    fn get_sst_key_ranges(&self, cf: &str, level: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let handle = util::get_cf_handle(self.as_inner(), cf)?;
-        let ret = self
-            .as_inner()
-            .get_column_family_meta_data(handle)
-            .get_level(level)
-            .get_files()
-            .iter()
-            .map(|sst_meta| {
-                (
-                    sst_meta.get_smallestkey().to_vec(),
-                    sst_meta.get_largestkey().to_vec(),
-                )
-            })
-            .collect();
-        Ok(ret)
     }
 
     fn get_engine_used_size(&self) -> Result<u64> {
@@ -334,16 +357,38 @@ impl MiscExt for RocksEngine {
         self.as_inner().sync_wal().map_err(r2e)
     }
 
+    /// Disables all manual compaction operations.
+    ///
+    /// After calling this function:
+    /// - All incoming manual compaction requests will be rejected
+    /// - All pending manual compaction jobs will not be executed
+    /// - All in-progress manual compaction jobs will be stopped
+    ///
+    /// This function should only be used during shutdown to ensure clean
+    /// termination.
+    fn disable_manual_compaction(&self) -> Result<()> {
+        self.as_inner().disable_manual_compaction(true);
+        Ok(())
+    }
+
+    fn enable_manual_compaction(&self) -> Result<()> {
+        self.as_inner().enable_manual_compaction();
+        Ok(())
+    }
+
     fn pause_background_work(&self) -> Result<()> {
         // This will make manual compaction return error instead of waiting. In practice
         // we might want to identify this case by parsing error message.
-        self.as_inner().disable_manual_compaction();
+        // WARNING: Setting global manual compaction canceled to false when multiple DB
+        // instances exist, as it affects the global state shared across all instances.
+        // This could lead to unexpected behavior in other instances.
+        self.as_inner().disable_manual_compaction(false);
         self.as_inner().pause_bg_work();
         Ok(())
     }
 
     fn continue_background_work(&self) -> Result<()> {
-        self.as_inner().enable_manual_compaction();
+        self.enable_manual_compaction()?;
         self.as_inner().continue_bg_work();
         Ok(())
     }
@@ -448,21 +493,25 @@ impl MiscExt for RocksEngine {
             .get();
         Ok(n)
     }
+
+    type DiskEngine = RocksEngine;
+    fn get_disk_engine(&self) -> &Self::DiskEngine {
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use engine_traits::{
-        CompactExt, DeleteStrategy, Iterable, Iterator, Mutable, SyncMutable, WriteBatchExt,
-        ALL_CFS,
+        ALL_CFS, DeleteStrategy, Iterable, Iterator, Mutable, SyncMutable, WriteBatchExt,
     };
     use tempfile::Builder;
 
     use super::*;
     use crate::{
+        RocksCfOptions, RocksDbOptions,
         engine::RocksEngine,
         util::{new_engine, new_engine_opt},
-        RocksCfOptions, RocksDbOptions,
     };
 
     fn check_data(db: &RocksEngine, cfs: &[&str], expected: &[(&[u8], &[u8])]) {
@@ -499,7 +548,7 @@ mod tests {
             .collect();
 
         let mut kvs: Vec<(&[u8], &[u8])> = vec![];
-        for (_, key) in keys.iter().enumerate() {
+        for key in keys.iter() {
             kvs.push((key.as_slice(), b"value"));
         }
         for &(k, v) in kvs.as_slice() {
@@ -603,7 +652,10 @@ mod tests {
             data.push(i.to_string().as_bytes().to_vec());
         }
         test_delete_ranges(
-            DeleteStrategy::DeleteByWriter { sst_path },
+            DeleteStrategy::DeleteByWriter {
+                sst_path,
+                allow_write_during_ingestion: false,
+            },
             &data,
             &[
                 Range::new(&data[2], &data[499]),
@@ -711,72 +763,6 @@ mod tests {
         )
         .unwrap();
         check_data(&db, &[cf], kvs_left.as_slice());
-    }
-
-    #[test]
-    fn test_get_sst_key_ranges() {
-        let path = Builder::new()
-            .prefix("test_get_sst_key_ranges")
-            .tempdir()
-            .unwrap();
-        let path_str = path.path().to_str().unwrap();
-
-        let mut opts = RocksDbOptions::default();
-        opts.create_if_missing(true);
-        opts.enable_multi_batch_write(true);
-
-        let mut cf_opts = RocksCfOptions::default();
-        // Prefix extractor(trim the timestamp at tail) for write cf.
-        cf_opts
-            .set_prefix_extractor(
-                "FixedSuffixSliceTransform",
-                crate::util::FixedSuffixSliceTransform::new(8),
-            )
-            .unwrap_or_else(|err| panic!("{:?}", err));
-        // Create prefix bloom filter for memtable.
-        cf_opts.set_memtable_prefix_bloom_size_ratio(0.1_f64);
-        let cf = "default";
-        let db = new_engine_opt(path_str, opts, vec![(cf, cf_opts)]).unwrap();
-        let mut wb = db.write_batch();
-        let kvs: Vec<(&[u8], &[u8])> = vec![
-            (b"k1", b"v1"),
-            (b"k2", b"v2"),
-            (b"k6", b"v3"),
-            (b"k7", b"v4"),
-        ];
-
-        for &(k, v) in kvs.as_slice() {
-            wb.put_cf(cf, k, v).unwrap();
-        }
-        wb.write().unwrap();
-
-        db.flush_cf(cf, true).unwrap();
-        let sst_range = db.get_sst_key_ranges(cf, 0).unwrap();
-        let expected = vec![(b"k1".to_vec(), b"k7".to_vec())];
-        assert_eq!(sst_range, expected);
-
-        let mut wb = db.write_batch();
-        let kvs: Vec<(&[u8], &[u8])> = vec![(b"k3", b"v1"), (b"k4", b"v2"), (b"k8", b"v3")];
-
-        for &(k, v) in kvs.as_slice() {
-            wb.put_cf(cf, k, v).unwrap();
-        }
-        wb.write().unwrap();
-
-        db.flush_cf(cf, true).unwrap();
-        let sst_range = db.get_sst_key_ranges(cf, 0).unwrap();
-        let expected = vec![
-            (b"k3".to_vec(), b"k8".to_vec()),
-            (b"k1".to_vec(), b"k7".to_vec()),
-        ];
-        assert_eq!(sst_range, expected);
-
-        db.compact_range_cf(cf, None, None, false, 1).unwrap();
-        let sst_range = db.get_sst_key_ranges(cf, 0).unwrap();
-        assert_eq!(sst_range.len(), 0);
-        let sst_range = db.get_sst_key_ranges(cf, 1).unwrap();
-        let expected = vec![(b"k1".to_vec(), b"k8".to_vec())];
-        assert_eq!(sst_range, expected);
     }
 
     #[test]

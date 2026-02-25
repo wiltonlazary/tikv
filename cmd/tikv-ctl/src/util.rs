@@ -1,19 +1,25 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{borrow::ToOwned, error::Error, str, str::FromStr, u64};
+use std::{borrow::ToOwned, error::Error, str, str::FromStr};
 
 use kvproto::kvrpcpb::KeyRange;
 use server::setup::initial_logger;
 use tikv::config::TikvConfig;
+use tikv_util::config::LogFormat;
 
 const LOG_DIR: &str = "./ctl-engine-info-log";
 
 #[allow(clippy::field_reassign_with_default)]
-pub fn init_ctl_logger(level: &str) {
+pub fn init_ctl_logger(level: &str, format: &str) {
     let mut cfg = TikvConfig::default();
     cfg.log.level = slog::Level::from_str(level).unwrap().into();
     cfg.rocksdb.info_log_dir = LOG_DIR.to_owned();
     cfg.raftdb.info_log_dir = LOG_DIR.to_owned();
+    cfg.log.format = match format {
+        "json" => LogFormat::Json,
+        "text" => LogFormat::Text,
+        fmt => panic!("unknown log format {}", fmt),
+    };
     initial_logger(&cfg);
 }
 
@@ -44,7 +50,7 @@ pub fn convert_gbmb(mut bytes: u64) -> String {
     if bytes < MIB {
         return format!("{}B", bytes);
     }
-    let mb = if bytes % GIB == 0 {
+    let mb = if bytes.is_multiple_of(GIB) {
         String::from("")
     } else {
         format!("{:.3}MiB", (bytes % GIB) as f64 / MIB as f64)

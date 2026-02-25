@@ -6,8 +6,8 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -21,22 +21,23 @@ use futures::{
 use kvproto::{deadlock::WaitForEntry, metapb::RegionEpoch};
 use tikv_util::{
     config::ReadableDuration,
-    time::{duration_to_sec, InstantExt},
+    time::{InstantExt, duration_to_sec},
     timer::GLOBAL_TIMER_HANDLE,
     worker::{FutureRunnable, FutureScheduler, Stopped},
 };
 use tokio::task::spawn_local;
 use tracker::GLOBAL_TRACKERS;
+use txn_types::LockInfoExt;
 
 use super::{config::Config, deadlock::Scheduler as DetectorScheduler, metrics::*};
 use crate::storage::{
+    Error as StorageError, ErrorInner as StorageErrorInner,
     lock_manager::{
         CancellationCallback, DiagnosticContext, KeyLockWaitInfo, LockDigest, LockWaitToken,
         UpdateWaitForEvent, WaitTimeout,
     },
     mvcc::{Error as MvccError, ErrorInner as MvccErrorInner, TimeStamp},
     txn::Error as TxnError,
-    Error as StorageError, ErrorInner as StorageErrorInner,
 };
 
 struct DelayInner {
@@ -357,7 +358,19 @@ impl WaitTable {
 
         assert_eq!(waiter.wait_info.key, update_event.wait_info.key);
 
-        if waiter.wait_info.lock_digest.ts == update_event.wait_info.lock_digest.ts {
+        // NOTE: `maybe_shared_lock_shrink` should be false currently. Because
+        // update_waiter is only triggered by UpdateWaitForEvent from
+        // LockWaitQueues::update_lock_wait, which is fed by `new_acquired_locks`.
+        // Shared-lock shrink (e.g. rollback/commit removing a sub-lock) writes
+        // SharedLocks with `is_new = false`, so it doesn't enter `new_locks`
+        // and thus won't emit update_wait_for events. However, if the production
+        // pipeline starts reporting shared-lock updates in the future, we should update
+        // the waiter even when the ts is unchanged.
+        let maybe_shared_lock_shrink = waiter.wait_info.lock_info.is_shared_lock()
+            && update_event.wait_info.lock_info.is_shared_lock();
+        if !maybe_shared_lock_shrink
+            && waiter.wait_info.lock_digest.ts == update_event.wait_info.lock_digest.ts
+        {
             // Unchanged.
             return None;
         }
@@ -555,10 +568,12 @@ impl WaiterManager {
             }
 
             if let Some((previous_wait_info, diag_ctx)) = previous_wait_info {
-                self.detector_scheduler
-                    .clean_up_wait_for(event.start_ts, previous_wait_info);
-                self.detector_scheduler
-                    .detect(event.start_ts, event.wait_info, diag_ctx);
+                if previous_wait_info.allow_lock_with_conflict {
+                    self.detector_scheduler
+                        .clean_up_wait_for(event.start_ts, previous_wait_info);
+                    self.detector_scheduler
+                        .detect(event.start_ts, event.wait_info, diag_ctx);
+                }
             }
         }
     }
@@ -580,6 +595,13 @@ impl WaiterManager {
             .borrow_mut()
             .take_waiter_by_lock_digest(lock, waiter_ts);
         if let Some(waiter) = waiter {
+            if waiter.wait_info.lock_info.is_shared_lock() {
+                // When deadlock detected on a shared lock, some wait-for entries might have
+                // been registered to the detect table. So do clean up here to avoid those
+                // entries causing false-positive deadlock errors.
+                self.detector_scheduler
+                    .clean_up_wait_for(waiter_ts, waiter.wait_info.clone());
+            }
             waiter.cancel_for_deadlock(lock, key, deadlock_key_hash, wait_chain);
         }
     }
@@ -678,6 +700,7 @@ pub mod tests {
                 key: Key::from_raw(b""),
                 lock_digest: LockDigest { ts: lock_ts, hash },
                 lock_info: Default::default(),
+                allow_lock_with_conflict: false,
             },
             cancel_callback: Box::new(|_| ()),
             diag_ctx: DiagnosticContext::default(),
@@ -798,6 +821,7 @@ pub mod tests {
                 key: Key::from_raw(&raw_key),
                 lock_digest: lock,
                 lock_info: info.clone(),
+                allow_lock_with_conflict: false,
             },
             cb,
             Instant::now() + Duration::from_millis(3000),
@@ -1202,6 +1226,7 @@ pub mod tests {
                     key: key.to_raw().unwrap(),
                     ..Default::default()
                 },
+                allow_lock_with_conflict: false,
             },
         };
         scheduler.update_wait_for(vec![event]);

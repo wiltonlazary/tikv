@@ -1,12 +1,13 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{assert_matches::assert_matches, time::Duration};
+use std::time::Duration;
 
 use engine_traits::{
-    CompactExt, DbOptionsExt, MiscExt, Peekable, RaftEngineReadOnly, CF_DEFAULT, CF_RAFT, CF_WRITE,
+    CF_DEFAULT, CF_RAFT, CF_WRITE, CompactExt, DbOptionsExt, ManualCompactionOptions, MiscExt,
+    Peekable, RaftEngineReadOnly,
 };
 use futures::executor::block_on;
-use raftstore_v2::{router::PeerMsg, SimpleWriteEncoder};
+use raftstore_v2::{SimpleWriteEncoder, router::PeerMsg};
 
 use crate::cluster::Cluster;
 
@@ -56,7 +57,7 @@ fn test_write_batch_rollback() {
     assert!(!resp.get_header().has_error(), "{:?}", resp);
 
     let snap = router.stale_snapshot(2);
-    assert_matches!(snap.get_value(b"key"), Ok(None));
+    assert!(matches!(snap.get_value(b"key"), Ok(None)));
     assert_eq!(snap.get_value(b"key1").unwrap().unwrap(), b"value");
 
     fail::cfg("APPLY_COMMITTED_ENTRIES", "pause").unwrap();
@@ -92,7 +93,7 @@ fn test_write_batch_rollback() {
     let resp = block_on(sub1.result()).unwrap();
     assert!(!resp.get_header().has_error(), "{:?}", resp);
     let snap = router.stale_snapshot(2);
-    assert_matches!(snap.get_value(b"key2"), Ok(None));
+    assert!(matches!(snap.get_value(b"key2"), Ok(None)));
     assert_eq!(snap.get_value(b"key3").unwrap().unwrap(), b"value");
 }
 
@@ -200,7 +201,12 @@ fn test_delete_range_does_not_block_flushed_index() {
     cached
         .latest()
         .unwrap()
-        .compact_range_cf(CF_DEFAULT, Some(b"A"), Some(b"{"), false, 1)
+        .compact_range_cf(
+            CF_DEFAULT,
+            Some(b"A"),
+            Some(b"{"),
+            ManualCompactionOptions::new(false, 1, false),
+        )
         .unwrap();
     // delete range by files.
     let header = Box::new(router.new_request_for(2).take_header());

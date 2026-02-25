@@ -4,16 +4,15 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     fmt,
-    sync::{atomic::*, mpsc, Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::*, mpsc},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_channel::SendError;
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
-use engine_traits::{name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, SstCompressionType};
-use external_storage::{BackendConfig, HdfsConfig};
-use external_storage_export::{create_storage, ExternalStorage};
+use engine_traits::{CfName, KvEngine, SstCompressionType, name_to_cf, raw_ttl::ttl_current_ts};
+use external_storage::{BackendConfig, ExternalStorage, HdfsConfig, create_storage};
 use futures::{channel::mpsc::*, executor::block_on};
 use kvproto::{
     brpb::*,
@@ -24,35 +23,38 @@ use kvproto::{
 use online_config::OnlineConfig;
 use raft::StateRole;
 use raftstore::coprocessor::RegionInfoProvider;
-use resource_control::{with_resource_limiter, ResourceGroupManager, ResourceLimiter};
+use resource_control::{ResourceGroupManager, ResourceLimiter, with_resource_limiter};
 use tikv::{
     config::BackupConfig,
     storage::{
+        Snapshot, Statistics,
         kv::{CursorBuilder, Engine, LocalTablets, ScanMode, SnapContext},
         mvcc::Error as MvccError,
         raw::raw_mvcc::RawMvccSnapshot,
         txn::{EntryBatch, Error as TxnError, SnapshotStore, TxnEntryScanner, TxnEntryStore},
-        Snapshot, Statistics,
     },
 };
 use tikv_util::{
     box_err, debug, error, error_unknown,
     future::RescheduleChecker,
     impl_display_as_debug, info,
+    resizable_threadpool::ResizableRuntime,
     store::find_peer,
+    thread_name_prefix::{BACKUP_IO_THREAD, BACKUP_WORKER_THREAD},
     time::{Instant, Limiter},
     warn,
     worker::Runnable,
 };
-use tokio::runtime::Runtime;
-use txn_types::{Key, Lock, TimeStamp};
+use tokio::runtime::{Handle, Runtime};
+use txn_types::{Key, TimeStamp, TsSet};
 
 use crate::{
+    Error,
     metrics::*,
     softlimit::{CpuStatistics, SoftLimit, SoftLimitByCpu},
-    utils::{ControlThreadPool, KeyValueCodec},
+    utils::KeyValueCodec,
     writer::{BackupWriterBuilder, CfNameWrap},
-    Error, *,
+    *,
 };
 
 const BACKUP_BATCH_LIMIT: usize = 1024;
@@ -66,7 +68,9 @@ struct Request {
     sub_ranges: Vec<KeyRange>,
     start_ts: TimeStamp,
     end_ts: TimeStamp,
-    limiter: Limiter,
+    // cloning on Limiter will share the same underlying token bucket thus can be used as
+    // a global rate limiter
+    rate_limiter: Limiter,
     backend: StorageBackend,
     cancel: Arc<AtomicBool>,
     is_raw_kv: bool,
@@ -78,6 +82,8 @@ struct Request {
     replica_read: bool,
     resource_group_name: String,
     source_tag: String,
+    bypass_locks: Vec<u64>,
+    access_locks: Vec<u64>,
 }
 
 /// Backup Task.
@@ -113,9 +119,9 @@ impl Task {
     ) -> Result<(Task, Arc<AtomicBool>)> {
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let speed_limit = req.get_rate_limit();
-        let limiter = Limiter::new(if speed_limit > 0 {
-            speed_limit as f64
+        let rate_limit = req.get_rate_limit();
+        let rate_limiter = Limiter::new(if rate_limit > 0 {
+            rate_limit as f64
         } else {
             f64::INFINITY
         });
@@ -135,7 +141,7 @@ impl Task {
                 start_ts: req.get_start_version().into(),
                 end_ts: req.get_end_version().into(),
                 backend: req.get_storage_backend().clone(),
-                limiter,
+                rate_limiter,
                 cancel: cancel.clone(),
                 is_raw_kv: req.get_is_raw_kv(),
                 dst_api_ver: req.get_dst_api_version(),
@@ -149,6 +155,8 @@ impl Task {
                     .get_resource_group_name()
                     .to_owned(),
                 source_tag,
+                bypass_locks: req.get_context().get_resolved_locks().to_owned(),
+                access_locks: req.get_context().get_committed_locks().to_owned(),
                 cipher: req.cipher_info.unwrap_or_else(|| {
                     let mut cipher = CipherInfo::default();
                     cipher.set_cipher_type(EncryptionMethod::Plaintext);
@@ -217,7 +225,7 @@ struct InMemBackupFiles<EK: KvEngine> {
     start_version: TimeStamp,
     end_version: TimeStamp,
     region: Region,
-    limiter: Option<Arc<ResourceLimiter>>,
+    resource_limiter: Option<Arc<ResourceLimiter>>,
 }
 
 async fn save_backup_file_worker<EK: KvEngine>(
@@ -228,7 +236,9 @@ async fn save_backup_file_worker<EK: KvEngine>(
 ) {
     while let Ok(msg) = rx.recv().await {
         let files = if msg.files.need_flush_keys() {
-            match with_resource_limiter(msg.files.save(&storage), msg.limiter.clone()).await {
+            match with_resource_limiter(msg.files.save(&storage), msg.resource_limiter.clone())
+                .await
+            {
                 Ok(mut split_files) => {
                     let mut has_err = false;
                     for file in split_files.iter_mut() {
@@ -316,6 +326,8 @@ impl BackupRange {
         concurrency_manager: ConcurrencyManager,
         backup_ts: TimeStamp,
         begin_ts: TimeStamp,
+        bypass_locks: Vec<u64>,
+        access_locks: Vec<u64>,
         saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
         storage_name: &str,
         resource_limiter: Option<Arc<ResourceLimiter>>,
@@ -346,14 +358,16 @@ impl BackupRange {
             snap_ctx.key_ranges = vec![key_range];
         } else {
             // Update max_ts and check the in-memory lock table before getting the snapshot
-            concurrency_manager.update_max_ts(backup_ts);
+            concurrency_manager
+                .update_max_ts(backup_ts, "backup_range")
+                .map_err(TxnError::from)?;
             concurrency_manager
                 .read_range_check(
                     self.start_key.as_ref(),
                     self.end_key.as_ref(),
                     |key, lock| {
-                        Lock::check_ts_conflict(
-                            Cow::Borrowed(lock),
+                        txn_types::check_ts_conflict(
+                            Cow::Owned(tikv_util::Either::Left(lock.clone())),
                             key,
                             backup_ts,
                             &Default::default(),
@@ -369,20 +383,21 @@ impl BackupRange {
         let snapshot = match engine.snapshot(snap_ctx) {
             Ok(s) => s,
             Err(e) => {
-                error!(?e; "backup snapshot failed");
+                warn!("backup snapshot failed"; "err" => ?e, "ctx" => ?ctx);
                 return Err(e.into());
             }
         };
         BACKUP_RANGE_HISTOGRAM_VEC
             .with_label_values(&["snapshot"])
             .observe(start_snapshot.saturating_elapsed().as_secs_f64());
+
         let snap_store = SnapshotStore::new(
             snapshot,
             backup_ts,
             IsolationLevel::Si,
             false, // fill_cache
-            Default::default(),
-            Default::default(),
+            TsSet::vec_from_u64s(bypass_locks),
+            TsSet::vec_from_u64s(access_locks),
             false,
         );
         let start_key = self.start_key.clone();
@@ -404,7 +419,7 @@ impl BackupRange {
             RescheduleChecker::new(tokio::task::yield_now, TASK_YIELD_DURATION);
         loop {
             if let Err(e) = scanner.scan_entries(&mut batch) {
-                error!(?e; "backup scan entries failed");
+                warn!("backup scan entries failed"; "err" => ?e, "ctx" => ?ctx);
                 return Err(e.into());
             };
             if batch.is_empty() {
@@ -414,7 +429,7 @@ impl BackupRange {
 
             let entries = batch.drain();
             if writer.need_split_keys() {
-                let this_end_key = entries.as_slice().get(0).map_or_else(
+                let this_end_key = entries.as_slice().first().map_or_else(
                     || Err(Error::Other(box_err!("get entry error: nothing in batch"))),
                     |x| {
                         x.to_key().map(|k| k.into_raw().unwrap()).map_err(|e| {
@@ -431,7 +446,7 @@ impl BackupRange {
                     start_version: begin_ts,
                     end_version: backup_ts,
                     region: self.region.clone(),
-                    limiter: resource_limiter.clone(),
+                    resource_limiter: resource_limiter.clone(),
                 };
                 send_to_worker_with_metrics(&saver, msg).await?;
                 next_file_start_key = this_end_key;
@@ -445,7 +460,7 @@ impl BackupRange {
 
             // Build sst files.
             if let Err(e) = writer.write(entries, true) {
-                error_unknown!(?e; "backup build sst failed");
+                warn!("backup build sst failed"; "err" => ?e, "ctx" => ?ctx);
                 return Err(e);
             }
             if resource_limiter.is_some() {
@@ -478,7 +493,7 @@ impl BackupRange {
             start_version: begin_ts,
             end_version: backup_ts,
             region: self.region.clone(),
-            limiter: resource_limiter.clone(),
+            resource_limiter: resource_limiter.clone(),
         };
         send_to_worker_with_metrics(&saver, msg).await?;
 
@@ -550,7 +565,7 @@ impl BackupRange {
         &self,
         mut engine: E,
         db: E::Local,
-        limiter: &Limiter,
+        rate_limiter: &Limiter,
         file_name: String,
         cf: CfNameWrap,
         compression_type: Option<SstCompressionType>,
@@ -562,7 +577,7 @@ impl BackupRange {
             db,
             &file_name,
             cf,
-            limiter.clone(),
+            rate_limiter.clone(),
             compression_type,
             compression_level,
             cipher,
@@ -570,7 +585,7 @@ impl BackupRange {
         ) {
             Ok(w) => w,
             Err(e) => {
-                error_unknown!(?e; "backup writer failed");
+                warn!("backup writer failed"; "err" => ?e, "region" => ?self.region);
                 return Err(e);
             }
         };
@@ -587,7 +602,7 @@ impl BackupRange {
         let engine_snapshot = match engine.snapshot(snap_ctx) {
             Ok(s) => s,
             Err(e) => {
-                error!(?e; "backup raw kv snapshot failed");
+                warn!("backup raw kv snapshot failed"; "err" => ?e, "ctx" => ?ctx);
                 return Err(e.into());
             }
         };
@@ -612,7 +627,7 @@ impl BackupRange {
             start_version: TimeStamp::zero(),
             end_version: TimeStamp::zero(),
             region: self.region.clone(),
-            limiter: None,
+            resource_limiter: None,
         };
         send_to_worker_with_metrics(&saver_tx, msg).await?;
         Ok(stat)
@@ -635,6 +650,10 @@ impl ConfigManager {
     }
 }
 
+/// SoftLimitKeeper can run in the background and adjust the number of threads
+/// running based on CPU stats.
+/// It only starts to work when enable_auto_tune is turned on in BackupConfig.
+/// The initial number of threads is controlled by num_threads in BackupConfig.
 #[derive(Clone)]
 struct SoftLimitKeeper {
     limit: SoftLimit,
@@ -675,13 +694,13 @@ impl SoftLimitKeeper {
         let mut quota_val = num_threads;
         if enable_auto_tune {
             quota_val = cpu_quota
-                .get_quota(|s| s.contains("bkwkr"))
+                .get_quota(|s| s.contains(BACKUP_WORKER_THREAD))
                 .clamp(1, num_threads);
         }
 
         self.limit.resize(quota_val).await.map_err(|err| {
             warn!(
-                "error during appling the soft limit for backup.";
+                "error during applying the soft limit for backup.";
                 "current_limit" => %self.limit.current_cap(),
                 "to_set_value" => %quota_val,
                 "err" => %err,
@@ -703,12 +722,12 @@ impl SoftLimitKeeper {
 /// It coordinates backup tasks and dispatches them to different workers.
 pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     store_id: u64,
-    pool: RefCell<ControlThreadPool>,
+    pool: RefCell<ResizableRuntime>,
     io_pool: Runtime,
     tablets: LocalTablets<E::Local>,
     config_manager: ConfigManager,
     concurrency_manager: ConcurrencyManager,
-    softlimit: SoftLimitKeeper,
+    soft_limit_keeper: SoftLimitKeeper,
     api_version: ApiVersion,
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used in rawkv apiv2 only
     resource_ctl: Option<Arc<ResourceGroupManager>>,
@@ -780,9 +799,13 @@ impl<R: RegionInfoProvider> Progress<R> {
     /// Forward the progress by `ranges` BackupRanges
     ///
     /// The size of the returned BackupRanges should <= `ranges`
-    fn forward(&mut self, limit: usize, replica_read: bool) -> Vec<BackupRange> {
+    ///
+    /// Notice: Returning an empty BackupRanges means that no leader region
+    /// corresponding to the current range is sought. The caller should
+    /// call `forward` again to seek regions for the next range.
+    fn forward(&mut self, limit: usize, replica_read: bool) -> Option<Vec<BackupRange>> {
         if self.finished {
-            return Vec::new();
+            return None;
         }
         let store_id = self.store_id;
         let (tx, rx) = mpsc::channel();
@@ -801,8 +824,8 @@ impl<R: RegionInfoProvider> Progress<R> {
                 let mut count = 0;
                 for info in iter {
                     let region = &info.region;
-                    if end_key.is_some() {
-                        let end_slice = end_key.as_ref().unwrap().as_encoded().as_slice();
+                    if let Some(end_key) = &end_key {
+                        let end_slice = end_key.as_encoded().as_slice();
                         if end_slice <= region.get_start_key() {
                             // We have reached the end.
                             // The range is defined as [start, end) so break if
@@ -810,7 +833,13 @@ impl<R: RegionInfoProvider> Progress<R> {
                             break;
                         }
                     }
-                    let peer = find_peer(region, store_id).unwrap().to_owned();
+                    let peer = if let Some(peer) = find_peer(region, store_id) {
+                        peer.to_owned()
+                    } else {
+                        // skip the region at this time, and would retry to backup the region in
+                        // finegrained step.
+                        continue;
+                    };
                     // Raft peer role has to match the replica read flag.
                     if replica_read || info.role == StateRole::Leader {
                         let ekey = get_min_end_key(end_key.as_ref(), region);
@@ -835,7 +864,6 @@ impl<R: RegionInfoProvider> Progress<R> {
             }),
         );
         if let Err(e) = res {
-            // TODO: handle error.
             error!(?e; "backup seek region failed");
         }
 
@@ -852,7 +880,7 @@ impl<R: RegionInfoProvider> Progress<R> {
         } else {
             self.try_next();
         }
-        branges
+        Some(branges)
     }
 }
 
@@ -868,11 +896,16 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
         resource_ctl: Option<Arc<ResourceGroupManager>>,
     ) -> Endpoint<E, R> {
-        let pool = ControlThreadPool::new();
-        let rt = utils::create_tokio_runtime(config.io_thread_size, "backup-io").unwrap();
+        let pool = ResizableRuntime::new(
+            config.num_threads,
+            BACKUP_WORKER_THREAD,
+            Box::new(utils::create_tokio_runtime),
+            Box::new(|new_size| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
+        );
+        let rt = utils::create_tokio_runtime(config.io_thread_size, BACKUP_IO_THREAD).unwrap();
         let config_manager = ConfigManager(Arc::new(RwLock::new(config)));
-        let softlimit = SoftLimitKeeper::new(config_manager.clone());
-        rt.spawn(softlimit.clone().run());
+        let soft_limit_keeper = SoftLimitKeeper::new(config_manager.clone());
+        rt.spawn(soft_limit_keeper.clone().run());
         Endpoint {
             store_id,
             engine,
@@ -880,7 +913,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             pool: RefCell::new(pool),
             tablets,
             io_pool: rt,
-            softlimit,
+            soft_limit_keeper,
             config_manager,
             concurrency_manager,
             api_version,
@@ -926,9 +959,9 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         let concurrency_manager = self.concurrency_manager.clone();
         let batch_size = self.config_manager.0.read().unwrap().batch_size;
         let sst_max_size = self.config_manager.0.read().unwrap().sst_max_size.0;
-        let limit = self.softlimit.limit();
+        let soft_limit_keeper = self.soft_limit_keeper.limit();
         let resource_limiter = self.resource_ctl.as_ref().and_then(|r| {
-            r.get_resource_limiter(&request.resource_group_name, &request.source_tag)
+            r.get_background_resource_limiter(&request.resource_group_name, &request.source_tag)
         });
 
         self.pool.borrow_mut().spawn(async move {
@@ -938,8 +971,9 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             loop {
                 // when get the guard, release it until we finish scanning a batch,
                 // because if we were suspended during scanning,
-                // the region info have higher possibility to change (then we must compensate that by the fine-grained backup).
-                let guard = limit.guard().await;
+                // the region info have higher possibility to change (then we must compensate
+                // that by the fine-grained backup).
+                let guard = soft_limit_keeper.guard().await;
                 if let Err(e) = guard {
                     warn!("failed to retrieve limit guard, omitting."; "err" => %e);
                 };
@@ -948,26 +982,28 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     // It is critical to speed up backup, otherwise workers are
                     // blocked by each other.
                     //
-                    // If we use [tokio::sync::Mutex] here, until we give back the control flow to the scheduler
-                    // or tasks waiting for the lock won't be waked up due to the characteristic of the runtime...
+                    // If we use [tokio::sync::Mutex] here, until we give back the control flow to
+                    // the scheduler or tasks waiting for the lock won't be
+                    // waked up due to the characteristic of the runtime...
                     //
                     // The worst case is when using `noop` backend:
-                    // the task seems never yielding and in fact the backup would executing sequentially.
+                    // the task seems never yielding and in fact the backup would executing
+                    // sequentially.
                     //
-                    // Anyway, even tokio itself doesn't recommend to use it unless the lock guard needs to be `Send`.
-                    // (See https://tokio.rs/tokio/tutorial/shared-state)
+                    // Anyway, even tokio itself doesn't recommend to use it unless the lock guard
+                    // needs to be `Send`. (See https://tokio.rs/tokio/tutorial/shared-state)
                     // Use &mut and mark the type for making rust-analyzer happy.
                     let progress: &mut Progress<_> = &mut prs.lock().unwrap();
-                    let batch = progress.forward(batch_size, request.replica_read);
-                    if batch.is_empty() {
-                        return;
+                    match progress.forward(batch_size, request.replica_read) {
+                        Some(batch) => (batch, progress.codec.is_raw_kv, progress.cf),
+                        None => return,
                     }
-                    (batch, progress.codec.is_raw_kv, progress.cf)
                 };
 
                 for brange in batch {
-                    // wake up the scheduler for each loop for awaking tasks waiting for some lock or channels.
-                    // because the softlimit permit is held by current task, there isn't risk of being suspended for long time.
+                    // wake up the scheduler for each loop for awaking tasks waiting for some lock
+                    // or channels. because the softlimit permit is held by
+                    // current task, there isn't risk of being suspended for long time.
                     tokio::task::yield_now().await;
                     let engine = engine.clone();
                     if request.cancel.load(Ordering::SeqCst) {
@@ -976,7 +1012,8 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     }
                     // TODO: make file_name unique and short
                     let key = brange.start_key.clone().and_then(|k| {
-                        // use start_key sha256 instead of start_key to avoid file name too long os error
+                        // use start_key sha256 instead of start_key to avoid file name too long os
+                        // error
                         let input = brange.codec.decode_backup_key(Some(k)).unwrap_or_default();
                         file_system::sha256(&input).ok().map(hex::encode)
                     });
@@ -995,7 +1032,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             .backup_raw_kv_to_file(
                                 engine,
                                 db.into_owned(),
-                                &request.limiter,
+                                &request.rate_limiter,
                                 name,
                                 cf.into(),
                                 ct,
@@ -1007,7 +1044,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     } else {
                         let writer_builder = BackupWriterBuilder::new(
                             store_id,
-                            request.limiter.clone(),
+                            request.rate_limiter.clone(),
                             brange.region.clone(),
                             db.into_owned(),
                             ct,
@@ -1015,24 +1052,29 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             sst_max_size,
                             request.cipher.clone(),
                         );
-                        with_resource_limiter(brange.backup(
+                        with_resource_limiter(
+                            brange.backup(
                                 writer_builder,
                                 engine,
                                 concurrency_manager.clone(),
                                 backup_ts,
                                 start_ts,
+                                request.bypass_locks.clone(),
+                                request.access_locks.clone(),
                                 saver_tx.clone(),
                                 _backend.name(),
                                 resource_limiter.clone(),
-                            ), resource_limiter.clone())
-                            .await
+                            ),
+                            resource_limiter.clone(),
+                        )
+                        .await
                     };
                     match stat {
                         Err(err) => {
-                            error_unknown!(%err; "error during backup"; "region" => ?brange.region,);
+                            warn!("error during backup"; "region" => ?brange.region, "err" => %err);
                             let mut resp = BackupResponse::new();
                             resp.set_error(err.into());
-                            if let Err(err) =  resp_tx.unbounded_send(resp) {
+                            if let Err(err) = resp_tx.unbounded_send(resp) {
                                 warn!("failed to send response"; "err" => ?err)
                             }
                         }
@@ -1136,10 +1178,10 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             }
         };
         let backend = Arc::<dyn ExternalStorage>::from(backend);
-        let concurrency = self.config_manager.0.read().unwrap().num_threads;
-        self.pool.borrow_mut().adjust_with(concurrency);
+        let num_threads = self.config_manager.0.read().unwrap().num_threads;
+        self.pool.borrow_mut().adjust_with(num_threads);
         let (tx, rx) = async_channel::bounded(1);
-        for _ in 0..concurrency {
+        for _ in 0..num_threads {
             self.spawn_backup_worker(
                 prs.clone(),
                 request.clone(),
@@ -1154,6 +1196,13 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                 codec,
             ));
         }
+    }
+
+    /// Get the internal handle of the io thread pool used by the backup
+    /// endpoint. This is mainly shared for disk snapshot backup (so they
+    /// don't need to spawn on the gRPC pool.)
+    pub fn io_pool_handle(&self) -> &Handle {
+        self.io_pool.handle()
     }
 }
 
@@ -1198,15 +1247,15 @@ fn get_max_start_key(start_key: Option<&Key>, region: &Region) -> Option<Key> {
     } else {
         Some(Key::from_encoded_slice(region.get_start_key()))
     };
-    if start_key.is_none() {
-        region_start
-    } else {
-        let start_slice = start_key.as_ref().unwrap().as_encoded().as_slice();
+    if let Some(start_key_ref) = &start_key {
+        let start_slice = start_key_ref.as_encoded().as_slice();
         if start_slice < region.get_start_key() {
             region_start
         } else {
             start_key.cloned()
         }
+    } else {
+        region_start
     }
 }
 
@@ -1299,25 +1348,29 @@ pub mod tests {
         time::Duration,
     };
 
-    use api_version::{api_v2::RAW_KEY_PREFIX, dispatch_api_version, KvFormat, RawValue};
+    use api_version::{KvFormat, RawValue, api_v2::RAW_KEY_PREFIX, dispatch_api_version};
     use collections::HashSet;
-    use engine_traits::MiscExt;
-    use external_storage_export::{make_local_backend, make_noop_backend};
+    use engine_rocks::RocksSstReader;
+    use engine_traits::{IterOptions, Iterator, MiscExt, RefIterable, SstReader};
+    use external_storage::{make_local_backend, make_noop_backend};
     use file_system::{IoOp, IoRateLimiter, IoType};
     use futures::{executor::block_on, stream::StreamExt};
-    use kvproto::metapb;
+    use keys::data_key;
+    use kvproto::{kvrpcpb::Context, metapb};
     use raftstore::coprocessor::{RegionCollector, Result as CopResult, SeekRegionCallback};
     use rand::Rng;
     use tempfile::TempDir;
     use tikv::{
         coprocessor::checksum_crc64_xor,
         storage::{
+            RocksEngine, TestEngineBuilder,
             kv::LocalTablets,
             txn::tests::{must_commit, must_prewrite_put},
-            RocksEngine, TestEngineBuilder,
         },
     };
-    use tikv_util::{config::ReadableSize, store::new_peer};
+    use tikv_util::{
+        config::ReadableSize, info, store::new_peer, thread_name_prefix::BACKUP_WORKER_THREAD,
+    };
     use tokio::time;
     use txn_types::SHORT_VALUE_MAX_LEN;
 
@@ -1333,9 +1386,10 @@ pub mod tests {
     impl MockRegionInfoProvider {
         pub fn new(encode_key: bool) -> Self {
             MockRegionInfoProvider {
-                regions: Arc::new(Mutex::new(RegionCollector::new(Arc::new(RwLock::new(
-                    HashSet::default(),
-                ))))),
+                regions: Arc::new(Mutex::new(RegionCollector::new(
+                    Arc::new(RwLock::new(HashSet::default())),
+                    Box::new(|| 0),
+                ))),
                 cancel: None,
                 need_encode_key: encode_key,
             }
@@ -1436,7 +1490,7 @@ pub mod tests {
             .api_version(api_version)
             .build()
             .unwrap();
-        let concurrency_manager = ConcurrencyManager::new(1.into());
+        let concurrency_manager = ConcurrencyManager::new_for_test(1.into());
         let need_encode_key = !is_raw_kv || api_version == ApiVersion::V2;
         let db = rocks.get_rocksdb();
         (
@@ -1484,8 +1538,12 @@ pub mod tests {
         use std::thread::sleep;
 
         let counter = Arc::new(AtomicU32::new(0));
-        let mut pool = ControlThreadPool::new();
-        pool.adjust_with(3);
+        let mut pool = ResizableRuntime::new(
+            3,
+            BACKUP_WORKER_THREAD,
+            Box::new(utils::create_tokio_runtime),
+            Box::new(|new_size: usize| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
+        );
 
         for i in 0..8 {
             let ctr = counter.clone();
@@ -1547,7 +1605,7 @@ pub mod tests {
                 let mut ranges = Vec::with_capacity(expect.len());
                 while ranges.len() != expect.len() {
                     let n = (rand::random::<usize>() % 3) + 1;
-                    let mut r = prs.forward(n, false);
+                    let mut r = prs.forward(n, false).unwrap();
                     // The returned backup ranges should <= n
                     assert!(r.len() <= n);
 
@@ -1577,7 +1635,7 @@ pub mod tests {
             };
 
         // Test whether responses contain correct range.
-        #[allow(clippy::blocks_in_if_conditions)]
+        #[allow(clippy::blocks_in_conditions)]
         let test_handle_backup_task_range =
             |start_key: &[u8], end_key: &[u8], expect: Vec<(&[u8], &[u8])>| {
                 let tmp = TempDir::new().unwrap();
@@ -1591,7 +1649,7 @@ pub mod tests {
                         start_ts: 1.into(),
                         end_ts: 1.into(),
                         backend,
-                        limiter: Limiter::new(f64::INFINITY),
+                        rate_limiter: Limiter::new(f64::INFINITY),
                         cancel: Arc::default(),
                         is_raw_kv: false,
                         dst_api_ver: ApiVersion::V1,
@@ -1602,6 +1660,8 @@ pub mod tests {
                         replica_read: false,
                         resource_group_name: "".into(),
                         source_tag: "br".into(),
+                        bypass_locks: vec![],
+                        access_locks: vec![],
                     },
                     resp: tx,
                 };
@@ -1702,7 +1762,7 @@ pub mod tests {
                 start_ts: 1.into(),
                 end_ts: 1.into(),
                 backend: backend.clone(),
-                limiter: Limiter::new(f64::INFINITY),
+                rate_limiter: Limiter::new(f64::INFINITY),
                 cancel: Arc::default(),
                 is_raw_kv: false,
                 dst_api_ver: ApiVersion::V1,
@@ -1713,6 +1773,8 @@ pub mod tests {
                 replica_read: false,
                 resource_group_name: "".into(),
                 source_tag: "br".into(),
+                bypass_locks: vec![],
+                access_locks: vec![],
             },
             resp: tx,
         };
@@ -1733,7 +1795,7 @@ pub mod tests {
                 start_ts: 1.into(),
                 end_ts: 1.into(),
                 backend,
-                limiter: Limiter::new(f64::INFINITY),
+                rate_limiter: Limiter::new(f64::INFINITY),
                 cancel: Arc::default(),
                 is_raw_kv: false,
                 dst_api_ver: ApiVersion::V1,
@@ -1744,6 +1806,8 @@ pub mod tests {
                 replica_read: true,
                 resource_group_name: "".into(),
                 source_tag: "br".into(),
+                bypass_locks: vec![],
+                access_locks: vec![],
             },
             resp: tx,
         };
@@ -1792,23 +1856,18 @@ pub mod tests {
                 );
 
                 let mut ranges = Vec::with_capacity(expect.len());
-                while ranges.len() != expect.len() {
+                loop {
                     let n = (rand::random::<usize>() % 3) + 1;
-                    let mut r = prs.forward(n, false);
+                    let mut r = match prs.forward(n, false) {
+                        None => break,
+                        Some(r) => r,
+                    };
                     // The returned backup ranges should <= n
                     assert!(r.len() <= n);
 
-                    if r.is_empty() {
-                        // if return a empty vec then the progress is finished
-                        assert_eq!(
-                            ranges.len(),
-                            expect.len(),
-                            "got {:?}, expect {:?}",
-                            ranges,
-                            expect
-                        );
+                    if !r.is_empty() {
+                        ranges.append(&mut r);
                     }
-                    ranges.append(&mut r);
                 }
 
                 for (a, b) in ranges.into_iter().zip(expect) {
@@ -1824,7 +1883,7 @@ pub mod tests {
             };
 
         // Test whether responses contain correct range.
-        #[allow(clippy::blocks_in_if_conditions)]
+        #[allow(clippy::blocks_in_conditions)]
         let test_handle_backup_task_ranges =
             |sub_ranges: Vec<(&[u8], &[u8])>, expect: Vec<(&[u8], &[u8])>| {
                 let tmp = TempDir::new().unwrap();
@@ -1848,7 +1907,7 @@ pub mod tests {
                         start_ts: 1.into(),
                         end_ts: 1.into(),
                         backend,
-                        limiter: Limiter::new(f64::INFINITY),
+                        rate_limiter: Limiter::new(f64::INFINITY),
                         cancel: Arc::default(),
                         is_raw_kv: false,
                         dst_api_ver: ApiVersion::V1,
@@ -1859,6 +1918,8 @@ pub mod tests {
                         replica_read: false,
                         resource_group_name: "".into(),
                         source_tag: "br".into(),
+                        bypass_locks: vec![],
+                        access_locks: vec![],
                     },
                     resp: tx,
                 };
@@ -1949,6 +2010,226 @@ pub mod tests {
         }
     }
 
+    fn fake_empty_marker() -> Vec<super::BackupRange> {
+        vec![super::BackupRange {
+            start_key: None,
+            end_key: None,
+            region: Region::new(),
+            peer: Peer::new(),
+            codec: KeyValueCodec::new(false, ApiVersion::V1, ApiVersion::V1),
+            cf: "",
+            uses_replica_read: false,
+        }]
+    }
+
+    #[test]
+    fn test_seek_ranges_2() {
+        let (_tmp, endpoint) = new_endpoint();
+
+        endpoint.region_info.set_regions(vec![
+            (b"2".to_vec(), b"4".to_vec(), 1),
+            (b"6".to_vec(), b"8".to_vec(), 2),
+        ]);
+        let sub_ranges: Vec<(&[u8], &[u8])> = vec![(b"1", b"11"), (b"3", b"7"), (b"8", b"9")];
+        let expect: Vec<(&[u8], &[u8])> = vec![(b"", b""), (b"3", b"4"), (b"6", b"7"), (b"", b"")];
+
+        let mut ranges = Vec::with_capacity(sub_ranges.len());
+        for &(start_key, end_key) in &sub_ranges {
+            let start_key = (!start_key.is_empty()).then_some(Key::from_raw(start_key));
+            let end_key = (!end_key.is_empty()).then_some(Key::from_raw(end_key));
+            ranges.push((start_key, end_key));
+        }
+        let mut prs = Progress::new_with_ranges(
+            endpoint.store_id,
+            ranges,
+            endpoint.region_info.clone(),
+            KeyValueCodec::new(false, ApiVersion::V1, ApiVersion::V1),
+            engine_traits::CF_DEFAULT,
+        );
+
+        let mut ranges = Vec::with_capacity(expect.len());
+        loop {
+            let n = (rand::random::<usize>() % 2) + 1;
+            let mut r = match prs.forward(n, false) {
+                None => break,
+                Some(r) => r,
+            };
+            // The returned backup ranges should <= n
+            assert!(r.len() <= n);
+
+            if !r.is_empty() {
+                ranges.append(&mut r);
+            } else {
+                // append the empty marker
+                ranges.append(&mut fake_empty_marker());
+            }
+        }
+
+        assert!(ranges.len() == expect.len());
+        for (a, b) in ranges.into_iter().zip(expect) {
+            assert_eq!(
+                a.start_key.map_or_else(Vec::new, |k| k.into_raw().unwrap()),
+                b.0
+            );
+            assert_eq!(
+                a.end_key.map_or_else(Vec::new, |k| k.into_raw().unwrap()),
+                b.1
+            );
+        }
+    }
+
+    #[test]
+    fn test_handle_backup_task_bypass_locks() {
+        // consider both short and long value
+        for &len in &[SHORT_VALUE_MAX_LEN - 1, SHORT_VALUE_MAX_LEN * 2] {
+            let (tmp, endpoint) = new_endpoint();
+            let mut engine = endpoint.engine.clone();
+            endpoint
+                .region_info
+                .set_regions(vec![(b"".to_vec(), b"".to_vec(), 1)]);
+
+            let mut ts = TimeStamp::new(1);
+            let mut alloc_ts = || *ts.incr();
+            let lock_key = 9;
+
+            // Prepare data: 10 keys, with key 9 locked
+            let prewrite_keys: Vec<_> = (0..10u8)
+                .map(|i| {
+                    let start = alloc_ts();
+                    let commit = alloc_ts();
+                    let key = i.to_string();
+                    must_prewrite_put(
+                        &mut engine,
+                        key.as_bytes(),
+                        &vec![i; len],
+                        key.as_bytes(),
+                        start,
+                    );
+                    if i == lock_key {
+                        (key, start, commit)
+                    } else {
+                        must_commit(&mut engine, key.as_bytes(), start, commit);
+                        (key, start, commit)
+                    }
+                })
+                .collect();
+
+            let test_cases = vec![
+                (
+                    "No bypass locks",
+                    TimeStamp::new(3),
+                    vec![],
+                    b"0".to_vec(),
+                    false,
+                ),
+                (
+                    "With bypass locks, lock ts > backup ts",
+                    TimeStamp::new(12),
+                    prewrite_keys.clone(),
+                    b"4".to_vec(),
+                    false,
+                ),
+                (
+                    "No bypass locks, lock ts > backup ts",
+                    TimeStamp::new(12),
+                    vec![],
+                    b"4".to_vec(),
+                    false,
+                ),
+                (
+                    "No bypass locks, lock ts < backup ts",
+                    TimeStamp::new(22),
+                    vec![],
+                    vec![],
+                    true,
+                ),
+                (
+                    "With bypass locks, lock ts < backup ts",
+                    TimeStamp::new(22),
+                    prewrite_keys.clone(),
+                    // lock key is 9, so the key (8) should be included
+                    (lock_key - 1).to_string().into_bytes(),
+                    // the error can be ignored. because the lock key should commit after backup
+                    // ts.
+                    false,
+                ),
+            ];
+
+            for (case_name, backup_ts, bypass_locks, expect_end_key, expect_error) in test_cases {
+                let mut req = BackupRequest::default();
+                req.set_start_key(vec![]);
+                req.set_end_key(vec![]);
+                req.set_start_version(0);
+                req.set_end_version(backup_ts.into_inner());
+
+                let mut context = Context::default();
+                context.set_resolved_locks(
+                    bypass_locks
+                        .iter()
+                        .map(|(_, s, _)| s.into_inner())
+                        .collect(),
+                );
+                req.set_context(context);
+
+                let (tx, rx) = unbounded();
+                let tmp_dir = make_unique_dir(tmp.path());
+                req.set_storage_backend(make_local_backend(&tmp_dir));
+                let (task, _) = Task::new(req, tx).unwrap();
+                endpoint.handle_backup_task(task);
+
+                let (resp, _) = block_on(rx.into_future());
+                let resp = resp.unwrap();
+
+                if expect_error {
+                    assert!(
+                        resp.has_error(),
+                        "Case '{}' should have an error",
+                        case_name
+                    );
+                } else {
+                    assert!(
+                        !resp.has_error(),
+                        "Case '{}' should not have an error: {:?}",
+                        case_name,
+                        resp
+                    );
+
+                    let expected_file_count = if len <= SHORT_VALUE_MAX_LEN { 1 } else { 2 };
+                    let files = resp.get_files();
+
+                    assert_eq!(
+                        files.len(),
+                        expected_file_count,
+                        "Case '{}' failed: expected {} files, got {} files. {:?}",
+                        case_name,
+                        expected_file_count,
+                        files.len(),
+                        resp
+                    );
+
+                    for file in files {
+                        let sst_path = tmp_dir.join(&file.name);
+                        let sst_reader = RocksSstReader::open_with_env(
+                            sst_path.as_os_str().to_str().unwrap(),
+                            None,
+                        )
+                        .unwrap();
+                        sst_reader.verify_checksum().unwrap();
+                        let mut iter = sst_reader.iter(IterOptions::default()).unwrap();
+                        iter.seek_to_last().unwrap();
+                        let end_key = Key::truncate_ts_for(iter.key()).unwrap();
+                        assert_eq!(
+                            end_key,
+                            data_key(Key::from_raw(&expect_end_key).as_encoded()),
+                            "Case '{}' failed: unexpected end key",
+                            case_name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_handle_backup_task() {
         let limiter = Arc::new(IoRateLimiter::new_for_test());
@@ -2009,9 +2290,9 @@ pub mod tests {
             let (mut task, _) = Task::new(req, tx).unwrap();
             if len % 2 == 0 {
                 // Make sure the rate limiter is set.
-                assert!(task.request.limiter.speed_limit().is_finite());
+                assert!(task.request.rate_limiter.speed_limit().is_finite());
                 // Share the same rate limiter.
-                task.request.limiter = limiter.clone();
+                task.request.rate_limiter = limiter.clone();
             }
             endpoint.handle_backup_task(task);
             let (resp, rx) = block_on(rx.into_future());
@@ -2179,7 +2460,7 @@ pub mod tests {
         req.set_storage_backend(make_local_backend(&tmp1));
         req.set_rate_limit(10 * 1024 * 1024);
         let (mut task, _) = Task::new(req, tx).unwrap();
-        task.request.limiter = limiter;
+        task.request.rate_limiter = limiter;
         endpoint.handle_backup_task(task);
         let (resp, rx) = block_on(rx.into_future());
         let resp = resp.unwrap();
@@ -2459,20 +2740,20 @@ pub mod tests {
         endpoint.get_config_manager().set_num_threads(15);
         let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size == 15);
+        assert!(endpoint.pool.borrow().size() == 15);
 
-        // shrink thread pool only if there are too many idle threads
+        // shrink thread pool
         endpoint.get_config_manager().set_num_threads(10);
         req.set_start_key(vec![b'2']);
         let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size == 15);
+        assert!(endpoint.pool.borrow().size() == 10);
 
         endpoint.get_config_manager().set_num_threads(3);
         req.set_start_key(vec![b'3']);
         let (task, _) = Task::new(req, tx).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size == 3);
+        assert!(endpoint.pool.borrow().size() == 3);
 
         // make sure all tasks can finish properly.
         let responses = block_on(rx.collect::<Vec<_>>());
@@ -2481,8 +2762,12 @@ pub mod tests {
         // for testing whether dropping the pool before all tasks finished causes panic.
         // but the panic must be checked manually. (It may panic at tokio runtime
         // threads)
-        let mut pool = ControlThreadPool::new();
-        pool.adjust_with(1);
+        let mut pool = ResizableRuntime::new(
+            1,
+            BACKUP_WORKER_THREAD,
+            Box::new(utils::create_tokio_runtime),
+            Box::new(|new_size: usize| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
+        );
         pool.spawn(async { tokio::time::sleep(Duration::from_millis(100)).await });
         pool.adjust_with(2);
         drop(pool);
@@ -2519,5 +2804,11 @@ pub mod tests {
             let filename = backup_file_name(store_id, &region, key, storage_name);
             assert_eq!(target.to_string(), filename);
         }
+    }
+
+    #[test]
+    fn test_transmute_locks() {
+        let locks = vec![];
+        assert_eq!(TsSet::vec_from_u64s(locks), TsSet::Empty);
     }
 }

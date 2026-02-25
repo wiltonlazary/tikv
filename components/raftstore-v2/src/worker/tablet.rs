@@ -9,20 +9,22 @@ use std::{
 
 use collections::HashMap;
 use engine_traits::{
-    CfName, DeleteStrategy, KvEngine, Range, TabletContext, TabletRegistry, WriteOptions, DATA_CFS,
+    CfName, DATA_CFS, DeleteStrategy, KvEngine, ManualCompactionOptions, Range, TabletContext,
+    TabletRegistry, WriteOptions,
 };
 use fail::fail_point;
 use kvproto::{import_sstpb::SstMeta, metapb::Region};
 use raftstore::store::{TabletSnapKey, TabletSnapManager};
-use slog::{debug, error, info, warn, Logger};
+use slog::{Logger, debug, error, info, warn};
 use sst_importer::SstImporter;
 use tikv_util::{
+    Either,
     config::ReadableDuration,
     slog_panic,
+    thread_name_prefix::{TABLET_BACKGROUND_WORKER_THREAD, TABLET_HIGH_PRIORITY_WORKER_THREAD},
     time::Instant,
     worker::{Runnable, RunnableWithTimer},
     yatp_pool::{DefaultTicker, FuturePool, YatpPoolBuilder},
-    Either,
 };
 
 const DEFAULT_HIGH_PRI_POOL_SIZE: usize = 2;
@@ -235,7 +237,7 @@ impl<EK> Task<EK> {
 
 pub struct Runner<EK: KvEngine> {
     tablet_registry: TabletRegistry<EK>,
-    sst_importer: Arc<SstImporter>,
+    sst_importer: Arc<SstImporter<EK>>,
     snap_mgr: TabletSnapManager,
     logger: Logger,
 
@@ -252,7 +254,7 @@ pub struct Runner<EK: KvEngine> {
 impl<EK: KvEngine> Runner<EK> {
     pub fn new(
         tablet_registry: TabletRegistry<EK>,
-        sst_importer: Arc<SstImporter>,
+        sst_importer: Arc<SstImporter<EK>>,
         snap_mgr: TabletSnapManager,
         logger: Logger,
     ) -> Self {
@@ -264,11 +266,11 @@ impl<EK: KvEngine> Runner<EK> {
             waiting_destroy_tasks: HashMap::default(),
             pending_destroy_tasks: Vec::new(),
             high_pri_pool: YatpPoolBuilder::new(DefaultTicker::default())
-                .name_prefix("tablet-high")
+                .name_prefix(TABLET_HIGH_PRIORITY_WORKER_THREAD)
                 .thread_count(0, DEFAULT_HIGH_PRI_POOL_SIZE, DEFAULT_HIGH_PRI_POOL_SIZE)
                 .build_future_pool(),
             low_pri_pool: YatpPoolBuilder::new(DefaultTicker::default())
-                .name_prefix("tablet-bg")
+                .name_prefix(TABLET_BACKGROUND_WORKER_THREAD)
                 .thread_count(0, DEFAULT_LOW_PRI_POOL_SIZE, DEFAULT_LOW_PRI_POOL_SIZE)
                 .build_future_pool(),
         }
@@ -302,9 +304,11 @@ impl<EK: KvEngine> Runner<EK> {
                 // some files missing from compaction if dynamic_level_bytes is off.
                 for r in [range1, range2] {
                     // When compaction filter is present, trivial move is disallowed.
-                    if let Err(e) =
-                        tablet.compact_range(Some(r.start_key), Some(r.end_key), false, 1)
-                    {
+                    if let Err(e) = tablet.compact_range(
+                        Some(r.start_key),
+                        Some(r.end_key),
+                        ManualCompactionOptions::new(false, 1, false),
+                    ) {
                         if e.to_string().contains("Manual compaction paused") {
                             info!(
                                 logger,
@@ -602,6 +606,13 @@ impl<EK: KvEngine> Runner<EK> {
     }
 }
 
+#[cfg(test)]
+impl<EK: KvEngine> Runner<EK> {
+    pub fn get_running_task_count(&self) -> usize {
+        self.low_pri_pool.get_running_task_count()
+    }
+}
+
 impl<EK> Runnable for Runner<EK>
 where
     EK: KvEngine,
@@ -648,8 +659,10 @@ where
     fn on_timeout(&mut self) {
         self.pending_destroy_tasks.retain_mut(|(path, cb)| {
             let r = Self::process_destroy_task(&self.logger, &self.tablet_registry, path);
-            if r && let Some(cb) = cb.take() {
-                cb();
+            if r {
+                if let Some(cb) = cb.take() {
+                    cb();
+                }
             }
             !r
         });
@@ -822,6 +835,14 @@ mod tests {
         runner.run(Task::destroy(r_1, 100));
         assert!(path.exists());
         registry.remove(r_1);
+        // waiting for async `pause_background_work` to be finished,
+        // this task can block tablet's destroy.
+        for _i in 0..100 {
+            if runner.get_running_task_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         runner.on_timeout();
         assert!(!path.exists());
         assert!(runner.pending_destroy_tasks.is_empty());

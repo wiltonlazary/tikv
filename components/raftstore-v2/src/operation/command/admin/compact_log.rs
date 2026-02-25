@@ -16,8 +16,8 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -25,12 +25,11 @@ use engine_traits::{KvEngine, RaftEngine, RaftLogBatch};
 use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, AdminResponse, RaftCmdRequest};
 use protobuf::Message;
 use raftstore::{
-    store::{
-        entry_storage::MAX_WARMED_UP_CACHE_KEEP_TIME, fsm::new_admin_request,
-        metrics::REGION_MAX_LOG_LAG, needs_evict_entry_cache, Transport, WriteTask,
-        RAFT_INIT_LOG_INDEX,
-    },
     Result,
+    store::{
+        RAFT_INIT_LOG_INDEX, Transport, WriteTask, fsm::new_admin_request,
+        metrics::REGION_MAX_LOG_LAG, needs_evict_entry_cache,
+    },
 };
 use slog::{debug, error, info};
 use tikv_util::{box_err, log::SlogFormat};
@@ -106,7 +105,7 @@ impl CompactLogContext {
     }
 }
 
-impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> PeerFsmDelegate<'a, EK, ER, T> {
+impl<EK: KvEngine, ER: RaftEngine, T: Transport> PeerFsmDelegate<'_, EK, ER, T> {
     pub fn on_compact_log_tick(&mut self, force: bool) {
         // Might read raft logs.
         debug_assert!(self.fsm.peer().serving());
@@ -145,6 +144,8 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         store_ctx: &mut StoreContext<EK, ER, T>,
         force: bool,
     ) {
+        fail::fail_point!("maybe_propose_compact_log", |_| {});
+
         // As leader, we would not keep caches for the peers that didn't response
         // heartbeat in the last few seconds. That happens probably because
         // another TiKV is down. In this case if we do not clean up the cache,
@@ -200,8 +201,12 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
 
         // leader may call `get_term()` on the latest replicated index, so compact
         // entries before `alive_cache_idx` instead of `alive_cache_idx + 1`.
+        let mut cache_warmup_state = self.transfer_leader_state_mut().cache_warmup_state.take();
+        let compact_idx = std::cmp::min(alive_cache_idx, applied_idx + 1);
         self.entry_storage_mut()
-            .compact_entry_cache(std::cmp::min(alive_cache_idx, applied_idx + 1));
+            .compact_entry_cache(compact_idx, cache_warmup_state.as_mut());
+        self.entry_storage_mut().compact_term_cache(compact_idx);
+        self.transfer_leader_state_mut().cache_warmup_state = cache_warmup_state;
 
         let mut compact_idx = if force && replicated_idx > first_idx {
             replicated_idx
@@ -463,16 +468,16 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         mut res: CompactLogResult,
     ) {
         let first_index = self.entry_storage().first_index();
-        if let Some(i) = self.merge_context().and_then(|c| c.max_compact_log_index())
-            && res.compact_index > i
-        {
-            info!(
-                self.logger,
-                "in merging mode, adjust compact index";
-                "old_index" => res.compact_index,
-                "new_index" => i,
-            );
-            res.compact_index = i;
+        if let Some(i) = self.merge_context().and_then(|c| c.max_compact_log_index()) {
+            if res.compact_index > i {
+                info!(
+                    self.logger,
+                    "in merging mode, adjust compact index";
+                    "old_index" => res.compact_index,
+                    "new_index" => i,
+                );
+                res.compact_index = i;
+            }
         }
         if res.compact_index <= first_index {
             debug!(
@@ -493,14 +498,19 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
 
         // Since this peer may be warming up the entry cache, log compaction should be
         // temporarily skipped. Otherwise, the warmup task may fail.
-        if let Some(state) = self.entry_storage_mut().entry_cache_warmup_state_mut() {
-            if !state.check_stale(MAX_WARMED_UP_CACHE_KEEP_TIME) {
+        if let Some(state) = &mut self.transfer_leader_state_mut().cache_warmup_state {
+            if !state.check_stale() {
                 return;
             }
         }
 
+        let mut cache_warmup_state = self.transfer_leader_state_mut().cache_warmup_state.take();
         self.entry_storage_mut()
-            .compact_entry_cache(res.compact_index);
+            .compact_entry_cache(res.compact_index, cache_warmup_state.as_mut());
+        self.entry_storage_mut()
+            .compact_term_cache(res.compact_index);
+        self.transfer_leader_state_mut().cache_warmup_state = cache_warmup_state;
+
         self.storage_mut()
             .cancel_generating_snap_due_to_compacted(res.compact_index);
 
@@ -521,18 +531,19 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
 
         // All logs < persisted_apply will be deleted.
         let prev_first_index = first_index;
-        if prev_first_index < self.storage().apply_trace().persisted_apply_index()
-            && let Some(index) = self.compact_log_index()
-        {
-            // Raft Engine doesn't care about first index.
-            if let Err(e) = store_ctx
-                .engine
-                .gc(self.region_id(), 0, index, self.state_changes_mut())
-            {
-                error!(self.logger, "failed to compact raft logs"; "err" => ?e);
+        if prev_first_index < self.storage().apply_trace().persisted_apply_index() {
+            if let Some(index) = self.compact_log_index() {
+                // Raft Engine doesn't care about first index.
+                if let Err(e) =
+                    store_ctx
+                        .engine
+                        .gc(self.region_id(), 0, index, self.state_changes_mut())
+                {
+                    error!(self.logger, "failed to compact raft logs"; "err" => ?e);
+                }
+                self.compact_log_context_mut().set_last_compacted_idx(index);
+                // Extra write set right above.
             }
-            self.compact_log_context_mut().set_last_compacted_idx(index);
-            // Extra write set right above.
         }
 
         let context = self.compact_log_context_mut();
@@ -565,18 +576,15 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 error!(self.logger, "failed to delete raft states"; "err" => ?e);
             }
             // If it's snapshot, logs are gc already.
-            if !task.has_snapshot
-                && old_persisted < self.entry_storage().truncated_index() + 1
-                && let Some(index) = self.compact_log_index()
-            {
-                let batch = task.extra_write.ensure_v2(|| self.entry_storage().raft_engine().log_batch(0));
-                // Raft Engine doesn't care about first index.
-                if let Err(e) =
-                store_ctx
-                    .engine
-                    .gc(self.region_id(), 0, index, batch)
-                {
-                    error!(self.logger, "failed to compact raft logs"; "err" => ?e);
+            if !task.has_snapshot && old_persisted < self.entry_storage().truncated_index() + 1 {
+                if let Some(index) = self.compact_log_index() {
+                    let batch = task
+                        .extra_write
+                        .ensure_v2(|| self.entry_storage().raft_engine().log_batch(0));
+                    // Raft Engine doesn't care about first index.
+                    if let Err(e) = store_ctx.engine.gc(self.region_id(), 0, index, batch) {
+                        error!(self.logger, "failed to compact raft logs"; "err" => ?e);
+                    }
                 }
             }
             if self.remove_tombstone_tablets(new_persisted) {

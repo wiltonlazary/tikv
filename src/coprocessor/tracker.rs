@@ -2,12 +2,17 @@
 
 use std::{cell::RefCell, marker::PhantomData};
 
-use ::tracker::{get_tls_tracker_token, with_tls_tracker};
+use ::tracker::{FutureTrack, get_tls_tracker_token, with_tls_tracker};
 use engine_traits::{PerfContext, PerfContextExt, PerfContextKind};
 use kvproto::{kvrpcpb, kvrpcpb::ScanDetailV2};
 use pd_client::BucketMeta;
+use protobuf::Message;
 use tikv_kv::Engine;
-use tikv_util::time::{self, Duration, Instant};
+use tikv_util::{
+    memory::HeapSize,
+    time::{self, Duration, Instant},
+};
+use tipb::ResourceGroupTag;
 use txn_types::Key;
 
 use super::metrics::*;
@@ -49,7 +54,8 @@ pub struct Tracker<E: Engine> {
 
     // Intermediate results
     current_stage: TrackerState,
-    wait_time: Duration,          // Total wait time
+    wait_time: Duration, /* Total wait time, including schedule_wait_time, snapshot_wait_time,
+                          * and total_suspend_time. */
     schedule_wait_time: Duration, // Wait time spent on waiting for scheduling
     snapshot_wait_time: Duration, // Wait time spent on waiting for a snapshot
     handler_build_time: Duration, /* Time spent on building the handler (not included in total
@@ -74,6 +80,8 @@ pub struct Tracker<E: Engine> {
     // Request info, used to print slow log.
     pub req_ctx: ReqContext,
 
+    req_tag: ReqTag,
+
     _phantom: PhantomData<fn() -> E>,
 }
 
@@ -81,7 +89,7 @@ impl<E: Engine> Tracker<E> {
     /// Initialize the tracker. Normally it is called outside future pool's
     /// factory context, because the future pool might be full and we need
     /// to wait it. This kind of wait time has to be recorded.
-    pub fn new(req_ctx: ReqContext, slow_log_threshold: Duration) -> Self {
+    pub fn new(req_ctx: ReqContext, req_tag: ReqTag, slow_log_threshold: Duration) -> Self {
         let now = Instant::now();
         Tracker {
             request_begin_at: now,
@@ -99,8 +107,19 @@ impl<E: Engine> Tracker<E> {
             scan_process_time_ns: 0,
             slow_log_threshold,
             req_ctx,
+            req_tag,
             buckets: None,
             _phantom: PhantomData,
+        }
+    }
+
+    pub fn adjust_snapshot_type(&mut self, region_cache_engine: bool) {
+        if region_cache_engine {
+            if self.req_tag == ReqTag::select {
+                self.req_tag = ReqTag::select_by_in_memory_engine;
+            } else if self.req_tag == ReqTag::index {
+                self.req_tag = ReqTag::index_by_in_memory_engine;
+            }
         }
     }
 
@@ -143,6 +162,7 @@ impl<E: Engine> Tracker<E> {
             TrackerState::ItemFinished(at) => {
                 self.item_suspend_time = now - at;
                 self.total_suspend_time += self.item_suspend_time;
+                self.wait_time += self.item_suspend_time;
             }
             _ => unreachable!(),
         }
@@ -257,7 +277,7 @@ impl<E: Engine> Tracker<E> {
 
         let total_storage_stats = std::mem::take(&mut self.total_storage_stats);
 
-        if self.total_process_time > self.slow_log_threshold {
+        if (self.total_process_time + self.total_suspend_time) > self.slow_log_threshold {
             let first_range = self.req_ctx.ranges.first();
             let some_table_id = first_range.as_ref().map(|range| {
                 tidb_query_datatype::codec::table::decode_table_id(range.get_start())
@@ -266,21 +286,26 @@ impl<E: Engine> Tracker<E> {
 
             let source_stmt = self.req_ctx.context.get_source_stmt();
             with_tls_tracker(|tracker| {
+                let mut req_tag = ResourceGroupTag::new();
+                req_tag
+                    .merge_from_bytes(&tracker.req_info.resource_group_tag)
+                    .unwrap_or_default();
                 info!(#"slow_log", "slow-query";
                     "connection_id" => source_stmt.get_connection_id(),
                     "session_alias" => source_stmt.get_session_alias(),
+                    "query_digest" => hex::encode(req_tag.get_sql_digest()),
                     "region_id" => &self.req_ctx.context.get_region_id(),
                     "remote_host" => &self.req_ctx.peer,
                     "total_lifetime" => ?self.req_lifetime,
                     "wait_time" => ?self.wait_time,
                     "wait_time.schedule" => ?self.schedule_wait_time,
                     "wait_time.snapshot" => ?self.snapshot_wait_time,
+                    "wait_time.suspend" => ?self.total_suspend_time,
                     "handler_build_time" => ?self.handler_build_time,
                     "total_process_time" => ?self.total_process_time,
-                    "total_suspend_time" => ?self.total_suspend_time,
                     "txn_start_ts" => self.req_ctx.txn_start_ts,
                     "table_id" => some_table_id,
-                    "tag" => self.req_ctx.tag.get_str(),
+                    "tag" => self.req_tag.get_str(),
                     "scan.is_desc" => self.req_ctx.is_desc_scan,
                     "scan.processed" => total_storage_stats.write.processed_keys,
                     "scan.processed_size" => total_storage_stats.processed_size,
@@ -300,62 +325,68 @@ impl<E: Engine> Tracker<E> {
 
         // req time
         COPR_REQ_HISTOGRAM_STATIC
-            .get(self.req_ctx.tag)
+            .get(self.req_tag)
             .observe(time::duration_to_sec(self.req_lifetime));
 
-        // wait time
+        // total wait time
         COPR_REQ_WAIT_TIME_STATIC
-            .get(self.req_ctx.tag)
+            .get(self.req_tag)
             .all
             .observe(time::duration_to_sec(self.wait_time));
 
         // schedule wait time
         COPR_REQ_WAIT_TIME_STATIC
-            .get(self.req_ctx.tag)
+            .get(self.req_tag)
             .schedule
             .observe(time::duration_to_sec(self.schedule_wait_time));
 
         // snapshot wait time
         COPR_REQ_WAIT_TIME_STATIC
-            .get(self.req_ctx.tag)
+            .get(self.req_tag)
             .snapshot
             .observe(time::duration_to_sec(self.snapshot_wait_time));
 
+        // suspend wait time
+        COPR_REQ_WAIT_TIME_STATIC
+            .get(self.req_tag)
+            .suspend
+            .observe(time::duration_to_sec(self.total_suspend_time));
+
         // handler build time
         COPR_REQ_HANDLER_BUILD_TIME_STATIC
-            .get(self.req_ctx.tag)
+            .get(self.req_tag)
             .observe(time::duration_to_sec(self.handler_build_time));
 
         // handle time
         COPR_REQ_HANDLE_TIME_STATIC
-            .get(self.req_ctx.tag)
+            .get(self.req_tag)
             .observe(time::duration_to_sec(self.total_process_time));
 
         // scan keys
         COPR_SCAN_KEYS_STATIC
-            .get(self.req_ctx.tag)
+            .get(self.req_tag)
             .total
             .observe(total_storage_stats.write.total_op_count() as f64);
         COPR_SCAN_KEYS_STATIC
-            .get(self.req_ctx.tag)
+            .get(self.req_tag)
             .processed_keys
             .observe(total_storage_stats.write.processed_keys as f64);
 
-        tls_collect_scan_details(self.req_ctx.tag, &total_storage_stats);
+        tls_collect_scan_details(self.req_tag, &total_storage_stats);
 
         let peer = self.req_ctx.context.get_peer();
         let region_id = self.req_ctx.context.get_region_id();
         let start_key = Key::from_raw(&self.req_ctx.lower_bound);
         let end_key = Key::from_raw(&self.req_ctx.upper_bound);
-        let reverse_scan = if let Some(reverse_scan) = self.req_ctx.is_desc_scan {
-            reverse_scan
-        } else {
-            false
-        };
+        let reverse_scan = self.req_ctx.is_desc_scan.unwrap_or(false);
 
         // only collect metrics for select and index, exclude transient read flow such
         // like analyze and checksum.
-        if self.req_ctx.tag == ReqTag::select || self.req_ctx.tag == ReqTag::index {
+        if self.req_tag == ReqTag::select
+            || self.req_tag == ReqTag::index
+            || self.req_tag == ReqTag::select_by_in_memory_engine
+            || self.req_tag == ReqTag::index_by_in_memory_engine
+        {
             tls_collect_query(
                 region_id,
                 peer,
@@ -371,6 +402,21 @@ impl<E: Engine> Tracker<E> {
                 self.buckets.as_ref(),
             );
         }
+
+        // Track MVCC read activity for compaction prioritization
+        // Use internal_key_skipped_count + internal_delete_skipped_count as proxy for
+        // MVCC versions scanned
+        with_tls_tracker(|tracker| {
+            let versions_scanned = tracker.metrics.internal_key_skipped_count
+                + tracker.metrics.deleted_key_skipped_count;
+            if versions_scanned > 0 {
+                use crate::storage::mvcc::mvcc_read_tracker::MVCC_READ_TRACKER;
+                if let Some(tracker) = MVCC_READ_TRACKER.get() {
+                    tracker.record_read(region_id, versions_scanned);
+                }
+            }
+        });
+
         self.current_stage = TrackerState::Tracked;
     }
 
@@ -380,7 +426,9 @@ impl<E: Engine> Tracker<E> {
     {
         thread_local! {
             static SELECT: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
+            static SELECT_BY_IN_MEMORY_ENGINE: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static INDEX: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
+            static INDEX_BY_IN_MEMORY_ENGINE: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static ANALYZE_TABLE: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static ANALYZE_INDEX: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static ANALYZE_FULL_SAMPLING: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
@@ -388,9 +436,11 @@ impl<E: Engine> Tracker<E> {
             static CHECKSUM_INDEX: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
             static TEST: RefCell<Option<Box<dyn PerfContext>>> = RefCell::new(None);
         }
-        let tls_cell = match self.req_ctx.tag {
+        let tls_cell = match self.req_tag {
             ReqTag::select => &SELECT,
+            ReqTag::select_by_in_memory_engine => &SELECT_BY_IN_MEMORY_ENGINE,
             ReqTag::index => &INDEX,
+            ReqTag::index_by_in_memory_engine => &INDEX_BY_IN_MEMORY_ENGINE,
             ReqTag::analyze_table => &ANALYZE_TABLE,
             ReqTag::analyze_index => &ANALYZE_INDEX,
             ReqTag::analyze_full_sampling => &ANALYZE_FULL_SAMPLING,
@@ -400,14 +450,24 @@ impl<E: Engine> Tracker<E> {
         };
         tls_cell.with(|c| {
             let mut c = c.borrow_mut();
-            let perf_context = c.get_or_insert_with(|| {
+            let perf_context: &mut Box<dyn PerfContext> = c.get_or_insert_with(|| {
                 Box::new(E::Local::get_perf_context(
                     PerfLevel::Uninitialized,
-                    PerfContextKind::Coprocessor(self.req_ctx.tag.get_str()),
+                    PerfContextKind::Coprocessor(self.req_tag.get_str()),
                 )) as Box<dyn PerfContext>
             });
             f(perf_context)
         })
+    }
+}
+
+impl<E: Engine> FutureTrack for &mut Tracker<E> {
+    fn on_poll_begin(&mut self) {
+        self.on_begin_item();
+    }
+
+    fn on_poll_finish(&mut self) {
+        self.on_finish_item(None);
     }
 }
 
@@ -456,14 +516,24 @@ impl<E: Engine> Drop for Tracker<E> {
                 "wait_time" => ?self.wait_time,
                 "wait_time.schedule" => ?self.schedule_wait_time,
                 "wait_time.snapshot" => ?self.snapshot_wait_time,
+                "wait_time.suspend" => ?self.total_suspend_time,
                 "handler_build_time" => ?self.handler_build_time,
                 "total_process_time" => ?self.total_process_time,
-                "total_suspend_time" => ?self.total_suspend_time,
                 "txn_start_ts" => self.req_ctx.txn_start_ts,
                 "table_id" => some_table_id,
-                "tag" => self.req_ctx.tag.get_str(),
+                "tag" => self.req_tag.get_str(),
             );
         }
+    }
+}
+
+impl<E: Engine> HeapSize for Tracker<E> {
+    fn approximate_heap_size(&self) -> usize {
+        self.req_ctx.approximate_heap_size()
+            + self
+                .buckets
+                .as_ref()
+                .map_or(0, |b| b.approximate_heap_size())
     }
 }
 
@@ -475,16 +545,15 @@ mod tests {
     use pd_client::BucketMeta;
     use tikv_kv::RocksEngine;
 
-    use super::{PerfLevel, ReqContext, ReqTag, TimeStamp, Tracker, TLS_COP_METRICS};
-    use crate::storage::Statistics;
+    use super::{PerfLevel, ReqTag, TLS_COP_METRICS, TimeStamp, Tracker};
+    use crate::{coprocessor::ReqContextInner, storage::Statistics};
 
     #[test]
     fn test_track() {
         let check = move |tag: ReqTag, flow: u64| {
             let mut context = kvrpcpb::Context::default();
             context.set_region_id(1);
-            let mut req_ctx = ReqContext::new(
-                tag,
+            let mut req_ctx_inner = ReqContextInner::new(
                 context,
                 vec![],
                 Duration::from_secs(0),
@@ -493,15 +562,17 @@ mod tests {
                 TimeStamp::max(),
                 None,
                 PerfLevel::EnableCount,
+                false,
             );
 
-            req_ctx.lower_bound = vec![
+            req_ctx_inner.lower_bound = vec![
                 116, 128, 0, 0, 0, 0, 0, 0, 184, 95, 114, 128, 0, 0, 0, 0, 0, 70, 67,
             ];
-            req_ctx.upper_bound = vec![
+            req_ctx_inner.upper_bound = vec![
                 116, 128, 0, 0, 0, 0, 0, 0, 184, 95, 114, 128, 0, 0, 0, 0, 0, 70, 167,
             ];
-            let mut track: Tracker<RocksEngine> = Tracker::new(req_ctx, Duration::default());
+            let mut track: Tracker<RocksEngine> =
+                Tracker::new(req_ctx_inner.into(), tag, Duration::default());
             let mut bucket = BucketMeta::default();
             bucket.region_id = 1;
             bucket.version = 1;
@@ -546,13 +617,12 @@ mod tests {
                             .read_keys[0]
                     );
                 } else {
-                    assert!(m.borrow().local_read_stats().region_infos.get(&1).is_none());
+                    assert!(!m.borrow().local_read_stats().region_infos.contains_key(&1));
                     assert!(
-                        m.borrow()
+                        !m.borrow()
                             .local_read_stats()
                             .region_buckets
-                            .get(&1)
-                            .is_none()
+                            .contains_key(&1)
                     );
                 }
 

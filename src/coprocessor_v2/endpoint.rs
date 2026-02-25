@@ -8,7 +8,7 @@ use kvproto::kvrpcpb;
 use semver::VersionReq;
 
 use super::{config::Config, plugin_registry::PluginRegistry, raw_storage_impl::RawStorageImpl};
-use crate::storage::{self, lock_manager::LockManager, Engine, Storage};
+use crate::storage::{self, Engine, Storage, lock_manager::LockManager};
 
 #[allow(clippy::large_enum_variant)]
 enum CoprocessorError {
@@ -126,7 +126,7 @@ fn extract_region_error(error: &PluginError) -> Option<kvproto::errorpb::Error> 
     match error {
         PluginError::Other(_, other_err) => other_err
             .downcast_ref::<storage::Result<()>>()
-            .and_then(|e| storage::errors::extract_region_error::<()>(e)),
+            .and_then(storage::errors::extract_region_error::<()>),
         _ => None,
     }
 }

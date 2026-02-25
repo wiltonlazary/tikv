@@ -7,7 +7,7 @@ use engine_traits::{Range, Result, TtlProperties, TtlPropertiesExt};
 use rocksdb::{DBEntryType, TablePropertiesCollector, TablePropertiesCollectorFactory};
 use tikv_util::error;
 
-use crate::{decode_properties::DecodeProperties, RocksEngine, UserProperties};
+use crate::{RocksEngine, UserProperties, decode_properties::DecodeProperties};
 
 const PROP_MAX_EXPIRE_TS: &str = "tikv.max_expire_ts";
 const PROP_MIN_EXPIRE_TS: &str = "tikv.min_expire_ts";
@@ -74,6 +74,7 @@ pub struct TtlPropertiesCollector<F: KvFormat> {
 
 impl<F: KvFormat> TablePropertiesCollector for TtlPropertiesCollector<F> {
     fn add(&mut self, key: &[u8], value: &[u8], entry_type: DBEntryType, _: u64, _: u64) {
+        // DBEntryType::BlobIndex will be skipped because we can't parse the value.
         if entry_type != DBEntryType::Put {
             return;
         }

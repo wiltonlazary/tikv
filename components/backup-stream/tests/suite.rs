@@ -2,66 +2,76 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    fmt::Display,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use async_compression::futures::write::ZstdDecoder;
 use backup_stream::{
+    BackupStreamGrpcService, BackupStreamResolver, Endpoint, GetCheckpointResult,
+    RegionCheckpointOperation, RegionSet, Task,
     errors::Result,
     metadata::{
+        MetadataClient, StreamTask,
         keys::{KeyValue, MetaKey},
         store::{MetaStore, SlashEtcStore},
-        MetadataClient, StreamTask,
     },
     observer::BackupStreamObserver,
     router::{Router, TaskSelector},
-    utils, BackupStreamResolver, Endpoint, GetCheckpointResult, RegionCheckpointOperation,
-    RegionSet, Service, Task,
+    utils,
 };
-use futures::{executor::block_on, AsyncWriteExt, Future, Stream, StreamExt};
+use encryption::{BackupEncryptionManager, MultiMasterKeyBackend};
+use futures::{AsyncWriteExt, Future, Stream, StreamExt, executor::block_on};
 use grpcio::{ChannelBuilder, Server, ServerBuilder};
 use kvproto::{
     brpb::{CompressionType, Local, Metadata, StorageBackend},
+    encryptionpb::EncryptionMethod,
     kvrpcpb::*,
     logbackuppb::{SubscribeFlushEventRequest, SubscribeFlushEventResponse},
-    logbackuppb_grpc::{create_log_backup, LogBackupClient},
+    logbackuppb_grpc::{LogBackupClient, create_log_backup},
     tikvpb::*,
 };
 use pd_client::PdClient;
-use protobuf::parse_from_bytes;
-use raftstore::{
-    router::{CdcRaftRouter, ServerRaftStoreRouter},
-    RegionInfoAccessor,
-};
+use raftstore::{RegionInfoAccessor, router::CdcRaftRouter};
 use resolved_ts::LeadershipResolver;
-use tempdir::TempDir;
+use tempfile::TempDir;
 use test_pd_client::TestPdClient;
-use test_raftstore::{new_server_cluster, Cluster, ServerCluster, SimulateTransport};
+use test_raftstore::{Cluster, Config, ServerCluster, new_server_cluster};
 use test_util::retry;
-use tikv::config::BackupStreamConfig;
+use tikv::{
+    config::{BackupStreamConfig, ResolvedTsConfig},
+    storage::txn::txn_status_cache::TxnStatusCache,
+};
 use tikv_util::{
+    HandyRwLock,
     codec::{
         number::NumberEncoder,
         stream_event::{EventIterator, Iterator},
     },
-    info,
+    debug, info,
     worker::LazyWorker,
-    HandyRwLock,
 };
 use txn_types::{Key, TimeStamp, WriteRef};
 use walkdir::WalkDir;
+
+#[derive(Debug)]
+pub struct FileSegments {
+    path: PathBuf,
+    segments: Vec<(usize, usize)>,
+}
+
+#[derive(Default, Debug)]
+pub struct LogFiles {
+    default_cf: Vec<FileSegments>,
+    write_cf: Vec<FileSegments>,
+}
 
 pub type TestEndpoint = Endpoint<
     ErrorStore<SlashEtcStore>,
     RegionInfoAccessor,
     engine_test::kv::KvTestEngine,
-    CdcRaftRouter<
-        SimulateTransport<
-            ServerRaftStoreRouter<engine_test::kv::KvTestEngine, engine_test::raft::RaftTestEngine>,
-        >,
-    >,
     TestPdClient,
 >;
 
@@ -120,6 +130,7 @@ pub struct SuiteBuilder {
     nodes: usize,
     metastore_error: Box<dyn Fn(&str) -> Result<()> + Send + Sync>,
     cfg: Box<dyn FnOnce(&mut BackupStreamConfig)>,
+    cluster_cfg: Box<dyn FnOnce(&mut Config)>,
 }
 
 impl SuiteBuilder {
@@ -131,6 +142,7 @@ impl SuiteBuilder {
             cfg: Box::new(|cfg| {
                 cfg.enable = true;
             }),
+            cluster_cfg: Box::new(|_| {}),
         }
     }
 
@@ -158,16 +170,28 @@ impl SuiteBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn cluster_cfg(mut self, f: impl FnOnce(&mut Config) + 'static) -> Self {
+        let old_f = self.cluster_cfg;
+        self.cluster_cfg = Box::new(move |cfg| {
+            old_f(cfg);
+            f(cfg);
+        });
+        self
+    }
+
     pub fn build(self) -> Suite {
         let Self {
             name: case,
             nodes: n,
             metastore_error,
             cfg: cfg_f,
+            cluster_cfg: ccfg_f,
         } = self;
 
         info!("start test"; "case" => %case, "nodes" => %n);
-        let cluster = new_server_cluster(42, n);
+        let mut cluster = new_server_cluster(42, n);
+        ccfg_f(&mut cluster.cfg);
         let mut suite = Suite {
             endpoints: Default::default(),
             meta_store: ErrorStore {
@@ -182,8 +206,8 @@ impl SuiteBuilder {
             env: Arc::new(grpcio::Environment::new(1)),
             cluster,
 
-            temp_files: TempDir::new("temp").unwrap(),
-            flushed_files: TempDir::new("flush").unwrap(),
+            temp_files: TempDir::new().unwrap(),
+            flushed_files: TempDir::new().unwrap(),
             case_name: case,
         };
         for id in 1..=(n as u64) {
@@ -253,12 +277,15 @@ pub struct Suite {
     // The place to make services live as long as suite.
     servers: Vec<Server>,
 
-    temp_files: TempDir,
+    pub temp_files: TempDir,
     pub flushed_files: TempDir,
     case_name: String,
 }
 
 impl Suite {
+    pub const PROMISED_SHORT_VALUE: &'static [u8] = b"hello, world";
+    pub const PROMISED_LONG_VALUE: &'static [u8] = &[0xbb; 4096];
+
     pub fn simple_task(&self, name: &str) -> StreamTask {
         let mut task = StreamTask::default();
         task.info.set_name(name.to_owned());
@@ -281,7 +308,7 @@ impl Suite {
 
         let ob = BackupStreamObserver::new(worker.scheduler());
         let ob2 = ob.clone();
-        s.coprocessor_hooks
+        s.coprocessor_hosts
             .entry(id)
             .or_default()
             .push(Box::new(move |host| {
@@ -335,7 +362,7 @@ impl Suite {
             .get(&id)
             .expect("must register endpoint first");
 
-        let serv = Service::new(endpoint.scheduler());
+        let serv = BackupStreamGrpcService::new(endpoint.scheduler());
         let builder =
             ServerBuilder::new(self.env.clone()).register_service(create_log_backup(serv));
         let mut server = builder.bind("127.0.0.1", 0).build().unwrap();
@@ -343,7 +370,6 @@ impl Suite {
         let (_, port) = server.bind_addrs().next().unwrap();
         let addr = format!("127.0.0.1:{}", port);
         let channel = ChannelBuilder::new(self.env.clone()).connect(&addr);
-        println!("connecting channel to {} for store {}", addr, id);
         let client = LogBackupClient::new(channel);
         self.servers.push(server);
         client
@@ -376,6 +402,7 @@ impl Suite {
             id,
             self.meta_store.clone(),
             cfg,
+            ResolvedTsConfig::default(),
             worker.scheduler(),
             ob,
             regions,
@@ -383,12 +410,24 @@ impl Suite {
             cluster.pd_client.clone(),
             cm,
             BackupStreamResolver::V1(resolver),
+            BackupEncryptionManager::new(
+                None,
+                EncryptionMethod::Plaintext,
+                MultiMasterKeyBackend::default(),
+                sim.encryption.clone(),
+            ),
+            Arc::new(TxnStatusCache::new_for_test()),
         );
         worker.start(endpoint);
     }
 
     pub fn get_meta_cli(&self) -> MetadataClient<impl MetaStore> {
         MetadataClient::new(self.meta_store.clone(), 0)
+    }
+
+    #[allow(dead_code)]
+    pub fn dump_slash_etc(&self) {
+        self.meta_store.inner.blocking_lock().dump();
     }
 
     pub fn must_split(&mut self, key: &[u8]) {
@@ -407,7 +446,7 @@ impl Suite {
         ))
         .unwrap();
         let name = name.to_owned();
-        self.wait_with_router(move |r| block_on(r.get_task_info(&name)).is_ok())
+        self.wait_with_router(move |r| r.get_task_handler(&name).is_ok())
     }
 
     /// This function tries to calculate the global checkpoint from the flush
@@ -451,6 +490,52 @@ impl Suite {
             .await
     }
 
+    #[allow(dead_code)]
+    pub async fn write_records_batched(
+        &mut self,
+        from: usize,
+        n: usize,
+        for_table: i64,
+    ) -> HashSet<Vec<u8>> {
+        let mut inserted = HashSet::default();
+        let mut keys = HashMap::new();
+        let start_ts = self.cluster.pd_client.get_tso().await.unwrap();
+        for sn in (from..(from + n)).map(|x| x * 2) {
+            let sn = sn as u64;
+            let key = make_record_key(for_table, sn);
+            let enc_key = Key::from_raw(&key).into_encoded();
+            let region = self.cluster.get_region_id(&enc_key);
+            let v = keys.entry(region).or_insert_with(|| vec![]);
+            v.push((key, sn));
+        }
+        let commit_ts = self.cluster.pd_client.get_tso().await.unwrap();
+        for (region, keys) in keys {
+            let mut muts = vec![];
+            for (key, sn) in &keys {
+                let raw_key = make_record_key(for_table, *sn);
+                let value = if sn % 4 == 0 {
+                    Self::PROMISED_SHORT_VALUE.to_vec()
+                } else {
+                    Self::PROMISED_LONG_VALUE.to_vec()
+                };
+
+                let k = Key::from_raw(key).append_ts(commit_ts);
+                muts.push(mutation(raw_key, value));
+                inserted.insert(k.into_encoded());
+            }
+            let pk = muts[0].key.clone();
+            self.must_kv_prewrite(region, muts, pk, start_ts);
+            self.must_kv_commit(
+                region,
+                keys.into_iter().map(|(k, _)| k).collect(),
+                start_ts,
+                commit_ts,
+            );
+        }
+
+        inserted
+    }
+
     pub async fn write_records(
         &mut self,
         from: usize,
@@ -458,10 +543,15 @@ impl Suite {
         for_table: i64,
     ) -> HashSet<Vec<u8>> {
         let mut inserted = HashSet::default();
-        for ts in (from..(from + n)).map(|x| x * 2) {
-            let ts = ts as u64;
-            let key = make_record_key(for_table, ts);
-            let muts = vec![mutation(key.clone(), b"hello, world".to_vec())];
+        for sn in (from..(from + n)).map(|x| x * 2) {
+            let sn = sn as u64;
+            let key = make_record_key(for_table, sn);
+            let value = if sn.is_multiple_of(4) {
+                Self::PROMISED_SHORT_VALUE.to_vec()
+            } else {
+                Self::PROMISED_LONG_VALUE.to_vec()
+            };
+            let muts = vec![mutation(key.clone(), value)];
             let enc_key = Key::from_raw(&key).into_encoded();
             let region = self.cluster.get_region_id(&enc_key);
             let start_ts = self.cluster.pd_client.get_tso().await.unwrap();
@@ -470,7 +560,7 @@ impl Suite {
             self.must_kv_commit(region, vec![key.clone()], start_ts, commit_ts);
             inserted.insert(make_encoded_record_key(
                 for_table,
-                ts,
+                sn,
                 commit_ts.into_inner(),
             ));
         }
@@ -506,10 +596,33 @@ impl Suite {
         ts
     }
 
+    pub fn for_each_log_backup_cli(&self, mut cb: impl FnMut(u64, &LogBackupClient)) {
+        for (k, v) in self.log_backup_cli.iter() {
+            cb(*k, v)
+        }
+    }
+
     pub fn force_flush_files(&self, task: &str) {
-        // TODO: use the callback to make the test more stable.
-        self.run(|| Task::ForceFlush(task.to_owned()));
-        self.sync();
+        // Force flush but not wait...
+        // Then the case may use `wait_flush`...
+        let _ = self.force_flush_files_and_wait(task);
+    }
+
+    pub fn force_flush_files_and_wait(&self, task: &str) -> impl Future<Output = ()> + '_ {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        self.run(|| Task::ForceFlush(TaskSelector::ByName(task.to_owned()), tx.clone()));
+        drop(tx);
+
+        async move {
+            while let Some(res) = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("flush not finish after 30s")
+            {
+                if let Some(ref err) = res.error {
+                    panic!("failed to flush: {}", err)
+                }
+            }
+        }
     }
 
     pub fn run(&self, mut t: impl FnMut() -> Task) {
@@ -518,45 +631,52 @@ impl Suite {
         }
     }
 
-    pub fn load_metadata_for_write_records(
-        &self,
-        path: &Path,
-    ) -> HashMap<String, Vec<(usize, usize)>> {
-        let mut meta_map: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-        for entry in WalkDir::new(path) {
-            let entry = entry.unwrap();
-            if entry.file_type().is_file()
-                && entry
-                    .file_name()
-                    .to_str()
-                    .map_or(false, |s| s.ends_with(".meta"))
-            {
-                let content = std::fs::read(entry.path()).unwrap();
-                let meta = parse_from_bytes::<Metadata>(content.as_ref()).unwrap();
-                for g in meta.file_groups.into_iter() {
-                    let path = g.path.split('/').last().unwrap();
-                    for f in g.data_files_info.into_iter() {
-                        let file_info = meta_map.get_mut(path);
-                        if let Some(v) = file_info {
-                            v.push((
-                                f.range_offset as usize,
-                                (f.range_offset + f.range_length) as usize,
-                            ));
+    pub fn get_files_to_check(&self, path: &Path) -> std::io::Result<LogFiles> {
+        let mut res = LogFiles::default();
+        for entry in WalkDir::new(path.join("v1/backupmeta")) {
+            let entry = entry?;
+            if entry.file_name().to_str().unwrap().ends_with(".meta") {
+                let content = std::fs::read(entry.path())?;
+                let meta = protobuf::parse_from_bytes::<Metadata>(&content)?;
+                for fg in meta.get_file_groups() {
+                    let mut default_segs = vec![];
+                    let mut write_segs = vec![];
+                    for file in fg.get_data_files_info() {
+                        let v = if file.cf == "default".into() || file.cf.is_empty() {
+                            Some(&mut default_segs)
+                        } else if file.cf == "write".into() {
+                            Some(&mut write_segs)
                         } else {
-                            let v = vec![(
-                                f.range_offset as usize,
-                                (f.range_offset + f.range_length) as usize,
-                            )];
-                            meta_map.insert(String::from(path), v);
-                        }
+                            None
+                        };
+                        v.into_iter().for_each(|v| {
+                            v.push((
+                                file.get_range_offset() as usize,
+                                (file.get_range_offset() + file.get_range_length()) as usize,
+                            ))
+                        });
+                    }
+                    let p = path.join(fg.get_path());
+                    if !default_segs.is_empty() {
+                        res.default_cf.push(FileSegments {
+                            path: p.clone(),
+                            segments: default_segs,
+                        })
+                    }
+                    if !write_segs.is_empty() {
+                        res.write_cf.push(FileSegments {
+                            path: p,
+                            segments: write_segs,
+                        })
                     }
                 }
             }
         }
-        meta_map
+        Ok(res)
     }
 
-    pub async fn check_for_write_records<'a>(
+    #[track_caller]
+    pub fn check_for_write_records<'a>(
         &self,
         path: &Path,
         key_set: impl std::iter::Iterator<Item = &'a [u8]>,
@@ -565,41 +685,68 @@ impl Suite {
         let n = remain_keys.len();
         let mut extra_key = 0;
         let mut extra_len = 0;
-        let meta_map = self.load_metadata_for_write_records(path);
-        for entry in WalkDir::new(path) {
-            let entry = entry.unwrap();
-            println!("checking: {:?}", entry);
-            if entry.file_type().is_file()
-                && entry
-                    .file_name()
-                    .to_str()
-                    .map_or(false, |s| s.ends_with(".log"))
-            {
-                let buf = std::fs::read(entry.path()).unwrap();
-                let file_infos = meta_map.get(entry.file_name().to_str().unwrap()).unwrap();
-                for &file_info in file_infos {
-                    let mut decoder = ZstdDecoder::new(Vec::new());
-                    let pbuf: &[u8] = &buf[file_info.0..file_info.1];
-                    decoder.write_all(pbuf).await.unwrap();
-                    decoder.flush().await.unwrap();
-                    decoder.close().await.unwrap();
-                    let content = decoder.into_inner();
+        let files = self.get_files_to_check(path).unwrap_or_default();
+        let mut default_keys = HashSet::new();
+        let content_of = |buf: &[u8], range: (usize, usize)| {
+            let mut decoder = ZstdDecoder::new(Vec::new());
+            let pbuf: &[u8] = &buf[range.0..range.1];
+            run_async_test(async {
+                decoder.write_all(pbuf).await.unwrap();
+                decoder.flush().await.unwrap();
+                decoder.close().await.unwrap();
+            });
+            decoder.into_inner()
+        };
+        for entry in files.write_cf {
+            debug!("checking write: {:?}", entry);
 
-                    let mut iter = EventIterator::new(&content);
-                    loop {
-                        if !iter.valid() {
-                            break;
-                        }
-                        iter.next().unwrap();
-                        if !remain_keys.remove(iter.key()) {
-                            extra_key += 1;
-                            extra_len += iter.key().len() + iter.value().len();
-                        }
-
-                        let value = iter.value();
-                        let wf = WriteRef::parse(value).unwrap();
-                        assert_eq!(wf.short_value, Some(b"hello, world" as &[u8]));
+            let buf = std::fs::read(&entry.path).unwrap();
+            for &file_info in entry.segments.iter() {
+                let data = content_of(&buf, file_info);
+                let mut iter = EventIterator::new(&data);
+                loop {
+                    if !iter.valid() {
+                        break;
                     }
+                    iter.next().unwrap();
+                    if !remain_keys.remove(iter.key()) {
+                        extra_key += 1;
+                        extra_len += iter.key().len() + iter.value().len();
+                    }
+
+                    let value = iter.value();
+                    let wf = WriteRef::parse(value).unwrap();
+                    if wf.short_value.is_none() {
+                        let mut key = Key::from_encoded_slice(iter.key()).truncate_ts().unwrap();
+                        key.append_ts_inplace(wf.start_ts);
+
+                        default_keys.insert(key.into_encoded());
+                    } else {
+                        assert_eq!(wf.short_value, Some(Self::PROMISED_SHORT_VALUE));
+                    }
+                }
+            }
+        }
+
+        for entry in files.default_cf {
+            debug!("checking default: {:?}", entry);
+
+            let buf = std::fs::read(&entry.path).unwrap();
+            for &file_info in entry.segments.iter() {
+                let data = content_of(&buf, file_info);
+                let mut iter = EventIterator::new(&data);
+                loop {
+                    if !iter.valid() {
+                        break;
+                    }
+                    iter.next().unwrap();
+                    if !default_keys.remove(iter.key()) {
+                        extra_key += 1;
+                        extra_len += iter.key().len() + iter.value().len();
+                    }
+
+                    let value = iter.value();
+                    assert_eq!(value, Self::PROMISED_LONG_VALUE);
                 }
             }
         }
@@ -613,17 +760,19 @@ impl Suite {
                 extra_len
             )
         }
-        if !remain_keys.is_empty() {
-            panic!(
-                "not all keys are recorded: it remains {:?} (total = {})",
-                remain_keys
-                    .iter()
-                    .take(3)
-                    .map(|v| hex::encode(v))
-                    .collect::<Vec<_>>(),
-                remain_keys.len()
-            );
-        }
+        assert_empty(&remain_keys, "not all keys are recorded");
+        assert_empty(&default_keys, "some keys don't have default entry");
+    }
+}
+
+#[track_caller]
+fn assert_empty(v: &HashSet<impl AsRef<[u8]>>, msg: impl Display) {
+    if !v.is_empty() {
+        panic!(
+            "{msg}: it remains {:?}... (total = {})",
+            v.iter().take(3).map(|v| hex::encode(v)).collect::<Vec<_>>(),
+            v.len()
+        );
     }
 }
 
@@ -811,9 +960,9 @@ impl Suite {
 
     pub fn wait_for_flush(&self) {
         self.wait_with_router(move |r| {
-            let task_names = block_on(r.select_task(TaskSelector::All.reference()));
+            let task_names = r.select_task(TaskSelector::All.reference());
             for task_name in task_names {
-                let tsk = block_on(r.get_task_info(&task_name));
+                let tsk = r.get_task_handler(&task_name);
                 if tsk.unwrap().is_flushing() {
                     return false;
                 }

@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use api_version::{dispatch_api_version, KvFormat};
+use api_version::{KvFormat, dispatch_api_version};
 use causal_ts::CausalTsProviderImpl;
 use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
@@ -15,12 +15,13 @@ use encryption_export::DataKeyManager;
 use engine_rocks::RocksEngine;
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{KvEngine, RaftEngine, TabletRegistry};
-use futures::{executor::block_on, future::BoxFuture, Future};
+use futures::{Future, executor::block_on, future::BoxFuture};
 use grpcio::{ChannelBuilder, EnvBuilder, Environment, Error as GrpcError, Service};
 use grpcio_health::HealthService;
+use health_controller::HealthController;
 use kvproto::{
     deadlock_grpc::create_deadlock,
-    debugpb_grpc::{create_debug, DebugClient},
+    debugpb_grpc::{DebugClient, create_debug},
     diagnosticspb_grpc::create_diagnostics,
     import_sstpb_grpc::create_import_sst,
     kvrpcpb::{ApiVersion, Context},
@@ -31,15 +32,15 @@ use kvproto::{
 };
 use pd_client::PdClient;
 use raftstore::{
+    RegionInfoAccessor,
     coprocessor::CoprocessorHost,
     errors::Error as RaftError,
     store::{
-        region_meta, AutoSplitController, CheckLeaderRunner, FlowStatsReporter, ReadStats,
-        RegionSnapshot, TabletSnapManager, WriteStats,
+        AutoSplitController, CheckLeaderRunner, FlowStatsReporter, ReadStats, RegionSnapshot,
+        TabletSnapManager, WriteStats, region_meta,
     },
-    RegionInfoAccessor,
 };
-use raftstore_v2::{router::RaftRouter, StateStorage, StoreMeta, StoreRouter};
+use raftstore_v2::{StateStorage, StoreMeta, StoreRouter, router::RaftRouter};
 use resource_control::ResourceGroupManager;
 use resource_metering::{CollectorRegHandle, ResourceTagFactory};
 use security::SecurityManager;
@@ -47,38 +48,41 @@ use service::service_manager::GrpcServiceManager;
 use slog_global::debug;
 use tempfile::TempDir;
 use test_pd_client::TestPdClient;
-use test_raftstore::{filter_send, AddressMap, Config, Filter};
+use test_raftstore::{AddressMap, Config, Filter, filter_send};
 use tikv::{
     config::ConfigController,
     coprocessor, coprocessor_v2,
     import::{ImportSstService, SstImporter},
     read_pool::ReadPool,
     server::{
+        ConnectionBuilder, Error, Extension, NodeV2, PdStoreAddrResolver, RaftClient, RaftKv2,
+        Result as ServerResult, Server, ServerTransport,
         debug2::DebuggerImplV2,
         gc_worker::GcWorker,
         load_statistics::ThreadLoadPool,
         lock_manager::LockManager,
         raftkv::ReplicaReadLockChecker,
         resolve,
-        service::{DebugService, DiagnosticsService},
-        ConnectionBuilder, Error, Extension, NodeV2, PdStoreAddrResolver, RaftClient, RaftKv2,
-        Result as ServerResult, Server, ServerTransport,
+        service::{DebugService, DefaultGrpcMessageFilter, DiagnosticsService},
     },
     storage::{
-        self,
+        self, Engine, Storage,
         kv::{FakeExtension, LocalTablets, RaftExtension, SnapContext},
-        txn::flow_controller::{EngineFlowController, FlowController},
-        Engine, Storage,
+        txn::{
+            flow_controller::{EngineFlowController, FlowController},
+            txn_status_cache::TxnStatusCache,
+        },
     },
 };
 use tikv_util::{
-    box_err,
+    Either, HandyRwLock, box_err,
     config::VersionTrack,
+    memory::MemoryQuota,
     quota_limiter::QuotaLimiter,
     sys::thread::ThreadBuildWrapper,
     thd_name,
-    worker::{Builder as WorkerBuilder, LazyWorker},
-    Either, HandyRwLock,
+    thread_name_prefix::RESOLVED_TS_WORKER_THREAD,
+    worker::{Builder as WorkerBuilder, LazyWorker, Worker},
 };
 use tokio::runtime::{Builder as TokioBuilder, Handle};
 use txn_types::TxnExtraScheduler;
@@ -144,6 +148,12 @@ impl<EK: KvEngine> Engine for TestRaftKv2<EK> {
     type SnapshotRes = <SimulateEngine<EK> as Engine>::SnapshotRes;
     fn async_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::SnapshotRes {
         self.raftkv.async_snapshot(ctx)
+    }
+
+    type IMSnap = Self::Snap;
+    type IMSnapshotRes = Self::SnapshotRes;
+    fn async_in_memory_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::IMSnapshotRes {
+        self.async_snapshot(ctx)
     }
 
     type WriteRes = <SimulateEngine<EK> as Engine>::WriteRes;
@@ -220,6 +230,11 @@ impl<EK: KvEngine> RaftExtension for TestExtension<EK> {
     #[inline]
     fn report_store_unreachable(&self, store_id: u64) {
         self.extension.report_store_unreachable(store_id)
+    }
+
+    #[inline]
+    fn report_store_maybe_tombstone(&self, store_id: u64) {
+        self.extension.report_store_maybe_tombstone(store_id)
     }
 
     #[inline]
@@ -413,7 +428,14 @@ impl<EK: KvEngine> ServerCluster<EK> {
         let mut coprocessor_host =
             CoprocessorHost::new(raft_router.store_router().clone(), cfg.coprocessor.clone());
 
-        let region_info_accessor = RegionInfoAccessor::new(&mut coprocessor_host);
+        let region_info_accessor = RegionInfoAccessor::new(
+            &mut coprocessor_host,
+            Arc::new(|| false), // Not applicable to v2
+            Box::new(|| {
+                // v2 does not support ime
+                unreachable!()
+            }),
+        );
 
         let sim_router = SimulateTransport::new(raft_router.clone());
         let mut raft_kv_v2 = TestRaftKv2::new(
@@ -439,7 +461,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
 
         let latest_ts =
             block_on(self.pd_client.get_tso()).expect("failed to get timestamp from PD");
-        let concurrency_manager = ConcurrencyManager::new(latest_ts);
+        let concurrency_manager = ConcurrencyManager::new_for_test(latest_ts);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut gc_worker = GcWorker::new(
@@ -449,12 +471,16 @@ impl<EK: KvEngine> ServerCluster<EK> {
             Default::default(),
             Arc::new(region_info_accessor.clone()),
         );
-        gc_worker.start(node_id).unwrap();
+        gc_worker.start(node_id, coprocessor_host.clone()).unwrap();
 
+        let txn_status_cache = Arc::new(TxnStatusCache::new_for_test());
         let rts_worker = if cfg.resolved_ts.enable {
             // Resolved ts worker
-            let mut rts_worker = LazyWorker::new("resolved-ts");
-            let rts_ob = resolved_ts::Observer::new(rts_worker.scheduler());
+            let rts_memory_quota =
+                Arc::new(MemoryQuota::new(cfg.resolved_ts.memory_quota.0 as usize));
+            let mut rts_worker = LazyWorker::new(RESOLVED_TS_WORKER_THREAD);
+            let rts_ob =
+                resolved_ts::Observer::new(rts_worker.scheduler(), rts_memory_quota.clone());
             rts_ob.register_to(&mut coprocessor_host);
             // resolved ts endpoint needs store id.
             store_meta.lock().unwrap().store_id = node_id;
@@ -468,6 +494,8 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 concurrency_manager.clone(),
                 self.env.clone(),
                 self.security_mgr.clone(),
+                txn_status_cache.clone(),
+                rts_memory_quota,
             );
             // Start the worker
             rts_worker.start(rts_endpoint);
@@ -529,6 +557,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 .as_ref()
                 .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
             resource_manager.clone(),
+            txn_status_cache,
         )?;
         self.storages.insert(node_id, raft_kv_v2.clone());
 
@@ -556,6 +585,8 @@ impl<EK: KvEngine> ServerCluster<EK> {
             Arc::clone(&importer),
             Some(store_meta),
             resource_manager.clone(),
+            Arc::new(region_info_accessor.clone()),
+            Default::default(),
         );
 
         // Create deadlock service.
@@ -599,7 +630,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
             cfg.slow_log_file.clone(),
         );
 
-        let health_service = HealthService::default();
+        let health_controller = HealthController::new();
 
         for _ in 0..100 {
             let mut svr = Server::new(
@@ -616,8 +647,12 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 self.env.clone(),
                 None,
                 debug_thread_pool.clone(),
-                health_service.clone(),
+                health_controller.clone(),
                 resource_manager.clone(),
+                Arc::new(DefaultGrpcMessageFilter::new(
+                    server_cfg.value().reject_messages_on_memory_ratio,
+                )),
+                Worker::new("test-background-worker"),
             )
             .unwrap();
             svr.register_service(create_diagnostics(diag_service.clone()));
@@ -685,7 +720,8 @@ impl<EK: KvEngine> ServerCluster<EK> {
         self.region_info_accessors
             .insert(node_id, region_info_accessor);
         // todo: importer
-        self.health_services.insert(node_id, health_service);
+        self.health_services
+            .insert(node_id, health_controller.get_grpc_health_service());
 
         lock_mgr
             .start(
@@ -718,7 +754,12 @@ impl<EK: KvEngine> ServerCluster<EK> {
         self.concurrency_managers
             .insert(node_id, concurrency_manager);
 
-        let client = RaftClient::new(node_id, self.conn_builder.clone());
+        let client = RaftClient::new(
+            node_id,
+            self.conn_builder.clone(),
+            Duration::from_millis(10),
+            Worker::new("test-worker"),
+        );
         self.raft_clients.insert(node_id, client);
         Ok(node_id)
     }
@@ -736,7 +777,10 @@ impl<EK: KvEngine> ServerCluster<EK> {
         cfg: &resource_metering::Config,
     ) -> (ResourceTagFactory, CollectorRegHandle, Box<dyn FnOnce()>) {
         let (_, collector_reg_handle, resource_tag_factory, recorder_worker) =
-            resource_metering::init_recorder(cfg.precision.as_millis());
+            resource_metering::init_recorder(
+                cfg.precision.as_millis(),
+                cfg.enable_network_io_collection,
+            );
         let (_, data_sink_reg_handle, reporter_worker) =
             resource_metering::init_reporter(cfg.clone(), collector_reg_handle.clone());
         let (_, single_target_worker) = resource_metering::init_single_target(

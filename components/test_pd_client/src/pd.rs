@@ -7,8 +7,8 @@ use std::{
         Bound::{Excluded, Unbounded},
     },
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -19,7 +19,7 @@ use futures::{
     channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
     compat::Future01CompatExt,
     executor::block_on,
-    future::{err, ok, ready, BoxFuture, FutureExt},
+    future::{BoxFuture, FutureExt, err, ok, ready},
     stream,
     stream::StreamExt,
 };
@@ -40,13 +40,13 @@ use pd_client::{
 };
 use raft::eraftpb::ConfChangeType;
 use tikv_util::{
-    store::{check_key_in_region, find_peer, find_peer_by_id, is_learner, new_peer, QueryStats},
+    Either, HandyRwLock,
+    store::{QueryStats, check_key_in_region, find_peer, find_peer_by_id, is_learner, new_peer},
     time::{Instant, UnixSecs},
     timer::GLOBAL_TIMER_HANDLE,
-    Either, HandyRwLock,
 };
 use tokio_timer::timer::Handle;
-use txn_types::{TimeStamp, TSO_PHYSICAL_SHIFT_BITS};
+use txn_types::{TSO_PHYSICAL_SHIFT_BITS, TimeStamp};
 
 use super::*;
 
@@ -529,7 +529,7 @@ impl PdCluster {
         if self
             .stores
             .get(&store_id)
-            .map_or(true, |s| s.store.get_id() != 0)
+            .is_none_or(|s| s.store.get_id() != 0)
         {
             self.stores.insert(
                 store_id,
@@ -547,7 +547,9 @@ impl PdCluster {
     fn get_store(&self, store_id: u64) -> Result<metapb::Store> {
         match self.stores.get(&store_id) {
             Some(s) if s.store.get_id() != 0 => Ok(s.store.clone()),
-            _ => Err(box_err!("store {} not found", store_id)),
+            // Matches PD error message.
+            // See https://github.com/tikv/pd/blob/v7.3.0/server/grpc_service.go#L777-L780
+            _ => Err(box_err!("invalid store ID {}, not found", store_id)),
         }
     }
 
@@ -577,6 +579,20 @@ impl PdCluster {
             .region_id_keys
             .get(&region_id)
             .and_then(|k| self.regions.get(k).cloned()))
+    }
+
+    fn scan_regions(&self, start: &[u8], end: &[u8], limit: i32) -> Vec<metapb::Region> {
+        let mut regions = vec![];
+        for (_, region) in self.regions.range((Excluded(start.to_vec()), Unbounded)) {
+            if !end.is_empty() && region.start_key.as_slice() >= end {
+                break;
+            }
+            regions.push(region.clone());
+            if regions.len() as i32 >= limit {
+                break;
+            }
+        }
+        regions
     }
 
     fn get_region_approximate_size(&self, region_id: u64) -> Option<u64> {
@@ -824,10 +840,18 @@ impl PdCluster {
         }
         self.leaders.insert(region.get_id(), leader.clone());
 
-        self.region_approximate_size
-            .insert(region.get_id(), region_stat.approximate_size);
-        self.region_approximate_keys
-            .insert(region.get_id(), region_stat.approximate_keys);
+        // only update region approximate size/keys when the stats data > 0.
+        // 0 value means the stats data is uninitialized.
+        // The equvalent logic in pd is: https://github.com/tikv/pd/blob/23550ebb90464948a2d6539d9dc9d6d067924d79/pkg/core/region.go#L275
+        if region_stat.approximate_size > 0 {
+            self.region_approximate_size
+                .insert(region.get_id(), region_stat.approximate_size);
+        }
+        if region_stat.approximate_keys > 0 {
+            self.region_approximate_keys
+                .insert(region.get_id(), region_stat.approximate_keys);
+        }
+
         self.region_last_report_ts
             .insert(region.get_id(), region_stat.last_report_ts);
         self.region_last_report_term.insert(region.get_id(), term);
@@ -921,12 +945,12 @@ pub struct TestPdClient {
     feature_gate: FeatureGate,
     trigger_leader_info_loss: AtomicBool,
 
-    pub gc_safepoints: RwLock<Vec<GcSafePoint>>,
+    pub gc_safepoints: RwLock<Vec<ServiceSafePoint>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct GcSafePoint {
-    pub serivce: String,
+pub struct ServiceSafePoint {
+    pub service: String,
     pub ttl: Duration,
     pub safepoint: TimeStamp,
 }
@@ -1063,10 +1087,10 @@ impl TestPdClient {
             };
             let add = add_peers
                 .iter()
-                .all(|peer| find_peer(&region, peer.get_store_id()).map_or(false, |p| p == peer));
+                .all(|peer| find_peer(&region, peer.get_store_id()).is_some_and(|p| p == peer));
             let remove = remove_peers
                 .iter()
-                .all(|peer| find_peer(&region, peer.get_store_id()).map_or(true, |p| p != peer));
+                .all(|peer| find_peer(&region, peer.get_store_id()) != Some(peer));
             if add && remove {
                 return;
             }
@@ -1367,13 +1391,19 @@ impl TestPdClient {
     pub fn region_leader_must_be(&self, region_id: u64, peer: metapb::Peer) {
         for _ in 0..500 {
             sleep_ms(10);
-            if let Some(p) = self.cluster.rl().leaders.get(&region_id) {
-                if *p == peer {
-                    return;
-                }
+            if self.check_region_leader(region_id, peer.clone()) {
+                return;
             }
         }
         panic!("region {} must have leader: {:?}", region_id, peer);
+    }
+
+    pub fn check_region_leader(&self, region_id: u64, peer: metapb::Peer) -> bool {
+        self.cluster
+            .rl()
+            .leaders
+            .get(&region_id)
+            .is_some_and(|p| *p == peer)
     }
 
     // check whether region is split by split_key or not.
@@ -1435,12 +1465,23 @@ impl TestPdClient {
         cluster.replication_status = Some(status);
     }
 
-    pub fn switch_replication_mode(&self, state: DrAutoSyncState, available_stores: Vec<u64>) {
+    pub fn switch_replication_mode(
+        &self,
+        state: Option<DrAutoSyncState>,
+        available_stores: Vec<u64>,
+    ) {
         let mut cluster = self.cluster.wl();
         let status = cluster.replication_status.as_mut().unwrap();
+        if state.is_none() {
+            status.set_mode(ReplicationMode::Majority);
+            let dr = status.mut_dr_auto_sync();
+            dr.state_id += 1;
+            return;
+        }
+        status.set_mode(ReplicationMode::DrAutoSync);
         let dr = status.mut_dr_auto_sync();
         dr.state_id += 1;
-        dr.set_state(state);
+        dr.set_state(state.unwrap());
         dr.available_stores = available_stores;
     }
 
@@ -1643,6 +1684,28 @@ impl PdClient for TestPdClient {
         }
     }
 
+    fn scan_regions(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: i32,
+    ) -> Result<Vec<pdpb::Region>> {
+        self.check_bootstrap()?;
+
+        let result: Vec<_> = self
+            .cluster
+            .rl()
+            .scan_regions(start_key, end_key, limit)
+            .into_iter()
+            .map(|r| {
+                let mut res = pdpb::Region::new();
+                res.set_region(r);
+                res
+            })
+            .collect();
+        Ok(result)
+    }
+
     fn get_cluster_config(&self) -> Result<metapb::Cluster> {
         self.check_bootstrap()?;
         Ok(self.cluster.rl().meta.clone())
@@ -1666,6 +1729,7 @@ impl PdClient for TestPdClient {
             region_stat,
             replication_status,
         );
+        fail_point!("test_pd_client::finish_region_heartbeat");
         match resp {
             Ok(resp) => {
                 let store_id = leader.get_store_id();
@@ -1749,6 +1813,7 @@ impl PdClient for TestPdClient {
         &self,
         region: metapb::Region,
         count: usize,
+        _reason: pdpb::SplitReason,
     ) -> PdFuture<pdpb::AskBatchSplitResponse> {
         if self.is_incompatible {
             return Box::pin(err(Error::Incompatible));
@@ -1925,8 +1990,8 @@ impl PdClient for TestPdClient {
         ttl: Duration,
     ) -> PdFuture<()> {
         if ttl.as_secs() > 0 {
-            self.gc_safepoints.wl().push(GcSafePoint {
-                serivce: name,
+            self.gc_safepoints.wl().push(ServiceSafePoint {
+                service: name,
                 ttl,
                 safepoint,
             });

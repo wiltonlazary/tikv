@@ -55,8 +55,6 @@
 //! storage engines, and that it be extracted into its own crate for use in
 //! TiKV, once the full requirements are better understood.
 
-#![feature(let_chains)]
-
 /// Types and constructors for the "raft" engine
 pub mod raft {
     #[cfg(feature = "test-engine-raft-panic")]
@@ -64,7 +62,13 @@ pub mod raft {
     #[cfg(feature = "test-engine-raft-rocksdb")]
     pub use engine_rocks::RocksEngine as RaftTestEngine;
     use engine_traits::Result;
-    #[cfg(feature = "test-engine-raft-raft-engine")]
+    #[cfg(any(
+        feature = "test-engine-raft-raft-engine",
+        not(any(
+            feature = "test-engine-raft-panic",
+            feature = "test-engine-raft-rocksdb"
+        ))
+    ))]
     pub use raft_log_engine::RaftLogEngine as RaftTestEngine;
 
     use crate::ctor::{RaftDbOptions, RaftEngineConstructorExt};
@@ -83,7 +87,10 @@ pub mod kv {
         PanicEngine as KvTestEngine, PanicEngineIterator as KvTestEngineIterator,
         PanicSnapshot as KvTestSnapshot, PanicWriteBatch as KvTestWriteBatch,
     };
-    #[cfg(feature = "test-engine-kv-rocksdb")]
+    #[cfg(any(
+        feature = "test-engine-kv-rocksdb",
+        not(feature = "test-engine-kv-panic")
+    ))]
     pub use engine_rocks::{
         RocksEngine as KvTestEngine, RocksEngineIterator as KvTestEngineIterator,
         RocksSnapshot as KvTestSnapshot, RocksWriteBatchVec as KvTestWriteBatch,
@@ -127,7 +134,7 @@ pub mod kv {
         }
 
         fn destroy_tablet(&self, _ctx: TabletContext, path: &Path) -> Result<()> {
-            encryption::trash_dir_all(path, self.db_opt.key_manager.as_deref())?;
+            encryption::trash_dir_all(path, self.db_opt.get_key_manager().as_deref())?;
             Ok(())
         }
 
@@ -202,13 +209,17 @@ pub mod ctor {
 
     #[derive(Clone, Default)]
     pub struct DbOptions {
-        pub(crate) key_manager: Option<Arc<DataKeyManager>>,
+        key_manager: Option<Arc<DataKeyManager>>,
         rate_limiter: Option<Arc<IoRateLimiter>>,
         state_storage: Option<Arc<dyn StateStorage>>,
         enable_multi_batch_write: bool,
     }
 
     impl DbOptions {
+        pub fn get_key_manager(&self) -> Option<Arc<DataKeyManager>> {
+            self.key_manager.clone()
+        }
+
         pub fn set_key_manager(&mut self, key_manager: Option<Arc<DataKeyManager>>) {
             self.key_manager = key_manager;
         }
@@ -254,6 +265,7 @@ pub mod ctor {
         disable_auto_compactions: bool,
         level_zero_file_num_compaction_trigger: Option<i32>,
         level_zero_slowdown_writes_trigger: Option<i32>,
+        level_zero_stop_writes_trigger: Option<i32>,
         /// On RocksDB, turns off the range properties collector. Only used in
         /// tests. Unclear how other engines should deal with this.
         no_range_properties: bool,
@@ -268,6 +280,7 @@ pub mod ctor {
                 disable_auto_compactions: false,
                 level_zero_file_num_compaction_trigger: None,
                 level_zero_slowdown_writes_trigger: None,
+                level_zero_stop_writes_trigger: None,
                 no_range_properties: false,
                 no_table_properties: false,
             }
@@ -295,6 +308,14 @@ pub mod ctor {
 
         pub fn get_level_zero_slowdown_writes_trigger(&self) -> Option<i32> {
             self.level_zero_slowdown_writes_trigger
+        }
+
+        pub fn set_level_zero_stop_writes_trigger(&mut self, n: i32) {
+            self.level_zero_stop_writes_trigger = Some(n);
+        }
+
+        pub fn get_level_zero_stop_writes_trigger(&self) -> Option<i32> {
+            self.level_zero_stop_writes_trigger
         }
 
         pub fn set_no_range_properties(&mut self, v: bool) {
@@ -358,13 +379,12 @@ pub mod ctor {
 
     mod rocks {
         use engine_rocks::{
-            get_env,
+            RocksCfOptions, RocksDbOptions, RocksPersistenceListener, get_env,
             properties::{MvccPropertiesCollectorFactory, RangePropertiesCollectorFactory},
-            util::{new_engine_opt as rocks_new_engine_opt, RangeCompactionFilterFactory},
-            RocksCfOptions, RocksDbOptions, RocksPersistenceListener,
+            util::{RangeCompactionFilterFactory, new_engine_opt as rocks_new_engine_opt},
         };
         use engine_traits::{
-            CfOptions as _, PersistenceListener, Result, TabletContext, CF_DEFAULT,
+            CF_DEFAULT, CfOptions as _, PersistenceListener, Result, TabletContext,
         };
 
         use super::{
@@ -411,13 +431,10 @@ pub mod ctor {
                 rocks_db_opts.enable_multi_batch_write(false);
                 rocks_db_opts.allow_concurrent_memtable_write(false);
                 if let Some(storage) = db_opt.state_storage
-                    && let Some(flush_state) = ctx.flush_state {
-                    let listener = PersistenceListener::new(
-                        ctx.id,
-                        ctx.suffix.unwrap(),
-                        flush_state,
-                        storage,
-                    );
+                    && let Some(flush_state) = ctx.flush_state
+                {
+                    let listener =
+                        PersistenceListener::new(ctx.id, ctx.suffix.unwrap(), flush_state, storage);
                     rocks_db_opts.add_event_listener(RocksPersistenceListener::new(listener));
                 }
                 let factory =
@@ -468,6 +485,9 @@ pub mod ctor {
             }
             if let Some(trigger) = cf_opts.get_level_zero_slowdown_writes_trigger() {
                 rocks_cf_opts.set_level_zero_slowdown_writes_trigger(trigger);
+            }
+            if let Some(trigger) = cf_opts.get_level_zero_stop_writes_trigger() {
+                rocks_cf_opts.set_level_zero_stop_writes_trigger(trigger);
             }
             if cf_opts.get_disable_auto_compactions() {
                 rocks_cf_opts.set_disable_auto_compactions(true);

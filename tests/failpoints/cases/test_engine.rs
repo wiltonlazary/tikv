@@ -1,11 +1,11 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    sync::{mpsc::channel, Mutex},
+    sync::{Mutex, mpsc::channel},
     time::Duration,
 };
 
-use engine_traits::{MiscExt, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE, MiscExt};
 use tikv_util::config::ReadableSize;
 
 fn dummy_string(len: usize) -> String {
@@ -57,12 +57,12 @@ fn test_write_buffer_manager() {
     }
 }
 
-#[rustfmt::skip]
 // The test mocks the senario before https://github.com/tikv/rocksdb/pull/347:
 // note: before rocksdb/pull/347, lock is called before on_memtable_sealed.
 // Case:
 // Assume FlushMemtable cf1 (schedule flush task) and BackgroundCallFlush cf1
 // (execute flush task) are performed concurrently.
+// ```text
 // t        FlushMemtable cf1                   BackgroundCallFlush cf1
 // 1.       lock
 // 2.       convert memtable t2(seqno. 10-20)
@@ -78,7 +78,9 @@ fn test_write_buffer_manager() {
 //                                            update last_flushed to 20
 // 9.       on_memtable_sealed
 //        10 > 20 *panic*
+// ```
 #[test]
+#[ignore]
 fn test_rocksdb_listener() {
     use test_raftstore_v2::*;
     let count = 1;

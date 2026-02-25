@@ -4,8 +4,8 @@ use std::{
     fmt,
     marker::PhantomData,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -14,15 +14,15 @@ use fail::fail_point;
 use file_system::{IoType, WithIoType};
 use kvproto::raft_serverpb::{PeerState, RaftSnapshotData, RegionLocalState};
 use protobuf::Message;
-use raft::{eraftpb::Snapshot, GetEntriesContext};
+use raft::{GetEntriesContext, eraftpb::Snapshot};
 use tikv_util::{error, info, time::Instant, worker::Runnable};
 
 use crate::store::{
+    MAX_INIT_ENTRY_COUNT, RaftlogFetchResult, TabletSnapKey, TabletSnapManager,
     metrics::{SNAPSHOT_KV_COUNT_HISTOGRAM, SNAPSHOT_SIZE_HISTOGRAM},
     snap::TABLET_SNAPSHOT_VERSION,
     util,
     worker::metrics::{SNAP_COUNTER, SNAP_HISTOGRAM},
-    RaftlogFetchResult, TabletSnapKey, TabletSnapManager, MAX_INIT_ENTRY_COUNT,
 };
 
 pub enum ReadTask<EK> {
@@ -96,7 +96,7 @@ where
 {
     notifier: N,
     raft_engine: ER,
-    sanp_mgr: Option<TabletSnapManager>,
+    snap_mgr: Option<TabletSnapManager>,
     _phantom: PhantomData<EK>,
 }
 
@@ -105,19 +105,19 @@ impl<EK: KvEngine, ER: RaftEngine, N: AsyncReadNotifier> ReadRunner<EK, ER, N> {
         ReadRunner {
             notifier,
             raft_engine,
-            sanp_mgr: None,
+            snap_mgr: None,
             _phantom: PhantomData,
         }
     }
 
     #[inline]
     pub fn set_snap_mgr(&mut self, mgr: TabletSnapManager) {
-        self.sanp_mgr = Some(mgr);
+        self.snap_mgr = Some(mgr);
     }
 
     #[inline]
     fn snap_mgr(&self) -> &TabletSnapManager {
-        self.sanp_mgr.as_ref().unwrap()
+        self.snap_mgr.as_ref().unwrap()
     }
 
     fn generate_snap(&self, snap_key: &TabletSnapKey, tablet: EK) -> crate::Result<()> {

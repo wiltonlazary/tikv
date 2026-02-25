@@ -2,6 +2,7 @@
 
 mod bucket;
 mod command;
+mod disk_snapshot_backup;
 mod life;
 mod misc;
 mod pd;
@@ -11,20 +12,19 @@ mod txn_ext;
 mod unsafe_recovery;
 
 pub use command::{
-    merge_source_path, AdminCmdResult, ApplyFlowControl, CatchUpLogs, CommittedEntries,
-    CompactLogContext, MergeContext, ProposalControl, RequestHalfSplit, RequestSplit,
-    SimpleWriteBinary, SimpleWriteEncoder, SimpleWriteReqDecoder, SimpleWriteReqEncoder,
-    SplitFlowControl, SplitPendingAppend, MERGE_IN_PROGRESS_PREFIX, MERGE_SOURCE_PREFIX,
-    SPLIT_PREFIX,
+    AdminCmdResult, ApplyFlowControl, CatchUpLogs, CommittedEntries, CompactLogContext,
+    MERGE_IN_PROGRESS_PREFIX, MERGE_SOURCE_PREFIX, MergeContext, ProposalControl, RequestHalfSplit,
+    RequestSplit, SPLIT_PREFIX, SimpleWriteBinary, SimpleWriteEncoder, SimpleWriteReqDecoder,
+    SimpleWriteReqEncoder, SplitFlowControl, SplitPendingAppend, merge_source_path,
 };
+pub use disk_snapshot_backup::UnimplementedHandle as DiskSnapBackupHandle;
 pub use life::{AbnormalPeerContext, DestroyProgress, GcPeerContext};
 pub use ready::{
-    write_initial_states, ApplyTrace, AsyncWriter, DataTrace, GenSnapTask, ReplayWatch, SnapState,
-    StateStorage,
+    ApplyTrace, AsyncWriter, DataTrace, GenSnapTask, ReplayWatch, SnapState, StateStorage,
+    write_initial_states,
 };
 
 pub(crate) use self::{
-    bucket::BucketStatsInfo,
     command::SplitInit,
     query::{LocalReader, ReadDelegatePair, SharedReadTablet},
     txn_ext::TxnContext,
@@ -33,11 +33,11 @@ pub(crate) use self::{
 #[cfg(test)]
 pub mod test_util {
     use std::sync::{
-        mpsc::{channel, Receiver, Sender},
         Arc,
+        mpsc::{Receiver, Sender, channel},
     };
 
-    use engine_traits::{CfName, CF_DEFAULT};
+    use engine_traits::{CF_DEFAULT, CfName, KvEngine};
     use kvproto::{kvrpcpb::ApiVersion, metapb::RegionEpoch, raft_cmdpb::RaftRequestHeader};
     use raft::prelude::{Entry, EntryType};
     use raftstore::store::simple_write::SimpleWriteEncoder;
@@ -47,7 +47,7 @@ pub mod test_util {
     use super::{CatchUpLogs, SimpleWriteReqEncoder};
     use crate::{fsm::ApplyResReporter, router::ApplyRes};
 
-    pub fn create_tmp_importer() -> (TempDir, Arc<SstImporter>) {
+    pub fn create_tmp_importer<E: KvEngine>() -> (TempDir, Arc<SstImporter<E>>) {
         let dir = TempDir::new().unwrap();
         let importer = Arc::new(
             SstImporter::new(&Default::default(), dir.path(), None, ApiVersion::V1, true).unwrap(),
@@ -87,7 +87,7 @@ pub mod test_util {
         let mut header = Box::<RaftRequestHeader>::default();
         header.set_region_id(region_id);
         header.set_region_epoch(region_epoch);
-        let req_encoder = SimpleWriteReqEncoder::new(header, encoder.encode(), 512, false);
+        let req_encoder = SimpleWriteReqEncoder::new(header, encoder.encode(), 512);
         let (bin, _) = req_encoder.encode();
         let mut e = Entry::default();
         e.set_entry_type(EntryType::EntryNormal);
@@ -112,7 +112,7 @@ pub mod test_util {
         let mut header = Box::<RaftRequestHeader>::default();
         header.set_region_id(region_id);
         header.set_region_epoch(region_epoch);
-        let req_encoder = SimpleWriteReqEncoder::new(header, encoder.encode(), 512, false);
+        let req_encoder = SimpleWriteReqEncoder::new(header, encoder.encode(), 512);
         let (bin, _) = req_encoder.encode();
         let mut e = Entry::default();
         e.set_entry_type(EntryType::EntryNormal);

@@ -5,6 +5,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use bitflags::bitflags;
 use byteorder::{ByteOrder, NativeEndian};
 use collections::HashMap;
+use fail::fail_point;
 use kvproto::kvrpcpb::{self, Assertion};
 use tikv_util::{
     codec,
@@ -13,6 +14,7 @@ use tikv_util::{
         bytes::BytesEncoder,
         number::{self, NumberEncoder},
     },
+    memory::HeapSize,
 };
 
 use super::timestamp::TimeStamp;
@@ -22,17 +24,50 @@ pub const SHORT_VALUE_MAX_LEN: usize = 255;
 pub const SHORT_VALUE_PREFIX: u8 = b'v';
 
 pub fn is_short_value(value: &[u8]) -> bool {
+    fail_point!("is_short_value_always_false", |_| { false });
     value.len() <= SHORT_VALUE_MAX_LEN
 }
 
 /// Value type which is essentially raw bytes.
 pub type Value = Vec<u8>;
 
+/// Value with more information such as commit timestamp.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValueEntry {
+    pub value: Value,
+    /// The commit timestamp of the value.
+    /// `None` means the commit timestamp unknown.
+    pub commit_ts: Option<TimeStamp>,
+}
+
+impl ValueEntry {
+    #[inline]
+    pub fn new(value: Value, commit_ts: Option<TimeStamp>) -> Self {
+        ValueEntry { value, commit_ts }
+    }
+
+    /// Creates a `ValueEntry` from only a `Value`,
+    /// with other attributes not present.
+    ///
+    /// Please use `ValueEntry::new` instead if commit_ts or other attributes
+    /// are required to make the value complete.
+    #[inline]
+    pub fn from_value(value: Value) -> Self {
+        ValueEntry {
+            value,
+            commit_ts: None,
+        }
+    }
+}
+
 /// Key-value pair type.
 ///
 /// The value is simply raw bytes; the key is a little bit tricky, which is
 /// encoded bytes.
 pub type KvPair = (Vec<u8>, Value);
+
+/// Key-value pair entry type.
+pub type KvPairEntry = (Vec<u8>, ValueEntry);
 
 /// Key type.
 ///
@@ -246,6 +281,10 @@ impl Key {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl Clone for Key {
@@ -270,11 +309,18 @@ impl Display for Key {
     }
 }
 
+impl HeapSize for Key {
+    fn approximate_heap_size(&self) -> usize {
+        self.0.approximate_heap_size()
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum MutationType {
     Put,
     Delete,
     Lock,
+    SharedLock,
     Insert,
     Other,
 }
@@ -294,6 +340,11 @@ pub enum Mutation {
     Delete(Key, Assertion),
     /// Set a lock on `Key`.
     Lock(Key, Assertion),
+    /// Set a shared lock on `Key`.
+    ///
+    /// This variant is only used by shared pessimistic locks so we can
+    /// distinguish them from normal lock mutations.
+    SharedLock(Key, Assertion),
     /// Put `Value` into `Key` if `Key` does not yet exist.
     ///
     /// Returns `kvrpcpb::KeyError::AlreadyExists` if the key already exists.
@@ -302,6 +353,18 @@ pub enum Mutation {
     ///
     /// Returns `kvrpcpb::KeyError::AlreadyExists` if the key already exists.
     CheckNotExists(Key, Assertion),
+}
+
+impl HeapSize for Mutation {
+    fn approximate_heap_size(&self) -> usize {
+        match self {
+            Mutation::Put(kv, _) | Mutation::Insert(kv, _) => kv.approximate_heap_size(),
+            Mutation::Delete(k, _)
+            | Mutation::CheckNotExists(k, _)
+            | Mutation::Lock(k, _)
+            | Mutation::SharedLock(k, _) => k.approximate_heap_size(),
+        }
+    }
 }
 
 impl Debug for Mutation {
@@ -313,12 +376,12 @@ impl Debug for Mutation {
 impl Display for Mutation {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Mutation::Put((key, value), assertion) => write!(
+            // TODO: find a proper way to print values, debug printing them in the log
+            //       may result in large files.
+            Mutation::Put((key, _), assertion) => write!(
                 f,
-                "Put key:{:?} value:{:?} assertion:{:?}",
-                key,
-                &log_wrappers::Value::value(value),
-                assertion
+                "Put key:{:?} value:skipped assertion:{:?}",
+                key, assertion
             ),
             Mutation::Delete(key, assertion) => {
                 write!(f, "Delete key:{:?} assertion:{:?}", key, assertion)
@@ -326,12 +389,15 @@ impl Display for Mutation {
             Mutation::Lock(key, assertion) => {
                 write!(f, "Lock key:{:?} assertion:{:?}", key, assertion)
             }
-            Mutation::Insert((key, value), assertion) => write!(
+            Mutation::SharedLock(key, assertion) => {
+                write!(f, "SharedLock key:{:?} assertion:{:?}", key, assertion)
+            }
+            // TODO: find a proper way to print values, debug printing them in the log
+            //       may result in large files.
+            Mutation::Insert((key, _), assertion) => write!(
                 f,
-                "Put key:{:?} value:{:?} assertion:{:?}",
-                key,
-                &log_wrappers::Value::value(value),
-                assertion
+                "Put key:{:?} value:skipped assertion:{:?}",
+                key, assertion
             ),
             Mutation::CheckNotExists(key, assertion) => {
                 write!(f, "CheckNotExists key:{:?} assertion:{:?}", key, assertion)
@@ -346,6 +412,7 @@ impl Mutation {
             Mutation::Put((ref key, _), _) => key,
             Mutation::Delete(ref key, _) => key,
             Mutation::Lock(ref key, _) => key,
+            Mutation::SharedLock(ref key, _) => key,
             Mutation::Insert((ref key, _), _) => key,
             Mutation::CheckNotExists(ref key, _) => key,
         }
@@ -356,6 +423,7 @@ impl Mutation {
             Mutation::Put(..) => MutationType::Put,
             Mutation::Delete(..) => MutationType::Delete,
             Mutation::Lock(..) => MutationType::Lock,
+            Mutation::SharedLock(..) => MutationType::SharedLock,
             Mutation::Insert(..) => MutationType::Insert,
             _ => MutationType::Other,
         }
@@ -366,6 +434,7 @@ impl Mutation {
             Mutation::Put((key, value), _) => (key, Some(value)),
             Mutation::Delete(key, _) => (key, None),
             Mutation::Lock(key, _) => (key, None),
+            Mutation::SharedLock(key, _) => (key, None),
             Mutation::Insert((key, value), _) => (key, Some(value)),
             Mutation::CheckNotExists(key, _) => (key, None),
         }
@@ -387,6 +456,7 @@ impl Mutation {
             Mutation::Put(_, assertion) => assertion,
             Mutation::Delete(_, assertion) => assertion,
             Mutation::Lock(_, assertion) => assertion,
+            Mutation::SharedLock(_, assertion) => assertion,
             Mutation::Insert(_, assertion) => assertion,
             Mutation::CheckNotExists(_, assertion) => assertion,
         }
@@ -397,6 +467,7 @@ impl Mutation {
             Mutation::Put(_, ref mut assertion) => assertion,
             Mutation::Delete(_, ref mut assertion) => assertion,
             Mutation::Lock(_, ref mut assertion) => assertion,
+            Mutation::SharedLock(_, ref mut assertion) => assertion,
             Mutation::Insert(_, ref mut assertion) => assertion,
             Mutation::CheckNotExists(_, ref mut assertion) => assertion,
         } = assertion;
@@ -415,6 +486,11 @@ impl Mutation {
     /// Creates a Lock mutation with none assertion.
     pub fn make_lock(key: Key) -> Self {
         Mutation::Lock(key, Assertion::None)
+    }
+
+    /// Creates a SharedLock mutation with none assertion.
+    pub fn make_shared_lock(key: Key) -> Self {
+        Mutation::SharedLock(key, Assertion::None)
     }
 
     /// Creates a Insert mutation with none assertion.
@@ -437,6 +513,9 @@ impl From<kvrpcpb::Mutation> for Mutation {
             ),
             kvrpcpb::Op::Del => Mutation::Delete(Key::from_raw(m.get_key()), m.get_assertion()),
             kvrpcpb::Op::Lock => Mutation::Lock(Key::from_raw(m.get_key()), m.get_assertion()),
+            kvrpcpb::Op::SharedLock => {
+                Mutation::SharedLock(Key::from_raw(m.get_key()), m.get_assertion())
+            }
             kvrpcpb::Op::Insert => Mutation::Insert(
                 (Key::from_raw(m.get_key()), m.take_value()),
                 m.get_assertion(),
@@ -451,7 +530,7 @@ impl From<kvrpcpb::Mutation> for Mutation {
 
 /// `OldValue` is used by cdc to read the previous value associated with some
 /// key during the prewrite process.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum OldValue {
     /// A real `OldValue`.
     Value { value: Value },
@@ -545,6 +624,15 @@ impl TxnExtra {
     pub fn is_empty(&self) -> bool {
         self.old_values.is_empty()
     }
+
+    pub fn size(&self) -> usize {
+        let mut result = 0;
+        for (key, value) in &self.old_values {
+            result += key.len();
+            result += value.0.size();
+        }
+        result + std::mem::size_of::<Self>()
+    }
 }
 
 pub trait TxnExtraScheduler: Send + Sync {
@@ -585,7 +673,7 @@ impl WriteBatchFlags {
 /// The position info of the last actual write (PUT or DELETE) of a LOCK record.
 /// Note that if the last change is a DELETE, its LastChange can be either
 /// Exist(which points to it) or NotExist.
-#[derive(Clone, Default, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub enum LastChange {
     #[default]
     Unknown,
@@ -641,6 +729,14 @@ impl LastChange {
             Self::make_exist(last_change_ts, estimated_versions_to_last_change)
         }
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum CommitRole {
+    /// Indicates it commits the primary key in request.
+    Primary,
+    /// Indicates it commits the secondary key(s) in request.
+    Secondary,
 }
 
 #[cfg(test)]

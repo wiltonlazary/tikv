@@ -1,10 +1,10 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{cmp, error::Error as StdError, i32, result, sync::Arc, thread, time::Duration};
+use std::{cmp, error::Error as StdError, result, sync::Arc, thread, time::Duration};
 
 use encryption_export::data_key_manager_from_config;
-use engine_rocks::{util::new_engine_opt, RocksEngine};
-use engine_traits::{Engines, Error as EngineError, Peekable, RaftEngine, SyncMutable};
+use engine_rocks::util::new_engine_opt;
+use engine_traits::{Engines, Error as EngineError, KvEngine, RaftEngine};
 use kvproto::{metapb, raft_serverpb::StoreIdent};
 use pd_client::{Error as PdError, PdClient};
 use raft_log_engine::RaftLogEngine;
@@ -12,7 +12,7 @@ use raftstore::store::initial_region;
 use thiserror::Error;
 use tikv::{
     config::TikvConfig,
-    server::{config::Config as ServerConfig, KvEngineFactoryBuilder},
+    server::{KvEngineFactoryBuilder, config::Config as ServerConfig},
 };
 use tikv_util::{
     config::{ReadableDuration, ReadableSize, VersionTrack},
@@ -53,7 +53,7 @@ const MAX_SPLIT_KEY: u64 = 1 << 31;
 /// 2. peer valid during a recovery time even without leader in its region
 /// 3. PD can not put any peer into tombstone
 /// 4. must ensure all region data with ts less than backup ts (below commit
-/// index) are safe
+///    index) are safe
 pub fn enter_snap_recovery_mode(config: &mut TikvConfig) {
     // TOOD: if we do not have to restart TiKV, then, we need exit the recovery mode
     // and bring the following parameter back.
@@ -251,21 +251,21 @@ pub trait LocalEngineService {
 }
 
 // init engine and read local engine info
-pub struct LocalEngines<ER: RaftEngine> {
-    engines: Engines<RocksEngine, ER>,
+pub struct LocalEngines<EK: KvEngine, ER: RaftEngine> {
+    engines: Engines<EK, ER>,
 }
 
-impl<ER: RaftEngine> LocalEngines<ER> {
-    pub fn new(engines: Engines<RocksEngine, ER>) -> LocalEngines<ER> {
+impl<EK: KvEngine, ER: RaftEngine> LocalEngines<EK, ER> {
+    pub fn new(engines: Engines<EK, ER>) -> LocalEngines<EK, ER> {
         LocalEngines { engines }
     }
 
-    pub fn get_engine(&self) -> &Engines<RocksEngine, ER> {
+    pub fn get_engine(&self) -> &Engines<EK, ER> {
         &self.engines
     }
 }
 
-impl<ER: RaftEngine> LocalEngineService for LocalEngines<ER> {
+impl<EK: KvEngine, ER: RaftEngine> LocalEngineService for LocalEngines<EK, ER> {
     fn set_cluster_id(&self, cluster_id: u64) {
         let res = self
             .get_engine()
@@ -338,10 +338,15 @@ pub fn create_local_engine_service(
     let block_cache = config.storage.block_cache.build_shared_cache();
 
     // init rocksdb / kv db
-    let factory =
-        KvEngineFactoryBuilder::new(env.clone(), config, block_cache, key_manager.clone())
-            .lite(true)
-            .build();
+    let factory = KvEngineFactoryBuilder::new(
+        env.clone(),
+        config,
+        block_cache,
+        key_manager.clone(),
+        Default::default(),
+    )
+    .lite(true)
+    .build();
     let kv_db = match factory.create_shared_db(&config.storage.data_dir) {
         Ok(db) => db,
         Err(e) => handle_engine_error(e),

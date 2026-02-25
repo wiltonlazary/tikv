@@ -7,10 +7,10 @@ use tikv_util::{box_try, debug, info, warn};
 
 use super::{
     super::{
-        error::Result, metrics::*, Coprocessor, KeyEntry, ObserverContext, SplitCheckObserver,
-        SplitChecker,
+        Coprocessor, KeyEntry, ObserverContext, SplitCheckObserver, SplitChecker, error::Result,
+        metrics::*,
     },
-    calc_split_keys_count, Host,
+    Host, calc_split_keys_count,
 };
 use crate::coprocessor::dispatcher::StoreHandle;
 
@@ -158,13 +158,14 @@ impl<C: StoreHandle, E: KvEngine> SplitCheckObserver<E> for SizeCheckObserver<C>
         };
 
         // send it to raftstore to update region approximate size
-        self.router.update_approximate_size(region_id, region_size);
+        self.router
+            .update_approximate_size(region_id, Some(region_size), None);
 
+        let need_split_region = region_size >= host.cfg.region_max_size().0;
         let need_bucket_checker =
             host.cfg.enable_region_bucket() && region_size >= 2 * host.cfg.region_bucket_size.0;
         REGION_SIZE_HISTOGRAM.observe(region_size as f64);
 
-        let need_split_region = region_size >= host.cfg.region_max_size().0;
         if need_split_region || need_bucket_checker {
             // when it's a large region use approximate way to produce split keys
             if need_split_region {
@@ -233,7 +234,7 @@ pub fn get_approximate_split_keys(
 
 #[cfg(test)]
 pub mod tests {
-    use std::{assert_matches::assert_matches, iter, sync::mpsc, u64};
+    use std::{iter, sync::mpsc};
 
     use collections::HashSet;
     use engine_test::{
@@ -241,11 +242,11 @@ pub mod tests {
         kv::KvTestEngine,
     };
     use engine_traits::{
-        CfName, MiscExt, SyncMutable, ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE, LARGE_CFS,
+        ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE, CfName, LARGE_CFS, MiscExt, SyncMutable,
     };
     use kvproto::{
         metapb::{Peer, Region},
-        pdpb::CheckPolicy,
+        pdpb::{CheckPolicy, SplitReason},
     };
     use tempfile::Builder;
     use tikv_util::{config::ReadableSize, worker::Runnable};
@@ -254,7 +255,7 @@ pub mod tests {
     use super::{Checker, *};
     use crate::{
         coprocessor::{
-            dispatcher::SchedTask, Config, CoprocessorHost, ObserverContext, SplitChecker,
+            Config, CoprocessorHost, ObserverContext, SplitChecker, dispatcher::SchedTask,
         },
         store::{BucketRange, KeyEntry, SplitCheckRunner, SplitCheckTask},
     };
@@ -265,11 +266,23 @@ pub mod tests {
         exp_split_keys: Vec<Vec<u8>>,
         ignore_split_keys: bool,
     ) {
+        let mut split = false;
         loop {
             match rx.try_recv() {
-                Ok(SchedTask::UpdateApproximateKeys { region_id, .. })
-                | Ok(SchedTask::UpdateApproximateSize { region_id, .. })
-                | Ok(SchedTask::RefreshRegionBuckets { region_id, .. }) => {
+                Ok(SchedTask::UpdateApproximateKeys {
+                    region_id,
+                    splitable,
+                    ..
+                })
+                | Ok(SchedTask::UpdateApproximateSize {
+                    region_id,
+                    splitable,
+                    ..
+                }) => {
+                    assert_eq!(region_id, exp_region.get_id());
+                    split = split || splitable.unwrap_or(false);
+                }
+                Ok(SchedTask::RefreshRegionBuckets { region_id, .. }) => {
                     assert_eq!(region_id, exp_region.get_id());
                 }
                 Ok(SchedTask::AskSplit {
@@ -283,6 +296,7 @@ pub mod tests {
                     if !ignore_split_keys {
                         assert_eq!(split_keys, exp_split_keys);
                     }
+                    assert!(split);
                     break;
                 }
                 others => panic!("expect split check result, but got {:?}", others),
@@ -303,11 +317,23 @@ pub mod tests {
         exp_region: &Region,
         exp_split_keys_count: usize,
     ) {
+        let mut split = false;
         loop {
             match rx.try_recv() {
-                Ok(SchedTask::UpdateApproximateSize { region_id, .. })
-                | Ok(SchedTask::UpdateApproximateKeys { region_id, .. })
-                | Ok(SchedTask::RefreshRegionBuckets { region_id, .. }) => {
+                Ok(SchedTask::UpdateApproximateSize {
+                    region_id,
+                    splitable,
+                    ..
+                })
+                | Ok(SchedTask::UpdateApproximateKeys {
+                    region_id,
+                    splitable,
+                    ..
+                }) => {
+                    assert_eq!(region_id, exp_region.get_id());
+                    split = split || splitable.unwrap_or(false);
+                }
+                Ok(SchedTask::RefreshRegionBuckets { region_id, .. }) => {
                     assert_eq!(region_id, exp_region.get_id());
                 }
                 Ok(SchedTask::AskSplit {
@@ -319,6 +345,7 @@ pub mod tests {
                     assert_eq!(region_id, exp_region.get_id());
                     assert_eq!(&region_epoch, exp_region.get_region_epoch());
                     assert_eq!(split_keys.len(), exp_split_keys_count);
+                    assert!(split);
                     break;
                 }
                 others => panic!("expect split check result, but got {:?}", others),
@@ -427,8 +454,12 @@ pub mod tests {
             ..Default::default()
         };
 
-        let mut runnable =
-            SplitCheckRunner::new(engine.clone(), tx.clone(), CoprocessorHost::new(tx, cfg));
+        let mut runnable = SplitCheckRunner::new(
+            engine.clone(),
+            tx.clone(),
+            CoprocessorHost::new(tx, cfg),
+            None,
+        );
 
         // so split key will be [z0006]
         for i in 0..7 {
@@ -443,7 +474,9 @@ pub mod tests {
             None,
         ));
         // size has not reached the max_size 100 yet.
-        assert_matches!(rx.try_recv(), Ok(SchedTask::UpdateApproximateSize { region_id, .. }) if region_id == region.get_id());
+        assert!(
+            matches!(rx.try_recv(), Ok(SchedTask::UpdateApproximateSize { region_id, .. }) if region_id == region.get_id())
+        );
 
         for i in 7..11 {
             let s = keys::data_key(format!("{:04}", i).as_bytes());
@@ -563,7 +596,7 @@ pub mod tests {
             }
         };
         let cop_host = CoprocessorHost::new(tx.clone(), cfg);
-        let mut runnable = SplitCheckRunner::new(engine.clone(), tx, cop_host.clone());
+        let mut runnable = SplitCheckRunner::new(engine.clone(), tx, cop_host.clone(), None);
         for i in 0..1000 {
             // if not mvcc, kv size is (6+1)*2 = 14, given bucket size is 3000, expect each
             // bucket has about 210 keys if mvcc, kv size is about 18*2 = 36, expect each
@@ -582,7 +615,8 @@ pub mod tests {
             None,
         ));
 
-        let host = cop_host.new_split_checker_host(&region, &engine, true, CheckPolicy::Scan);
+        let host =
+            cop_host.new_split_checker_host(&region, &engine, SplitReason::Size, CheckPolicy::Scan);
         assert_eq!(host.policy(), CheckPolicy::Approximate);
 
         if !mvcc {
@@ -612,7 +646,8 @@ pub mod tests {
             CheckPolicy::Approximate,
             Some(vec![BucketRange(start.clone(), end.clone())]),
         ));
-        let host = cop_host.new_split_checker_host(&region, &engine, true, CheckPolicy::Scan);
+        let host =
+            cop_host.new_split_checker_host(&region, &engine, SplitReason::Size, CheckPolicy::Scan);
         assert_eq!(host.policy(), CheckPolicy::Approximate);
 
         if !mvcc {
@@ -695,12 +730,14 @@ pub mod tests {
         }
 
         let cop_host = CoprocessorHost::new(tx.clone(), cfg.clone());
-        let host = cop_host.new_split_checker_host(&region, &engine, true, CheckPolicy::Scan);
+        let host =
+            cop_host.new_split_checker_host(&region, &engine, SplitReason::Size, CheckPolicy::Scan);
         assert_eq!(host.policy(), CheckPolicy::Scan);
 
         cfg.prefer_approximate_bucket = true;
         let cop_host = CoprocessorHost::new(tx, cfg);
-        let host = cop_host.new_split_checker_host(&region, &engine, true, CheckPolicy::Scan);
+        let host =
+            cop_host.new_split_checker_host(&region, &engine, SplitReason::Size, CheckPolicy::Scan);
         assert_eq!(host.policy(), CheckPolicy::Approximate);
     }
 
@@ -747,6 +784,7 @@ pub mod tests {
             engine.clone(),
             tx.clone(),
             CoprocessorHost::new(tx.clone(), cfg.clone()),
+            None,
         );
 
         for cf in LARGE_CFS {
@@ -783,8 +821,12 @@ pub mod tests {
         let engine =
             engine_test::kv::new_engine_opt(path_str, DbOptions::default(), cfs_opts).unwrap();
 
-        let mut runnable =
-            SplitCheckRunner::new(engine.clone(), tx.clone(), CoprocessorHost::new(tx, cfg));
+        let mut runnable = SplitCheckRunner::new(
+            engine.clone(),
+            tx.clone(),
+            CoprocessorHost::new(tx, cfg),
+            None,
+        );
 
         // Flush a sst of CF_LOCK with range properties.
         for i in 7..15 {
@@ -869,7 +911,7 @@ pub mod tests {
         );
 
         let mut big_value = Vec::with_capacity(256);
-        big_value.extend(iter::repeat(b'v').take(256));
+        big_value.extend(iter::repeat_n(b'v', 256));
         for i in 0..100 {
             let k = format!("key_{:03}", i).into_bytes();
             let k = keys::data_key(Key::from_raw(&k).as_encoded());
@@ -896,7 +938,7 @@ pub mod tests {
         let engine = engine_test::kv::new_engine_opt(path, db_opts, cfs_opts).unwrap();
 
         let mut big_value = Vec::with_capacity(256);
-        big_value.extend(iter::repeat(b'v').take(256));
+        big_value.extend(iter::repeat_n(b'v', 256));
 
         for i in 0..4 {
             let k = format!("key_{:03}", i).into_bytes();

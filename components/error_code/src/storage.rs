@@ -25,6 +25,7 @@ define_error_codes!(
     DEADLINE_EXCEEDED => ("DeadlineExceeded", "", ""),
     API_VERSION_NOT_MATCHED => ("ApiVersionNotMatched", "", ""),
     INVALID_KEY_MODE => ("InvalidKeyMode", "", ""),
+    INVALID_MAX_TS_UPDATE => ("InvalidMaxTsUpdate", "", ""),
 
     COMMITTED => ("Committed", "", ""),
     PESSIMISTIC_LOCK_ROLLED_BACK => ("PessimisticLockRolledBack", "", ""),
@@ -45,6 +46,7 @@ define_error_codes!(
 
     PRIMARY_MISMATCH => ("PrimaryMismatch", "", ""),
     UNDETERMINED => ("Undetermined", "", ""),
+    GENERATION_OUT_OF_ORDER => ("GenerationOutOfOrder", "", ""),
 
     UNKNOWN => ("Unknown", "", "")
 );

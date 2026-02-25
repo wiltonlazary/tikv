@@ -35,36 +35,37 @@ use engine_traits::{
 use fail::fail_point;
 use futures::channel::oneshot;
 use kvproto::{
+    kvrpcpb::DiskFullOpt,
     metapb::{self, Region, RegionEpoch},
-    pdpb::CheckPolicy,
+    pdpb::{CheckPolicy, SplitReason},
     raft_cmdpb::{AdminRequest, AdminResponse, RaftCmdRequest, SplitRequest},
     raft_serverpb::{RaftMessage, RaftSnapshotData},
 };
 use protobuf::Message;
-use raft::{prelude::Snapshot, INVALID_ID};
+use raft::{INVALID_ID, prelude::Snapshot};
 use raftstore::{
+    Result,
     coprocessor::RegionChangeReason,
     store::{
+        PeerPessimisticLocks, RAFT_INIT_LOG_INDEX, RAFT_INIT_LOG_TERM, SplitCheckTask, Transport,
         cmd_resp,
-        fsm::{apply::validate_batch_split, ApplyMetrics},
+        fsm::{ApplyMetrics, apply::validate_batch_split},
         metrics::PEER_ADMIN_CMD_COUNTER,
         snap::TABLET_SNAPSHOT_VERSION,
         util::{self, KeysInfoFormatter},
-        PeerPessimisticLocks, SplitCheckTask, Transport, RAFT_INIT_LOG_INDEX, RAFT_INIT_LOG_TERM,
     },
-    Result,
 };
 use slog::{error, info, warn};
 use tikv_util::{box_err, log::SlogFormat, slog_panic, time::Instant};
 
 use crate::{
+    Error,
     batch::StoreContext,
     fsm::{ApplyResReporter, PeerFsmDelegate},
     operation::{AdminCmdResult, SharedReadTablet},
     raft::{Apply, Peer},
     router::{CmdResChannel, PeerMsg, PeerTick, StoreMsg},
     worker::tablet,
-    Error,
 };
 
 pub const SPLIT_PREFIX: &str = "split";
@@ -332,6 +333,14 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             ))));
             return;
         }
+        // Check whether the admin request can be proposed when disk full.
+        if let Err(e) =
+            self.check_proposal_with_disk_full_opt(ctx, DiskFullOpt::AllowedOnAlmostFull)
+        {
+            info!(self.logger, "disk is full, skip split"; "err" => ?e);
+            ch.set_result(cmd_resp::new_error(e));
+            return;
+        }
         if let Err(e) = util::validate_split_region(
             self.region_id(),
             self.peer_id(),
@@ -365,6 +374,13 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             info!(self.logger, "not leader, skip.");
             return;
         }
+        // Check whether the admin request can be proposed when disk full.
+        if let Err(e) =
+            self.check_proposal_with_disk_full_opt(ctx, DiskFullOpt::AllowedOnAlmostFull)
+        {
+            info!(self.logger, "disk is full, skip half split"; "err" => ?e);
+            return;
+        }
 
         let region = self.region();
         if util::is_epoch_stale(&rhs.epoch, region.get_region_epoch()) {
@@ -393,7 +409,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             region.clone(),
             rhs.start_key,
             rhs.end_key,
-            false,
+            SplitReason::Admin,
             rhs.policy,
             split_check_bucket_ranges,
         );
@@ -989,8 +1005,8 @@ mod test {
         kv::{KvTestEngine, TestTabletFactory},
     };
     use engine_traits::{
-        FlushState, Peekable, SstApplyState, TabletContext, TabletRegistry, WriteBatch, CF_DEFAULT,
-        DATA_CFS,
+        CF_DEFAULT, DATA_CFS, FlushState, Peekable, SstApplyState, TabletContext, TabletRegistry,
+        WriteBatch,
     };
     use futures::executor::block_on;
     use kvproto::{
@@ -1000,7 +1016,7 @@ mod test {
     };
     use raftstore::{
         coprocessor::CoprocessorHost,
-        store::{cmd_resp::new_error, Config},
+        store::{Config, cmd_resp::new_error},
     };
     use slog::o;
     use tempfile::TempDir;
@@ -1012,7 +1028,7 @@ mod test {
 
     use super::*;
     use crate::{
-        operation::test_util::{create_tmp_importer, MockReporter},
+        operation::test_util::{MockReporter, create_tmp_importer},
         raft::Apply,
     };
 

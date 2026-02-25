@@ -5,6 +5,7 @@
 
 mod consistency_check;
 pub(super) mod metrics;
+pub mod mvcc_read_tracker;
 pub(crate) mod reader;
 pub(super) mod txn;
 
@@ -13,10 +14,12 @@ use std::{error, io};
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use kvproto::kvrpcpb::{self, Assertion, IsolationLevel};
 use thiserror::Error;
-use tikv_util::{metrics::CRITICAL_ERROR, panic_when_unexpected_key_or_data, set_panic_mark};
+use tikv_util::{
+    Either, metrics::CRITICAL_ERROR, panic_when_unexpected_key_or_data, set_panic_mark,
+};
 pub use txn_types::{
-    Key, Lock, LockType, Mutation, TimeStamp, Value, Write, WriteRef, WriteType,
-    SHORT_VALUE_MAX_LEN,
+    Key, Lock, LockType, Mutation, SHORT_VALUE_MAX_LEN, SharedLocks, TimeStamp, Value, Write,
+    WriteRef, WriteType,
 };
 
 pub use self::{
@@ -25,8 +28,9 @@ pub use self::{
     },
     metrics::{GC_DELETE_VERSIONS_HISTOGRAM, MVCC_VERSIONS_HISTOGRAM},
     reader::*,
-    txn::{GcInfo, MvccTxn, ReleasedLock, MAX_TXN_WRITE_SIZE},
+    txn::{GcInfo, MAX_TXN_WRITE_SIZE, MvccTxn, ReleasedLock},
 };
+pub use crate::storage::types::MvccInfo;
 
 #[derive(Debug, Error)]
 pub enum ErrorInner {
@@ -40,7 +44,7 @@ pub enum ErrorInner {
     Codec(#[from] tikv_util::codec::Error),
 
     #[error("key is locked (backoff or cleanup) {0:?}")]
-    KeyIsLocked(kvproto::kvrpcpb::LockInfo),
+    KeyIsLocked(kvrpcpb::LockInfo),
 
     #[error("{0}")]
     BadFormat(#[source] txn_types::Error),
@@ -69,6 +73,7 @@ pub enum ErrorInner {
         start_ts: TimeStamp,
         commit_ts: TimeStamp,
         key: Vec<u8>,
+        mvcc_info: Option<MvccInfo>,
     },
 
     #[error("txn not found {} key: {}", .start_ts, log_wrappers::Value::key(.key))]
@@ -110,8 +115,13 @@ pub enum ErrorInner {
         wait_chain: Vec<kvproto::deadlock::WaitForEntry>,
     },
 
-    #[error("key {} already exists", log_wrappers::Value::key(.key))]
-    AlreadyExist { key: Vec<u8> },
+    #[error(
+        "key {} already exists with existing_start_ts={}", log_wrappers::Value::key(.key),
+        .existing_start_ts)]
+    AlreadyExist {
+        key: Vec<u8>,
+        existing_start_ts: TimeStamp,
+    },
 
     #[error(
         "default not found: key:{}, maybe read truncated/dropped table data?",
@@ -128,6 +138,7 @@ pub enum ErrorInner {
         commit_ts: TimeStamp,
         key: Vec<u8>,
         min_commit_ts: TimeStamp,
+        mvcc_info: Option<MvccInfo>,
     },
 
     #[error("bad format key(version)")]
@@ -172,7 +183,16 @@ pub enum ErrorInner {
     LockIfExistsFailed { start_ts: TimeStamp, key: Vec<u8> },
 
     #[error("check_txn_status sent to secondary lock, current lock: {0:?}")]
-    PrimaryMismatch(kvproto::kvrpcpb::LockInfo),
+    PrimaryMismatch(kvrpcpb::LockInfo),
+
+    #[error("generation out of order: current = {0}, key={1:?}, lock = {1:?}")]
+    GenerationOutOfOrder(u64, Key, Lock),
+
+    #[error("{0}")]
+    InvalidMaxTsUpdate(#[from] concurrency_manager::InvalidMaxTsUpdate),
+
+    #[error("key is locked by shared locks without shrink-only flag: {0:?}")]
+    NotInShrinkMode(SharedLocks),
 
     #[error("{0:?}")]
     Other(#[from] Box<dyn error::Error + Sync + Send>),
@@ -189,10 +209,12 @@ impl ErrorInner {
                 start_ts,
                 commit_ts,
                 key,
+                mvcc_info,
             } => Some(ErrorInner::TxnLockNotFound {
                 start_ts: *start_ts,
                 commit_ts: *commit_ts,
                 key: key.to_owned(),
+                mvcc_info: mvcc_info.clone(),
             }),
             ErrorInner::TxnNotFound { start_ts, key } => Some(ErrorInner::TxnNotFound {
                 start_ts: *start_ts,
@@ -235,7 +257,13 @@ impl ErrorInner {
                 deadlock_key_hash: *deadlock_key_hash,
                 wait_chain: wait_chain.clone(),
             }),
-            ErrorInner::AlreadyExist { key } => Some(ErrorInner::AlreadyExist { key: key.clone() }),
+            ErrorInner::AlreadyExist {
+                key,
+                existing_start_ts,
+            } => Some(ErrorInner::AlreadyExist {
+                key: key.clone(),
+                existing_start_ts: *existing_start_ts,
+            }),
             ErrorInner::DefaultNotFound { key } => Some(ErrorInner::DefaultNotFound {
                 key: key.to_owned(),
             }),
@@ -244,11 +272,13 @@ impl ErrorInner {
                 commit_ts,
                 key,
                 min_commit_ts,
+                mvcc_info,
             } => Some(ErrorInner::CommitTsExpired {
                 start_ts: *start_ts,
                 commit_ts: *commit_ts,
                 key: key.clone(),
                 min_commit_ts: *min_commit_ts,
+                mvcc_info: mvcc_info.clone(),
             }),
             ErrorInner::KeyVersion => Some(ErrorInner::KeyVersion),
             ErrorInner::Committed {
@@ -304,6 +334,13 @@ impl ErrorInner {
                 })
             }
             ErrorInner::PrimaryMismatch(l) => Some(ErrorInner::PrimaryMismatch(l.clone())),
+            ErrorInner::GenerationOutOfOrder(gen, key, lock_info) => Some(
+                ErrorInner::GenerationOutOfOrder(*gen, key.clone(), lock_info.clone()),
+            ),
+            ErrorInner::InvalidMaxTsUpdate(e) => Some(ErrorInner::InvalidMaxTsUpdate(e.clone())),
+            ErrorInner::NotInShrinkMode(shared_locks) => {
+                Some(ErrorInner::NotInShrinkMode(shared_locks.clone()))
+            }
             ErrorInner::Io(_) | ErrorInner::Other(_) => None,
         }
     }
@@ -373,6 +410,11 @@ impl From<txn_types::Error> for ErrorInner {
                 primary,
                 reason,
             },
+            txn_types::Error(e @ box txn_types::ErrorInner::InvalidOperation(_)) => {
+                // This error indicates misuse of SharedLocks API. It
+                // should be handled internally.
+                ErrorInner::Other(e)
+            }
         }
     }
 }
@@ -407,6 +449,9 @@ impl ErrorCodeExt for Error {
             ErrorInner::AssertionFailed { .. } => error_code::storage::ASSERTION_FAILED,
             ErrorInner::LockIfExistsFailed { .. } => error_code::storage::LOCK_IF_EXISTS_FAILED,
             ErrorInner::PrimaryMismatch(_) => error_code::storage::PRIMARY_MISMATCH,
+            ErrorInner::GenerationOutOfOrder(..) => error_code::storage::GENERATION_OUT_OF_ORDER,
+            ErrorInner::InvalidMaxTsUpdate(_) => error_code::storage::INVALID_MAX_TS_UPDATE,
+            ErrorInner::NotInShrinkMode(_) => error_code::storage::KEY_IS_LOCKED,
             ErrorInner::Other(_) => error_code::storage::UNKNOWN,
         }
     }
@@ -426,10 +471,12 @@ pub fn default_not_found_error(key: Vec<u8>, hint: &str) -> Error {
             hint,
         );
     } else {
+        let bt = backtrace::Backtrace::new();
         error!(
             "default value not found";
             "key" => &log_wrappers::Value::key(&key),
             "hint" => hint,
+            "bt" => ?bt,
         );
         Error::from(ErrorInner::DefaultNotFound { key })
     }
@@ -528,9 +575,9 @@ pub mod tests {
         key: &Key,
         ts: TimeStamp,
     ) -> Result<()> {
-        if let Some(lock) = reader.load_lock(key)? {
-            if let Err(e) = Lock::check_ts_conflict(
-                Cow::Owned(lock),
+        if let Some(lock_or_shared_locks) = reader.load_lock(key)? {
+            if let Err(e) = txn_types::check_ts_conflict(
+                Cow::Owned(lock_or_shared_locks),
                 key,
                 ts,
                 &Default::default(),
@@ -596,7 +643,12 @@ pub mod tests {
     ) -> Lock {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut reader = MvccReader::new(snapshot, None, true);
-        let lock = reader.load_lock(&Key::from_raw(key)).unwrap().unwrap();
+        let lock = match reader.load_lock(&Key::from_raw(key)).unwrap().unwrap() {
+            Either::Left(lock) => lock,
+            Either::Right(_shared_locks) => {
+                unimplemented!("SharedLocks returned from load_lock is not supported here")
+            }
+        };
         assert_eq!(lock.ts, start_ts.into());
         assert!(!lock.is_pessimistic_lock());
         lock
@@ -610,7 +662,12 @@ pub mod tests {
     ) {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut reader = MvccReader::new(snapshot, None, true);
-        let lock = reader.load_lock(&Key::from_raw(key)).unwrap().unwrap();
+        let lock = match reader.load_lock(&Key::from_raw(key)).unwrap().unwrap() {
+            Either::Left(lock) => lock,
+            Either::Right(_shared_locks) => {
+                unimplemented!("SharedLocks returned from load_lock is not supported here")
+            }
+        };
         assert_eq!(lock.ts, start_ts.into());
         assert!(!lock.is_pessimistic_lock());
         assert_eq!(lock.ttl, ttl);
@@ -626,7 +683,12 @@ pub mod tests {
     ) {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let mut reader = MvccReader::new(snapshot, None, true);
-        let lock = reader.load_lock(&Key::from_raw(key)).unwrap().unwrap();
+        let lock = match reader.load_lock(&Key::from_raw(key)).unwrap().unwrap() {
+            Either::Left(lock) => lock,
+            Either::Right(_shared_locks) => {
+                unimplemented!("SharedLocks returned from load_lock is not supported here")
+            }
+        };
         assert_eq!(lock.ts, start_ts.into());
         assert_eq!(lock.ttl, ttl);
         assert_eq!(lock.min_commit_ts, min_commit_ts.into());
@@ -849,5 +911,16 @@ pub mod tests {
             reader.scan_keys(start.map(Key::from_raw), limit).unwrap(),
             expect
         );
+    }
+
+    pub fn must_load_shared_lock<E: Engine>(engine: &mut E, key: &[u8]) -> SharedLocks {
+        use tikv_util::Either;
+        let snapshot = engine.snapshot(Default::default()).unwrap();
+        let mut reader = MvccReader::new(snapshot, None, true);
+        let lock_or_shared = reader.load_lock(&Key::from_raw(key)).unwrap().unwrap();
+        match lock_or_shared {
+            Either::Right(shared_locks) => shared_locks,
+            Either::Left(_) => panic!("Expected SharedLocks, got Lock"),
+        }
     }
 }

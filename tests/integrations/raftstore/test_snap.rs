@@ -4,9 +4,9 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender},
-        Arc, Mutex, RwLock,
     },
     time::Duration,
 };
@@ -17,15 +17,18 @@ use file_system::{IoOp, IoType};
 use futures::executor::block_on;
 use grpcio::{self, ChannelBuilder, Environment};
 use kvproto::{
-    raft_serverpb::{RaftMessage, RaftSnapshotData},
+    kvrpcpb,
+    kvrpcpb::KeyRange,
+    raft_serverpb::{ExtraMessageType, RaftMessage, RaftSnapshotData},
     tikvpb::TikvClient,
 };
+use pd_client::PdClient;
 use protobuf::Message as M1;
 use raft::eraftpb::{Message, MessageType, Snapshot};
 use raftstore::{
+    Result,
     coprocessor::{ApplySnapshotObserver, BoxApplySnapshotObserver, Coprocessor, CoprocessorHost},
     store::{snap::TABLET_SNAPSHOT_VERSION, *},
-    Result,
 };
 use rand::Rng;
 use security::SecurityManager;
@@ -33,14 +36,17 @@ use test_raftstore::*;
 use test_raftstore_macro::test_case;
 use test_raftstore_v2::WrapFactory;
 use tikv::server::{snap::send_snap, tablet_snap::send_snap as send_snap_v2};
+use tikv_kv::{
+    Engine, Error, ErrorInner, ExtraRegionOverride, SnapContext, Snapshot as _, SnapshotExt,
+};
 use tikv_util::{
+    HandyRwLock,
     config::*,
     time::{Instant, Limiter, UnixSecs},
-    HandyRwLock,
 };
 
 fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>, max_snapshot_file_size: u64) {
-    cluster.cfg.rocksdb.titan.enabled = true;
+    cluster.cfg.rocksdb.titan.enabled = Some(true);
     cluster.cfg.raft_store.raft_log_gc_count_limit = Some(1000);
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(10);
     cluster.cfg.raft_store.snap_apply_batch_size = ReadableSize(500);
@@ -232,7 +238,7 @@ fn test_concurrent_snap() {
     // Test that the handling of snapshot is correct when there are multiple
     // snapshots which have overlapped region ranges arrive at the same
     // raftstore.
-    cluster.cfg.rocksdb.titan.enabled = true;
+    cluster.cfg.rocksdb.titan.enabled = Some(true);
     // Disable raft log gc in this test case.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::secs(60);
     // For raftstore v2, after split, follower delays first messages (see
@@ -285,7 +291,7 @@ fn test_concurrent_snap_v2() {
     // Test that the handling of snapshot is correct when there are multiple
     // snapshots which have overlapped region ranges arrive at the same
     // raftstore.
-    // cluster.cfg.rocksdb.titan.enabled = true;
+    // cluster.cfg.rocksdb.titan.enabled = Some(true);
     // Disable raft log gc in this test case.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::secs(60);
     // For raftstore v2, after split, follower delays first messages (see
@@ -1036,4 +1042,350 @@ fn test_v2_leaner_snapshot_commit_index() {
     cluster.must_transfer_leader(1, new_peer(2, 2));
 
     cluster.must_put(b"k3", b"v3");
+}
+
+/// Snapshot should not be blocked when a peer is removed before receiving
+/// MsgSnapGenPrecheckRequest.
+#[test_case(test_raftstore::new_node_cluster)]
+fn test_remove_peer_after_requesting_snapshot() {
+    let mut cluster = new_cluster(0, 3);
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    // Use run conf change to make new node be initialized with term 0.
+    let r = cluster.run_conf_change();
+
+    // Add peer(3, 3) to store 3
+    cluster.must_put(b"k0", b"v0");
+    pd_client.must_add_peer(r, new_peer(3, 3));
+    must_get_equal(&cluster.get_engine(3), b"k0", b"v0");
+
+    // Add peer(2, 2) to store 2
+    //
+    // Drop MsgSnapGenPrecheckRequest to region 1 on store 2 before adding peer.
+    let (send_tx, send_rx) = mpsc::channel();
+    cluster.add_send_filter(CloneFilterFactory(DropMessageFilter::new(Arc::new(
+        move |m| {
+            let is_precheck_2 = m.get_to_peer().get_id() == 2
+                && m.get_extra_msg().get_type() == ExtraMessageType::MsgSnapGenPrecheckRequest;
+            if is_precheck_2 {
+                let _ = send_tx.send(());
+            }
+            !is_precheck_2
+        },
+    ))));
+    // Make sure add peer conf change is applied on leader side.
+    pd_client.must_add_peer(r, new_peer(2, 2));
+
+    // Make sure peer 2 has requested snapshot.
+    send_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Remove peer(2, 2) from store 2
+    pd_client.must_remove_peer(r, new_peer(2, 2));
+
+    // Clear filters and add peer(2, 4) to store 2.
+    cluster.clear_send_filters();
+    pd_client.must_add_peer(r, new_peer(2, 4));
+
+    // Make sure store 2 has applied a snapshot.
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+}
+
+/// Snapshot should not be blocked when a peer is stopped before receiving
+/// MsgSnapGenPrecheckRequest.
+#[test_case(test_raftstore::new_server_cluster)]
+fn test_network_partition_after_requesting_snapshot() {
+    let mut cluster = new_cluster(0, 5);
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    // Use run conf change to make new node be initialized with term 0.
+    let r = cluster.run_conf_change();
+
+    // Add peers.
+    cluster.must_put(b"k0", b"v0");
+    for id in 2..=3 {
+        pd_client.must_add_peer(r, new_peer(id, id));
+        must_get_equal(&cluster.get_engine(id), b"k0", b"v0");
+    }
+
+    // Add peer(4, 4) to store 4
+    //
+    // Drop MsgSnapGenPrecheckRequest to region 1 on store 4 before adding peer.
+    let (send_tx, send_rx) = mpsc::channel();
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(r, 4)
+            .msg_type(MessageType::MsgSnapshot)
+            .drop_extra_message(ExtraMessageType::MsgSnapGenPrecheckRequest)
+            .direction(Direction::Recv)
+            .set_msg_callback(Arc::new(move |m: &RaftMessage| {
+                if m.get_extra_msg().get_type() == ExtraMessageType::MsgSnapGenPrecheckRequest {
+                    let _ = send_tx.send(());
+                }
+            })),
+    ));
+    // Make sure add peer conf change is applied on leader side.
+    pd_client.must_add_peer(r, new_peer(4, 4));
+
+    // Make sure peer 4 has requested snapshot.
+    send_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Stop node 4.
+    cluster.stop_node(4);
+
+    // Add peer to store 5.
+    pd_client.must_add_peer(r, new_peer(5, 5));
+
+    // Make sure store 5 has applied a snapshot.
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(5), b"k1", b"v1");
+}
+
+/// Snapshot precheck should be cancelled when a leader steps down.
+#[test_case(test_raftstore::new_node_cluster)]
+fn test_leader_step_down_after_requesting_snapshot() {
+    let mut cluster = new_cluster(0, 3);
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+
+    // Use run conf change to make new node be initialized with term 0.
+    let r = cluster.run_conf_change();
+
+    // Add peer(3, 3) to store 3
+    cluster.must_put(b"k0", b"v0");
+    pd_client.must_add_peer(r, new_peer(3, 3));
+    must_get_equal(&cluster.get_engine(3), b"k0", b"v0");
+
+    // Add peer(2, 2) to store 2
+    //
+    // Drop MsgSnapGenPrecheckRequest to region 1 on store 2 before adding peer.
+    let (send_tx, send_rx) = mpsc::channel();
+    cluster.add_send_filter(CloneFilterFactory(DropMessageFilter::new(Arc::new(
+        move |m| {
+            let is_precheck_2 = m.get_to_peer().get_id() == 2
+                && m.get_from_peer().get_id() == 1
+                && m.get_extra_msg().get_type() == ExtraMessageType::MsgSnapGenPrecheckRequest;
+            if is_precheck_2 {
+                let _ = send_tx.send(());
+            }
+            !is_precheck_2
+        },
+    ))));
+    // Make sure add peer conf change is applied on leader side.
+    pd_client.must_add_peer(r, new_peer(2, 2));
+
+    // Make sure peer 2 has requested snapshot.
+    send_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Transfer leader to peer 3.
+    cluster.must_transfer_leader(r, new_peer(3, 3));
+
+    // Make sure store 2 has applied a snapshot.
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+
+    // Peer 1 should not send precheck after became follower.
+    while send_rx.try_recv().is_ok() {}
+    let base_tick_interval = cluster.cfg.raft_store.raft_base_tick_interval.0;
+    let election_ticks = cluster.cfg.raft_store.raft_election_timeout_ticks as u32;
+    let election_timeout = base_tick_interval * election_ticks;
+    std::thread::sleep(election_timeout);
+    send_rx.try_recv().unwrap_err();
+}
+
+#[test_case(test_raftstore::new_node_cluster)]
+#[test_case(test_raftstore::new_server_cluster)]
+fn test_node_apply_snapshot_by_or_without_ingest() {
+    let validate_sst_files = |dir: &std::path::Path| -> bool {
+        let mut sst_file_count = 0_usize;
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() && path.ends_with(".sst") {
+                sst_file_count += 1;
+            }
+        }
+        sst_file_count > 0
+    };
+    let check_snap_count = |snap_dir: &str| -> usize {
+        let mut valid_snap_count = 0_usize;
+        for entry in fs::read_dir(snap_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() && validate_sst_files(&path) {
+                valid_snap_count += 1;
+            }
+        }
+        valid_snap_count
+    };
+    for snap_min_ingest_size in [ReadableSize::mb(1), ReadableSize::default()] {
+        let mut cluster = new_cluster(0, 4);
+        cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(20);
+        cluster.cfg.raft_store.raft_log_gc_count_limit = Some(2);
+        cluster.cfg.raft_store.merge_max_log_gap = 1;
+        cluster.cfg.raft_store.snap_mgr_gc_tick_interval = ReadableDuration::millis(50);
+        cluster.cfg.server.snap_min_ingest_size = snap_min_ingest_size;
+
+        let pd_client = Arc::clone(&cluster.pd_client);
+        // Disable default max peer count check.
+        pd_client.disable_default_operator();
+        cluster.run();
+
+        // In case of removing leader, let's transfer leader to some node first.
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+        cluster.must_put(b"k1", b"v1");
+        cluster.must_put(b"k2", b"v2");
+        pd_client.must_remove_peer(1, new_peer(4, 4));
+        pd_client.add_peer(1, new_peer(4, 5));
+        let snap_dir = cluster.get_snap_dir(4);
+        // Verify that the snap has been received.
+        for _ in 0..10 {
+            if check_snap_count(&snap_dir) > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let engine4 = cluster.get_engine(4);
+        must_get_equal(&engine4, b"k1", b"v1");
+        must_get_equal(&engine4, b"k2", b"v2");
+
+        pd_client.must_remove_peer(1, new_peer(3, 3));
+        pd_client.must_remove_peer(1, new_peer(4, 5));
+        cluster.must_put(b"k3", b"v3");
+        cluster.must_put(b"k3", b"v3");
+        pd_client.add_peer(1, new_peer(3, 6));
+        let engine3 = cluster.get_engine(3);
+        must_get_equal(&engine3, b"k3", b"v3");
+        must_get_equal(&engine3, b"k3", b"v3");
+        // Verify that the snap will be gced.
+        let snap_dir = cluster.get_snap_dir(3);
+        for _ in 0..10 {
+            if check_snap_count(&snap_dir) == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test_case(test_raftstore::new_server_cluster)]
+fn test_extra_snapshot_override() {
+    let mut cluster = new_cluster(0, 3);
+    configure_for_snapshot(&mut cluster.cfg);
+    cluster.run_conf_change();
+    let pd_client = cluster.pd_client.clone();
+    pd_client.disable_default_operator();
+    for key in [b"a", b"b", b"c", b"d"] {
+        let region = pd_client.get_region_info(key).unwrap();
+        cluster.must_split(&region, key);
+    }
+
+    // make sure leaders of region0 and region2 are in the same store
+    let r0 = pd_client.get_region_info(b"a").unwrap();
+    let r0_leader = r0.leader.as_ref().unwrap();
+    let mut r2 = pd_client.get_region_info(b"c").unwrap();
+    r2.leader = Some(find_peer(&r2, r0_leader.get_store_id()).unwrap().clone());
+    let r2_leader = r2.leader.as_ref().unwrap();
+    pd_client.transfer_leader(r2.get_id(), r2_leader.clone(), vec![]);
+    pd_client.region_leader_must_be(r2.get_id(), r2_leader.clone());
+
+    // constructs a snap_ctx with the base info region 0.
+    let pb_ctx = {
+        let mut ctx = kvrpcpb::Context::default();
+        ctx.set_region_id(r0.get_id());
+        ctx.set_region_epoch(r0.get_region_epoch().clone());
+        ctx.set_peer(r0_leader.clone());
+        ctx.set_term(10000);
+        ctx
+    };
+
+    let mut snap_ctx = SnapContext {
+        pb_ctx: &pb_ctx,
+        start_ts: Some(get_tso(pd_client.as_ref()).into()),
+        key_ranges: vec![KeyRange {
+            start_key: b"c1".to_vec(),
+            end_key: b"c2".to_vec(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // when `extra_snap_override`, should use the override region info
+    snap_ctx.extra_region_override = Some(ExtraRegionOverride {
+        region_id: r2.get_id(),
+        region_epoch: r2.get_region_epoch().clone(),
+        peer: r2_leader.clone(),
+        // test None term will not check the term in snapshot
+        check_term: None,
+    });
+    let snap = cluster
+        .must_get_raft_engine(r0_leader.get_store_id())
+        .snapshot(snap_ctx.clone())
+        .unwrap();
+    let r2_term = snap.ext().get_term().unwrap().get();
+    assert_eq!(snap.get_region().clone(), r2.region.clone());
+
+    // If`extra_snap_override`.`term` is set with an invalid value, should return an
+    // error.
+    snap_ctx.extra_region_override.as_mut().unwrap().check_term = Some(r2_term - 2);
+    let err = cluster
+        .must_get_raft_engine(r0_leader.get_store_id())
+        .snapshot(snap_ctx.clone())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, Error(box ErrorInner::Request(header)) if header.stale_command.is_some())
+    );
+    snap_ctx.extra_region_override.as_mut().unwrap().check_term = None;
+
+    // If `extra_snap_override`.`term` is set with a valid value, should return
+    // a snapshot.
+    snap_ctx.extra_region_override.as_mut().unwrap().check_term = Some(r2_term);
+    let snap = cluster
+        .must_get_raft_engine(r0_leader.get_store_id())
+        .snapshot(snap_ctx.clone())
+        .unwrap();
+    assert_eq!(snap.get_region().clone(), r2.region.clone());
+    snap_ctx.extra_region_override.as_mut().unwrap().check_term = None;
+
+    // test invalid req_epoch will return an error
+    let mut req_epoch = r2.get_region_epoch().clone();
+    req_epoch.version -= 1;
+    snap_ctx
+        .extra_region_override
+        .as_mut()
+        .unwrap()
+        .region_epoch = req_epoch;
+    let err = cluster
+        .must_get_raft_engine(r0_leader.get_store_id())
+        .snapshot(snap_ctx.clone())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, Error(box ErrorInner::Request(header)) if header.epoch_not_match.is_some())
+    );
+    snap_ctx
+        .extra_region_override
+        .as_mut()
+        .unwrap()
+        .region_epoch = r2.get_region_epoch().clone();
+
+    // test no-leader request will return an error
+    let r2_old_leader = r2_leader.clone();
+    let r2_leader = r2
+        .peers
+        .iter()
+        .find(|p| p.get_id() != r2_old_leader.get_id())
+        .unwrap()
+        .clone();
+    pd_client.transfer_leader(r2.get_id(), r2_leader.clone(), vec![]);
+    pd_client.region_leader_must_be(r2.get_id(), r2_leader.clone());
+    r2.leader = Some(r2_leader.clone());
+    snap_ctx.extra_region_override.as_mut().unwrap().peer = r2_old_leader.clone();
+    assert!(!snap_ctx.pb_ctx.replica_read);
+    let err = cluster
+        .must_get_raft_engine(r0_leader.get_store_id())
+        .snapshot(snap_ctx.clone())
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error(box ErrorInner::Request(header)) if header.not_leader.is_some()));
 }

@@ -15,8 +15,8 @@
 use std::{
     collections::LinkedList,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -25,7 +25,7 @@ use kvproto::import_sstpb::SstMeta;
 use slog_global::{info, warn};
 use tikv_util::{set_panic_mark, time::Instant};
 
-use crate::{data_cf_offset, RaftEngine, RaftLogBatch, DATA_CFS_LEN};
+use crate::{DATA_CFS_LEN, RaftEngine, RaftLogBatch, data_cf_offset};
 
 const HEAVY_WORKER_THRESHOLD: Duration = Duration::from_millis(25);
 
@@ -119,7 +119,7 @@ impl SstApplyState {
         for sst in ssts {
             let cf_index = data_cf_offset(sst.get_cf_name());
             if let Some(metas) = sst_list.get_mut(cf_index) {
-                let _ = metas.extract_if(|entry| entry.sst.get_uuid() == sst.get_uuid());
+                metas.retain(|entry| entry.sst.get_uuid() != sst.get_uuid());
             }
         }
     }
@@ -217,7 +217,7 @@ impl PersistenceListener {
             })
         })();
         // The correctness relies on the assumption that there will be only one
-        // thread writting to the DB and increasing apply index.
+        // thread writing to the DB and increasing apply index.
         // Apply index will be set within DB lock, so it's correct even with manual
         // flush.
         let offset = data_cf_offset(&cf);

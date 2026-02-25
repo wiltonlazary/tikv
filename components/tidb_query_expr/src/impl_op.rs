@@ -2,7 +2,7 @@
 
 use tidb_query_codegen::rpn_fn;
 use tidb_query_common::Result;
-use tidb_query_datatype::codec::{data_type::*, Error};
+use tidb_query_datatype::codec::{Error, data_type::*};
 
 #[rpn_fn(nullable)]
 #[inline]
@@ -132,6 +132,12 @@ pub fn is_null_bytes(arg: Option<BytesRef>) -> Result<Option<i64>> {
 #[rpn_fn(nullable)]
 #[inline]
 pub fn is_null_json(arg: Option<JsonRef>) -> Result<Option<i64>> {
+    is_null_ref(arg)
+}
+
+#[rpn_fn(nullable)]
+#[inline]
+pub fn is_null_vector_float32(arg: Option<VectorFloat32Ref>) -> Result<Option<i64>> {
     is_null_ref(arg)
 }
 
@@ -275,8 +281,8 @@ fn right_shift(lhs: Option<&Int>, rhs: Option<&Int>) -> Result<Option<Int>> {
 #[cfg(test)]
 mod tests {
     use tidb_query_datatype::{
-        builder::FieldTypeBuilder, codec::mysql::TimeType, expr::EvalContext, FieldTypeFlag,
-        FieldTypeTp,
+        FieldTypeFlag, FieldTypeTp, builder::FieldTypeBuilder, codec::mysql::TimeType,
+        expr::EvalContext,
     };
     use tipb::ScalarFuncSig;
 

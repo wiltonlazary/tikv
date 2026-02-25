@@ -5,11 +5,10 @@
 //! [`Server`](crate::server::Server). The [`BTreeEngine`](kv::BTreeEngine) and
 //! [`RocksEngine`](RocksEngine) are used for testing only.
 
-#![feature(bound_map)]
 #![feature(min_specialization)]
 #![feature(type_alias_impl_trait)]
-#![feature(associated_type_defaults)]
 #![feature(impl_trait_in_assoc_type)]
+#![feature(associated_type_defaults)]
 
 #[macro_use(fail_point)]
 extern crate fail;
@@ -37,8 +36,8 @@ use std::{
 
 use collections::HashMap;
 use engine_traits::{
-    CfName, IterOptions, KvEngine as LocalEngine, Mutable, MvccProperties, ReadOptions,
-    TabletRegistry, WriteBatch, CF_DEFAULT, CF_LOCK,
+    CF_DEFAULT, CF_LOCK, CfName, IterOptions, KvEngine as LocalEngine, MetricsExt, Mutable,
+    MvccProperties, ReadOptions, TabletRegistry, WriteBatch,
 };
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use futures::{future::BoxFuture, prelude::*};
@@ -47,12 +46,18 @@ use kvproto::{
     errorpb::Error as ErrorHeader,
     import_sstpb::SstMeta,
     kvrpcpb::{Context, DiskFullOpt, ExtraOp as TxnExtraOp, KeyRange},
+    metapb::{Peer, RegionEpoch},
     raft_cmdpb,
 };
 use pd_client::BucketMeta;
-use raftstore::store::{PessimisticLockPair, TxnExt};
+use raftstore::{
+    SeekRegionCallback,
+    store::{PessimisticLockPair, TxnExt},
+};
 use thiserror::Error;
-use tikv_util::{deadline::Deadline, escape, future::block_on_timeout, time::ThreadReadId};
+use tikv_util::{
+    deadline::Deadline, escape, future::block_on_timeout, memory::HeapSize, time::ThreadReadId,
+};
 use tracker::with_tls_tracker;
 use txn_types::{Key, PessimisticLock, TimeStamp, TxnExtra, Value};
 
@@ -63,8 +68,8 @@ pub use self::{
     raft_extension::{FakeExtension, RaftExtension},
     rocksdb_engine::{RocksEngine, RocksSnapshot},
     stats::{
-        CfStatistics, FlowStatistics, FlowStatsReporter, StageLatencyStats, Statistics,
-        StatisticsSummary, RAW_VALUE_TOMBSTONE,
+        CfStatistics, FlowStatistics, FlowStatsReporter, LoadDataHint, RAW_VALUE_TOMBSTONE,
+        StageLatencyStats, Statistics, StatisticsSummary,
     },
 };
 
@@ -84,6 +89,20 @@ pub enum Modify {
     // cf_name, start_key, end_key, notify_only
     DeleteRange(CfName, Key, Key, bool),
     Ingest(Box<SstMeta>),
+}
+
+impl HeapSize for Modify {
+    fn approximate_heap_size(&self) -> usize {
+        match self {
+            Modify::Delete(_, k) => k.approximate_heap_size(),
+            Modify::Put(_, k, v) => k.approximate_heap_size() + v.approximate_heap_size(),
+            Modify::PessimisticLock(k, _) => k.approximate_heap_size(),
+            Modify::DeleteRange(_, k1, k2, _) => {
+                k1.approximate_heap_size() + k2.approximate_heap_size()
+            }
+            Modify::Ingest(_) => 0,
+        }
+    }
 }
 
 impl Modify {
@@ -307,6 +326,14 @@ impl WriteEvent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtraRegionOverride {
+    pub region_id: u64,
+    pub region_epoch: RegionEpoch,
+    pub peer: Peer,
+    pub check_term: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SnapContext<'a> {
     pub pb_ctx: &'a Context,
@@ -320,6 +347,15 @@ pub struct SnapContext<'a> {
     pub key_ranges: Vec<KeyRange>,
     // Marks that this snapshot request is allowed in the flashback state.
     pub allowed_in_flashback: bool,
+    // extra_region_override overrides some context fields in the `pb_ctx` for the secondary
+    // regions.
+    // The "extra region" means the regions that are not the source region
+    // in a request.
+    // For example, if a cop-task contains a `IndexLookUp` executor which needs to
+    // access look up the primary rows,
+    // it will set this field to get the extra region snapshot
+    // in lookup phase.
+    pub extra_region_override: Option<ExtraRegionOverride>,
 }
 
 /// Engine defines the common behaviour for a storage engine type.
@@ -350,6 +386,14 @@ pub trait Engine: Send + Clone + 'static {
     /// Note the snapshot is queried immediately no matter whether the returned
     /// future is polled or not.
     fn async_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::SnapshotRes;
+
+    type IMSnap: Snapshot;
+    type IMSnapshotRes: Future<Output = Result<Self::IMSnap>> + Send + 'static;
+    /// Get a snapshot asynchronously.
+    ///
+    /// Note the snapshot is queried immediately no matter whether the returned
+    /// future is polled or not.
+    fn async_in_memory_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::IMSnapshotRes;
 
     /// Precheck request which has write with it's context.
     fn precheck_write_with_ctx(&self, _ctx: &Context) -> Result<()> {
@@ -441,6 +485,13 @@ pub trait Engine: Send + Clone + 'static {
     /// the engine there is probably a notable difference in range, so
     /// engine may update its statistics.
     fn hint_change_in_range(&self, _start_key: Vec<u8>, _end_key: Vec<u8>) {}
+
+    /// seek the regions from the specified key
+    /// The argument `from` should be the comparable format, you should use
+    /// `Key::from_raw` encode the raw key.
+    fn seek_region(&self, _from: &[u8], _callback: SeekRegionCallback) -> Result<()> {
+        Err(box_err!("not supported"))
+    }
 }
 
 /// A Snapshot is a consistent view of the underlying engine at a given point in
@@ -516,13 +567,19 @@ pub trait SnapshotExt {
     fn get_buckets(&self) -> Option<Arc<BucketMeta>> {
         None
     }
+
+    /// Whether the snapshot acquired hit the in memory engine. It always
+    /// returns false if the in memory engine is disabled.
+    fn in_memory_engine_hit(&self) -> bool {
+        false
+    }
 }
 
 pub struct DummySnapshotExt;
 
 impl SnapshotExt for DummySnapshotExt {}
 
-pub trait Iterator: Send {
+pub trait Iterator: Send + MetricsExt {
     fn next(&mut self) -> Result<bool>;
     fn prev(&mut self) -> Result<bool>;
     fn seek(&mut self, key: &Key) -> Result<bool>;
@@ -554,7 +611,7 @@ pub enum ErrorInner {
     Request(ErrorHeader),
     #[error("timeout after {0:?}")]
     Timeout(Duration),
-    #[error("an empty requets")]
+    #[error("an empty request")]
     EmptyRequest,
     #[error("key is locked (backoff or cleanup) {0:?}")]
     KeyIsLocked(kvproto::kvrpcpb::LockInfo),
@@ -629,7 +686,7 @@ impl ErrorCodeExt for Error {
 
 thread_local! {
     // A pointer to thread local engine. Use raw pointer and `UnsafeCell` to reduce runtime check.
-    static TLS_ENGINE_ANY: UnsafeCell<*mut ()> = UnsafeCell::new(ptr::null_mut());
+    static TLS_ENGINE_ANY: UnsafeCell<*mut ()> = const { UnsafeCell::new(ptr::null_mut())};
 }
 
 /// Execute the closure on the thread local engine.
@@ -689,6 +746,24 @@ pub fn snapshot<E: Engine>(
 ) -> impl std::future::Future<Output = Result<E::Snap>> {
     let begin = Instant::now();
     let val = engine.async_snapshot(ctx);
+    // make engine not cross yield point
+    async move {
+        let result = val.await;
+        with_tls_tracker(|tracker| {
+            tracker.metrics.get_snapshot_nanos += begin.elapsed().as_nanos() as u64;
+        });
+        fail_point!("after-snapshot");
+        result
+    }
+}
+
+/// Get an in memory snapshot of `engine`.
+pub fn in_memory_snapshot<E: Engine>(
+    engine: &mut E,
+    ctx: SnapContext<'_>,
+) -> impl std::future::Future<Output = Result<E::IMSnap>> {
+    let begin = Instant::now();
+    let val = engine.async_in_memory_snapshot(ctx);
     // make engine not cross yield point
     async move {
         let result = val.await;
@@ -1144,8 +1219,8 @@ pub mod tests {
                     Some((format!("key_{}", i / 2 * 2), format!("value_{}", i / 2)))
                 } else {
                     Some((
-                        format!("key_{}", (i + 1) / 2 * 2),
-                        format!("value_{}", (i + 1) / 2),
+                        format!("key_{}", i.div_ceil(2) * 2),
+                        format!("value_{}", i.div_ceil(2)),
                     ))
                 }
             } else if seek_mode != SeekMode::Normal {

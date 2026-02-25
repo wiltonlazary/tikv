@@ -1,7 +1,6 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-#![feature(let_chains)]
-
+mod backup;
 mod config;
 mod crypter;
 mod encrypted_file;
@@ -10,24 +9,28 @@ mod file_dict_file;
 mod io;
 mod manager;
 mod master_key;
+#[cfg(any(test, feature = "testexport"))]
+pub use master_key::fake;
 mod metrics;
+
+pub mod test_utils;
 
 use std::{io::ErrorKind, path::Path};
 
 pub use self::{
+    backup::backup_encryption::*,
     config::*,
-    crypter::{
-        from_engine_encryption_method, to_engine_encryption_method, verify_encryption_config,
-        AesGcmCrypter, Iv,
-    },
+    crypter::{AesGcmCrypter, FileEncryptionInfo, Iv, verify_encryption_config},
     encrypted_file::EncryptedFile,
-    errors::{cloud_convert_error, Error, Result, RetryCodedError},
+    errors::{Error, Result, RetryCodedError, cloud_convert_error},
     file_dict_file::FileDictionaryFile,
     io::{
-        create_aes_ctr_crypter, DecrypterReader, DecrypterWriter, EncrypterReader, EncrypterWriter,
+        DecrypterReader, DecrypterWriter, EncrypterReader, EncrypterWriter, create_aes_ctr_crypter,
     },
     manager::{DataKeyImporter, DataKeyManager, DataKeyManagerArgs},
-    master_key::{Backend, FileBackend, KmsBackend, PlaintextBackend},
+    master_key::{
+        AsyncBackend, Backend, FileBackend, KmsBackend, MultiMasterKeyBackend, PlaintextBackend,
+    },
 };
 
 const TRASH_PREFIX: &str = "TRASH-";

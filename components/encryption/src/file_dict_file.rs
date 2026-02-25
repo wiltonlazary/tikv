@@ -6,17 +6,17 @@ use std::{
 };
 
 use byteorder::{BigEndian, ByteOrder};
-use file_system::{rename, File, OpenOptions};
+use crypto::rand;
+use file_system::{File, OpenOptions, rename};
 use kvproto::encryptionpb::{EncryptedContent, FileDictionary, FileInfo};
 use protobuf::Message;
-use rand::{thread_rng, RngCore};
 use tikv_util::{box_err, info, set_panic_mark, warn};
 
 use crate::{
-    encrypted_file::{EncryptedFile, Header, Version, TMP_FILE_SUFFIX},
+    Error, Result,
+    encrypted_file::{EncryptedFile, Header, TMP_FILE_SUFFIX, Version},
     master_key::{Backend, PlaintextBackend},
     metrics::*,
-    Error, Result,
 };
 
 #[derive(Debug)]
@@ -127,7 +127,7 @@ impl FileDictionaryFile {
         if self.enable_log {
             let origin_path = self.file_path();
             let mut tmp_path = origin_path.clone();
-            tmp_path.set_extension(format!("{}.{}", thread_rng().next_u64(), TMP_FILE_SUFFIX));
+            tmp_path.set_extension(format!("{}.{}", rand::rand_u64()?, TMP_FILE_SUFFIX));
             let mut tmp_file = OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -412,7 +412,7 @@ mod tests {
     use kvproto::encryptionpb::EncryptionMethod;
 
     use super::*;
-    use crate::{encrypted_file::EncryptedFile, Error};
+    use crate::{Error, encrypted_file::EncryptedFile};
 
     fn test_file_dict_file_normal(enable_log: bool) {
         let tempdir = tempfile::tempdir().unwrap();

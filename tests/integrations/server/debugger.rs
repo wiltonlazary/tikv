@@ -2,8 +2,8 @@
 
 use collections::{HashMap, HashSet};
 use engine_rocks::{raw::Range, util::get_cf_handle};
-use engine_traits::{CachedTablet, MiscExt, CF_WRITE};
-use keys::{data_key, DATA_MAX_KEY};
+use engine_traits::{CF_WRITE, CachedTablet, MiscExt};
+use keys::{DATA_MAX_KEY, data_key};
 use kvproto::{
     debugpb::{
         Db, FlashbackToVersionRequest, FlashbackToVersionResponse, GetAllRegionsInStoreRequest,
@@ -41,7 +41,7 @@ fn gen_delete_k(k: &[u8], commit_ts: TimeStamp) -> Vec<u8> {
 fn test_compact() {
     let (split_key, _) = gen_mvcc_put_kv(b"k10", b"", 1.into(), 2.into());
     let (split_key2, _) = gen_mvcc_put_kv(b"k20", b"", 1.into(), 2.into());
-    let regions = vec![
+    let regions = [
         (1, b"".to_vec(), split_key.clone()),
         (1000, split_key.clone(), split_key2.clone()),
         (1002, split_key2.clone(), b"".to_vec()),

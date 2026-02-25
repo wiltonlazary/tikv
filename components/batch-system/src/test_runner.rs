@@ -6,8 +6,8 @@ use std::{
     borrow::Cow,
     ops::DerefMut,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -53,6 +53,8 @@ pub struct Runner {
 
 impl Fsm for Runner {
     type Message = Message;
+
+    const FSM_TYPE: FsmType = FsmType::store;
 
     fn is_stopped(&self) -> bool {
         self.is_stopped

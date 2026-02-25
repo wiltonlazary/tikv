@@ -19,13 +19,15 @@ pub type PluginConstructorSignature =
 
 /// Type signature of the exported function with symbol
 /// [`PLUGIN_GET_BUILD_INFO_SYMBOL`].
-// emit this warn because to fix it need to change the data type which is a breaking change.
+// FIXME: Fixing the warning breaks compatibility, maybe we should deprecated it
+// by A new API?
 #[allow(improper_ctypes_definitions)]
 pub type PluginGetBuildInfoSignature = extern "C" fn() -> BuildInfo;
 
 /// Type signature of the exported function with symbol
 /// [`PLUGIN_GET_PLUGIN_INFO_SYMBOL`].
-// emit this warn because to fix it need to change the data type which is a breaking change.
+// FIXME: Fixing the warning breaks compatibility, maybe we should deprecated it
+// by A new API?
 #[allow(improper_ctypes_definitions)]
 pub type PluginGetPluginInfoSignature = extern "C" fn() -> PluginInfo;
 

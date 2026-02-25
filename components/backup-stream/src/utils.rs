@@ -4,51 +4,47 @@ use core::pin::Pin;
 use std::{
     borrow::Borrow,
     cell::RefCell,
-    collections::{hash_map::RandomState, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::RandomState},
+    future::Future,
     ops::{Bound, RangeBounds},
     path::Path,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
-    task::Context,
+    task::{Context, Waker},
     time::Duration,
 };
 
-use async_compression::{tokio::write::ZstdEncoder, Level};
+use async_compression::{Level, tokio::write::ZstdEncoder};
 use engine_rocks::ReadPerfInstant;
-use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-use futures::{channel::mpsc, executor::block_on, ready, task::Poll, FutureExt, StreamExt};
+use engine_traits::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, CfName};
+use futures::{ready, task::Poll};
 use kvproto::{
     brpb::CompressionType,
     metapb::Region,
     raft_cmdpb::{CmdType, Request},
 };
-use raft::StateRole;
-use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
 use tikv::storage::CfStatistics;
 use tikv_util::{
-    box_err,
+    Either, box_err,
     sys::inspector::{
-        self_thread_inspector, IoStat, ThreadInspector, ThreadInspectorImpl as OsInspector,
+        IoStat, ThreadInspector, ThreadInspectorImpl as OsInspector, self_thread_inspector,
     },
     time::Instant,
-    warn,
     worker::Scheduler,
-    Either,
 };
 use tokio::{
     fs::File,
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
-    sync::{oneshot, Mutex, RwLock},
+    sync::{Mutex, RwLock},
 };
 use txn_types::{Key, Lock, LockType};
 
 use crate::{
-    errors::{Error, Result},
-    metadata::store::BoxFuture,
-    router::TaskSelector,
     Task,
+    errors::{Error, Result},
+    router::TaskSelector,
 };
 
 /// wrap a user key with encoded data key.
@@ -77,65 +73,6 @@ pub fn cf_name(s: &str) -> CfName {
 
 pub fn redact(key: &impl AsRef<[u8]>) -> log_wrappers::Value<'_> {
     log_wrappers::Value::key(key.as_ref())
-}
-
-/// RegionPager seeks regions with leader role in the range.
-pub struct RegionPager<P> {
-    regions: P,
-    start_key: Vec<u8>,
-    end_key: Vec<u8>,
-    reach_last_region: bool,
-}
-
-impl<P: RegionInfoProvider> RegionPager<P> {
-    pub fn scan_from(regions: P, start_key: Vec<u8>, end_key: Vec<u8>) -> Self {
-        Self {
-            regions,
-            start_key,
-            end_key,
-            reach_last_region: false,
-        }
-    }
-
-    pub fn next_page(&mut self, size: usize) -> Result<Vec<RegionInfo>> {
-        if self.start_key >= self.end_key || self.reach_last_region {
-            return Ok(vec![]);
-        }
-
-        let (mut tx, rx) = mpsc::channel(size);
-        let end_key = self.end_key.clone();
-        self.regions
-            .seek_region(
-                &self.start_key,
-                Box::new(move |i| {
-                    let r = i
-                        .filter(|r| r.role == StateRole::Leader)
-                        .take(size)
-                        .take_while(|r| r.region.start_key < end_key)
-                        .try_for_each(|r| tx.try_send(r.clone()));
-                    if let Err(_err) = r {
-                        warn!("failed to scan region and send to initlizer")
-                    }
-                }),
-            )
-            .map_err(|err| {
-                Error::Other(box_err!(
-                    "failed to seek region for start key {}: {}",
-                    redact(&self.start_key),
-                    err
-                ))
-            })?;
-        let collected_regions = block_on(rx.collect::<Vec<_>>());
-        self.start_key = collected_regions
-            .last()
-            .map(|region| region.region.end_key.to_owned())
-            // no leader region found.
-            .unwrap_or_default();
-        if self.start_key.is_empty() {
-            self.reach_last_region = true;
-        }
-        Ok(collected_regions)
-    }
 }
 
 /// StopWatch is a utility for record time cost in multi-stage tasks.
@@ -167,7 +104,7 @@ pub type SlotMap<K, V, S = RandomState> = RwLock<HashMap<K, Slot<V>, S>>;
 /// to DSTs.
 struct RangeToInclusiveRef<'a, T: ?Sized>(&'a T);
 
-impl<'a, T: ?Sized> RangeBounds<T> for RangeToInclusiveRef<'a, T> {
+impl<T: ?Sized> RangeBounds<T> for RangeToInclusiveRef<'_, T> {
     fn start_bound(&self) -> Bound<&T> {
         Bound::Unbounded
     }
@@ -179,7 +116,7 @@ impl<'a, T: ?Sized> RangeBounds<T> for RangeToInclusiveRef<'a, T> {
 
 struct RangeToExclusiveRef<'a, T: ?Sized>(&'a T);
 
-impl<'a, T: ?Sized> RangeBounds<T> for RangeToExclusiveRef<'a, T> {
+impl<T: ?Sized> RangeBounds<T> for RangeToExclusiveRef<'_, T> {
     fn start_bound(&self) -> Bound<&T> {
         Bound::Unbounded
     }
@@ -342,6 +279,7 @@ pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, CfName),
 /// `try_send!(s: Scheduler<T>, task: T)` tries to send a task to the scheduler,
 /// once meet an error, would report it, with the current file and line (so it
 /// is made as a macro). returns whether it success.
+// Note: perhaps we'd better using std::panic::Location.
 #[macro_export]
 macro_rules! try_send {
     ($s:expr, $task:expr) => {
@@ -436,51 +374,69 @@ pub fn should_track_lock(l: &Lock) -> bool {
         // Lock or Pessimistic lock won't commit more data,
         // (i.e. won't break the integration of data between [Lock.start_ts, get_ts()))
         // it is safe for ignoring them and advancing resolved_ts.
-        LockType::Lock | LockType::Pessimistic => false,
+        LockType::Lock | LockType::Pessimistic | LockType::Shared => false,
     }
 }
 
-pub struct CallbackWaitGroup {
+pub struct FutureWaitGroup {
     running: AtomicUsize,
-    on_finish_all: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
+    wakers: std::sync::Mutex<Vec<Waker>>,
 }
 
-impl CallbackWaitGroup {
+pub struct Work(Arc<FutureWaitGroup>);
+
+impl Drop for Work {
+    fn drop(&mut self) {
+        self.0.work_done();
+    }
+}
+
+pub struct WaitAll<'a>(&'a FutureWaitGroup);
+
+impl Future for WaitAll<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Fast path: nothing to wait.
+        let running = self.0.running.load(Ordering::SeqCst);
+        if running == 0 {
+            return Poll::Ready(());
+        }
+
+        // <1>
+        let mut callbacks = self.0.wakers.lock().unwrap();
+        callbacks.push(cx.waker().clone());
+        let running = self.0.running.load(Ordering::SeqCst);
+        // Unlikely path: if all background tasks finish at <1>, there will be a long
+        // period that nobody will wake the `wakers` even the condition is ready.
+        // We need to help ourselves here.
+        if running == 0 {
+            callbacks.drain(..).for_each(|w| w.wake());
+        }
+        Poll::Pending
+    }
+}
+
+impl FutureWaitGroup {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             running: AtomicUsize::new(0),
-            on_finish_all: std::sync::Mutex::default(),
+            wakers: Default::default(),
         })
     }
 
     fn work_done(&self) {
         let last = self.running.fetch_sub(1, Ordering::SeqCst);
         if last == 1 {
-            self.on_finish_all
-                .lock()
-                .unwrap()
-                .drain(..)
-                .for_each(|x| x())
+            self.wakers.lock().unwrap().drain(..).for_each(|x| {
+                x.wake();
+            })
         }
     }
 
     /// wait until all running tasks done.
-    pub fn wait(&self) -> BoxFuture<()> {
-        // Fast path: no uploading.
-        if self.running.load(Ordering::SeqCst) == 0 {
-            return Box::pin(futures::future::ready(()));
-        }
-
-        let (tx, rx) = oneshot::channel();
-        self.on_finish_all.lock().unwrap().push(Box::new(move || {
-            // The waiter may timed out.
-            let _ = tx.send(());
-        }));
-        // try to acquire the lock again.
-        if self.running.load(Ordering::SeqCst) == 0 {
-            return Box::pin(futures::future::ready(()));
-        }
-        Box::pin(rx.map(|_| ()))
+    pub fn wait(&self) -> WaitAll<'_> {
+        WaitAll(self)
     }
 
     /// make a work, as long as the return value held, mark a work in the group
@@ -488,14 +444,6 @@ impl CallbackWaitGroup {
     pub fn work(self: Arc<Self>) -> Work {
         self.running.fetch_add(1, Ordering::SeqCst);
         Work(self)
-    }
-}
-
-pub struct Work(Arc<CallbackWaitGroup>);
-
-impl Drop for Work {
-    fn drop(&mut self) {
-        self.0.work_done();
     }
 }
 
@@ -757,7 +705,7 @@ pub fn debug_key_range<'ret, 'a: 'ret, 'b: 'ret>(
 
 struct DebugKeyRange<'start, 'end>(&'start [u8], &'end [u8]);
 
-impl<'start, 'end> std::fmt::Debug for DebugKeyRange<'start, 'end> {
+impl std::fmt::Debug for DebugKeyRange<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let end_key = if self.1.is_empty() {
             Either::Left("inf")
@@ -786,7 +734,7 @@ pub fn debug_region(r: &Region) -> impl std::fmt::Debug + '_ {
 
 struct DebugRegion<'a>(&'a Region);
 
-impl<'a> std::fmt::Debug for DebugRegion<'a> {
+impl std::fmt::Debug for DebugRegion<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let r = self.0;
         f.debug_struct("Region")
@@ -807,7 +755,7 @@ impl<'a> std::fmt::Debug for DebugRegion<'a> {
 
 struct SlogRegion<'a>(&'a Region);
 
-impl<'a> slog::KV for SlogRegion<'a> {
+impl slog::KV for SlogRegion<'_> {
     fn serialize(
         &self,
         _record: &slog::Record<'_>,
@@ -830,7 +778,7 @@ impl<'a> slog::KV for SlogRegion<'a> {
 }
 
 /// A shortcut for making an opaque future type for return type or argument
-/// type, which is sendable and not borrowing any variables.  
+/// type, which is sendable and not borrowing any variables.
 ///
 /// `future![T]` == `impl Future<Output = T> + Send + 'static`
 #[macro_export]
@@ -863,8 +811,8 @@ impl<D: std::fmt::Debug, T: Iterator<Item = D>> std::fmt::Debug for DebugIter<D,
 mod test {
     use std::{
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -872,13 +820,14 @@ mod test {
     use engine_traits::WriteOptions;
     use futures::executor::block_on;
     use kvproto::metapb::{Region, RegionEpoch};
+    use log_wrappers::RedactOption;
     use tokio::io::{AsyncWriteExt, BufReader};
 
-    use crate::utils::{is_in_range, CallbackWaitGroup, SegmentMap};
+    use crate::utils::{FutureWaitGroup, SegmentMap, is_in_range};
 
     #[test]
     fn test_redact() {
-        log_wrappers::set_redact_info_log(true);
+        log_wrappers::set_redact_info_log(RedactOption::On);
         let mut region = Region::default();
         region.set_id(42);
         region.set_start_key(b"TiDB".to_vec());
@@ -983,8 +932,8 @@ mod test {
         }
 
         fn run_case(c: Case) {
+            let wg = FutureWaitGroup::new();
             for i in 0..c.repeat {
-                let wg = CallbackWaitGroup::new();
                 let cnt = Arc::new(AtomicUsize::new(c.bg_task));
                 for _ in 0..c.bg_task {
                     let cnt = cnt.clone();
@@ -995,7 +944,7 @@ mod test {
                     });
                 }
                 block_on(tokio::time::timeout(Duration::from_secs(20), wg.wait())).unwrap();
-                assert_eq!(cnt.load(Ordering::SeqCst), 0, "{:?}@{}", c, i);
+                assert_eq!(cnt.load(Ordering::SeqCst), 0, "{:?}@{}", c, i,);
             }
         }
 
@@ -1011,6 +960,10 @@ mod test {
             Case {
                 bg_task: 512,
                 repeat: 1,
+            },
+            Case {
+                bg_task: 16,
+                repeat: 10000,
             },
             Case {
                 bg_task: 2,
@@ -1039,10 +992,10 @@ mod test {
 
     #[test]
     fn test_recorder() {
-        use engine_traits::{Iterable, KvEngine, Mutable, WriteBatch, WriteBatchExt, CF_DEFAULT};
-        use tempdir::TempDir;
+        use engine_traits::{CF_DEFAULT, Iterable, KvEngine, Mutable, WriteBatch, WriteBatchExt};
+        use tempfile::TempDir;
 
-        let p = TempDir::new("test_db").unwrap();
+        let p = TempDir::new().unwrap();
         let engine =
             engine_rocks::util::new_engine(p.path().to_str().unwrap(), &[CF_DEFAULT]).unwrap();
         let mut wb = engine.write_batch();
@@ -1087,12 +1040,12 @@ mod test {
 
     #[tokio::test]
     async fn test_files_reader() {
-        use tempdir::TempDir;
+        use tempfile::TempDir;
         use tokio::{fs::File, io::AsyncReadExt};
 
         use super::FilesReader;
 
-        let dir = TempDir::new("test_files").unwrap();
+        let dir = TempDir::new().unwrap();
         let files_num = 5;
         let mut files_path = Vec::new();
         let mut expect_content = String::new();
@@ -1125,12 +1078,12 @@ mod test {
     #[tokio::test]
     async fn test_compression_writer() {
         use kvproto::brpb::CompressionType;
-        use tempdir::TempDir;
+        use tempfile::TempDir;
         use tokio::{fs::File, io::AsyncReadExt};
 
         use super::compression_writer_dispatcher;
 
-        let dir = TempDir::new("test_files").unwrap();
+        let dir = TempDir::new().unwrap();
         let content = "test for compression writer. try to write to local path, and read it back.";
 
         // uncompressed writer

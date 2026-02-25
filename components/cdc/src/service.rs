@@ -1,30 +1,43 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use collections::{HashMap, HashMapEntry};
 use crossbeam::atomic::AtomicCell;
-use futures::stream::TryStreamExt;
+use futures::{
+    compat::Stream01CompatExt,
+    stream::{StreamExt, TryStreamExt},
+};
 use grpcio::{DuplexSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode};
 use kvproto::{
     cdcpb::{
-        ChangeData, ChangeDataEvent, ChangeDataRequest, ChangeDataRequestKvApi,
-        ChangeDataRequest_oneof_request,
+        ChangeData, ChangeDataEvent, ChangeDataRequest, ChangeDataRequest_oneof_request,
+        ChangeDataRequestKvApi,
     },
     kvrpcpb::ApiVersion,
 };
-use tikv_util::{error, info, memory::MemoryQuota, warn, worker::*};
+use tikv_util::{error, info, memory::MemoryQuota, timer::GLOBAL_TIMER_HANDLE, warn, worker::*};
 
 use crate::{
-    channel::{channel, Sink, CDC_CHANNLE_CAPACITY},
+    channel::{CDC_CHANNLE_CAPACITY, Sink, channel},
     delegate::{Downstream, DownstreamId, DownstreamState, ObservedRange},
     endpoint::{Deregister, Task},
+    metrics::CDC_ABORTED_CONNECTIONS,
 };
 
 static CONNECTION_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
+
+// CDC connection monitoring constants in seconds
+const CDC_WATCHDOG_CHECK_INTERVAL_SECS: u64 = 2;
+const CDC_IDLE_WARNING_THRESHOLD_SECS: u64 = 60;
+const CDC_IDLE_DEREGISTER_THRESHOLD_SECS: u64 = 60 * 20; // 20 minutes
+const CDC_MEMORY_QUOTA_ABORT_THRESHOLD: f64 = 0.999;
 
 pub fn validate_kv_api(kv_api: ChangeDataRequestKvApi, api_version: ApiVersion) -> bool {
     kv_api == ChangeDataRequestKvApi::TiDb
@@ -34,6 +47,9 @@ pub fn validate_kv_api(kv_api: ChangeDataRequestKvApi, api_version: ApiVersion) 
 /// A unique identifier of a Connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ConnId(usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct RequestId(pub u64);
 
 impl ConnId {
     pub fn new() -> ConnId {
@@ -89,7 +105,7 @@ pub struct Conn {
 
 #[derive(PartialEq, Eq, Hash)]
 struct DownstreamKey {
-    request_id: u64,
+    request_id: RequestId,
     region_id: u64,
 }
 
@@ -100,9 +116,9 @@ struct DownstreamValue {
 }
 
 impl Conn {
-    pub fn new(sink: Sink, peer: String) -> Conn {
+    pub fn new(conn_id: ConnId, sink: Sink, peer: String) -> Conn {
         Conn {
-            id: ConnId::new(),
+            id: conn_id,
             sink,
             downstreams: HashMap::default(),
             peer,
@@ -143,7 +159,7 @@ impl Conn {
         &self.sink
     }
 
-    pub fn get_downstream(&self, request_id: u64, region_id: u64) -> Option<DownstreamId> {
+    pub fn get_downstream(&self, request_id: RequestId, region_id: u64) -> Option<DownstreamId> {
         let key = DownstreamKey {
             request_id,
             region_id,
@@ -153,7 +169,7 @@ impl Conn {
 
     pub fn subscribe(
         &mut self,
-        request_id: u64,
+        request_id: RequestId,
         region_id: u64,
         downstream_id: DownstreamId,
         downstream_state: Arc<AtomicCell<DownstreamState>>,
@@ -174,7 +190,7 @@ impl Conn {
         }
     }
 
-    pub fn unsubscribe(&mut self, request_id: u64, region_id: u64) -> Option<DownstreamId> {
+    pub fn unsubscribe(&mut self, request_id: RequestId, region_id: u64) -> Option<DownstreamId> {
         let key = DownstreamKey {
             request_id,
             region_id,
@@ -182,7 +198,7 @@ impl Conn {
         self.downstreams.remove(&key).map(|value| value.id)
     }
 
-    pub fn unsubscribe_request(&mut self, request_id: u64) -> Vec<(u64, DownstreamId)> {
+    pub fn unsubscribe_request(&mut self, request_id: RequestId) -> Vec<(u64, DownstreamId)> {
         let mut downstreams = Vec::new();
         self.downstreams.retain(|key, value| -> bool {
             if key.request_id == request_id {
@@ -196,7 +212,7 @@ impl Conn {
 
     pub fn iter_downstreams<F>(&self, mut f: F)
     where
-        F: FnMut(u64, u64, DownstreamId, &Arc<AtomicCell<DownstreamState>>),
+        F: FnMut(RequestId, u64, DownstreamId, &Arc<AtomicCell<DownstreamState>>),
     {
         for (key, value) in &self.downstreams {
             f(key.request_id, key.region_id, value.id, &value.state);
@@ -217,8 +233,8 @@ struct EventFeedHeaders {
 }
 
 impl EventFeedHeaders {
-    const FEATURES_KEY: &str = "features";
-    const STREAM_MULTIPLEXING: &str = "stream-multiplexing";
+    const FEATURES_KEY: &'static str = "features";
+    const STREAM_MULTIPLEXING: &'static str = "stream-multiplexing";
     const FEATURES: &'static [&'static str] = &[Self::STREAM_MULTIPLEXING];
 
     fn parse_features(value: &[u8]) -> Result<Vec<&'static str>, String> {
@@ -245,16 +261,22 @@ impl EventFeedHeaders {
 pub struct Service {
     scheduler: Scheduler<Task>,
     memory_quota: Arc<MemoryQuota>,
+    pool: Arc<Worker>,
 }
 
 impl Service {
     /// Create a ChangeData service.
     ///
     /// It requires a scheduler of an `Endpoint` in order to schedule tasks.
-    pub fn new(scheduler: Scheduler<Task>, memory_quota: Arc<MemoryQuota>) -> Service {
+    pub fn new(
+        scheduler: Scheduler<Task>,
+        memory_quota: Arc<MemoryQuota>,
+        pool: Arc<Worker>,
+    ) -> Service {
         Service {
             scheduler,
             memory_quota,
+            pool,
         }
     }
 
@@ -276,18 +298,15 @@ impl Service {
         peer: &str,
     ) -> semver::Version {
         let version_field = request.get_header().get_ticdc_version();
-        match semver::Version::parse(version_field) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "empty or invalid TiCDC version, please upgrading TiCDC";
-                    "version" => version_field,
-                    "downstream" => ?peer, "region_id" => request.region_id,
-                    "error" => ?e,
-                );
-                semver::Version::new(0, 0, 0)
-            }
-        }
+        semver::Version::parse(version_field).unwrap_or_else(|e| {
+            warn!(
+                "empty or invalid TiCDC version, please upgrading TiCDC";
+                "version" => version_field,
+                "downstream" => ?peer, "region_id" => request.region_id,
+                "error" => ?e,
+            );
+            semver::Version::new(0, 0, 0)
+        })
     }
 
     fn set_conn_version(
@@ -334,22 +353,23 @@ impl Service {
         request: ChangeDataRequest,
         conn_id: ConnId,
     ) -> Result<(), String> {
-        let observed_range =
-            match ObservedRange::new(request.start_key.clone(), request.end_key.clone()) {
-                Ok(observed_range) => observed_range,
-                Err(e) => {
-                    warn!(
-                        "cdc invalid observed start key or end key version";
-                        "downstream" => ?peer, "region_id" => request.region_id,
-                        "error" => ?e,
-                    );
-                    ObservedRange::default()
-                }
-            };
+        let observed_range = ObservedRange::new(request.start_key.clone(), request.end_key.clone())
+            .unwrap_or_else(|e| {
+                warn!(
+                    "cdc invalid observed start key or end key version";
+                    "downstream" => ?peer,
+                    "region_id" => request.region_id,
+                    "request_id" => request.region_id,
+                    "error" => ?e,
+                    "start_key" => log_wrappers::Value::key(&request.start_key),
+                    "end_key" => log_wrappers::Value::key(&request.end_key),
+                );
+                ObservedRange::default()
+            });
         let downstream = Downstream::new(
             peer.to_owned(),
             request.get_region_epoch().clone(),
-            request.request_id,
+            RequestId(request.request_id),
             conn_id,
             request.kv_api,
             request.filter_loop,
@@ -358,7 +378,6 @@ impl Service {
         let task = Task::Register {
             request,
             downstream,
-            conn_id,
         };
         scheduler.schedule(task).map_err(|e| format!("{:?}", e))
     }
@@ -371,13 +390,13 @@ impl Service {
         let task = if request.region_id != 0 {
             Task::Deregister(Deregister::Region {
                 conn_id,
-                request_id: request.request_id,
+                request_id: RequestId(request.request_id),
                 region_id: request.region_id,
             })
         } else {
             Task::Deregister(Deregister::Request {
                 conn_id,
-                request_id: request.request_id,
+                request_id: RequestId(request.request_id),
             })
         };
         scheduler.schedule(task).map_err(|e| format!("{:?}", e))
@@ -405,10 +424,10 @@ impl Service {
         event_feed_v2: bool,
     ) {
         sink.enhance_batch(true);
+        let conn_id = ConnId::new();
         let (event_sink, mut event_drain) =
-            channel(CDC_CHANNLE_CAPACITY, self.memory_quota.clone());
-        let conn = Conn::new(event_sink, ctx.peer());
-        let conn_id = conn.get_id();
+            channel(conn_id, CDC_CHANNLE_CAPACITY, self.memory_quota.clone());
+        let conn = Conn::new(conn_id, event_sink, ctx.peer());
         let mut explicit_features = vec![];
 
         if event_feed_v2 {
@@ -428,7 +447,8 @@ impl Service {
             };
             explicit_features = headers.features;
         }
-        info!("cdc connection created"; "downstream" => ctx.peer(), "features" => ?explicit_features);
+        info!("cdc connection created"; "downstream" => ctx.peer(),
+         "conn_id" => ?conn_id,"features" => ?explicit_features);
 
         if let Err(e) = self.scheduler.schedule(Task::OpenConn { conn }) {
             let peer = ctx.peer();
@@ -455,13 +475,10 @@ impl Service {
             while let Some(request) = stream.try_next().await? {
                 Self::handle_request(&scheduler, &peer, request, conn_id)?;
             }
-            let deregister = Deregister::Conn(conn_id);
-            if let Err(e) = scheduler.schedule(Task::Deregister(deregister)) {
-                error!("cdc deregister failed"; "error" => ?e, "conn_id" => ?conn_id);
-            }
             Ok::<(), String>(())
         };
 
+        let scheduler_dereg = self.scheduler.clone();
         let peer = ctx.peer();
         ctx.spawn(async move {
             if let Err(e) = recv_req.await {
@@ -469,16 +486,132 @@ impl Service {
             } else {
                 info!("cdc receive closed"; "downstream" => peer, "conn_id" => ?conn_id);
             }
+
+            let deregister = Deregister::Conn(conn_id);
+            if let Err(e) = scheduler_dereg.schedule(Task::Deregister(deregister)) {
+                error!("cdc deregister failed"; "error" => ?e, "conn_id" => ?conn_id);
+            }
         });
 
+        let last_flush_time = Arc::new(AtomicCell::new(Instant::now()));
+        let last_flush_time_for_forward = last_flush_time.clone();
+        let last_flush_time_for_watchdog = last_flush_time.clone();
+        let peer_for_watchdog = ctx.peer().to_string();
+
         let peer = ctx.peer();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Create cancelCh for eventDrain.forward exit signal
+        let (forward_exit_tx, forward_exit_rx) = tokio::sync::oneshot::channel::<()>();
+
         ctx.spawn(async move {
             #[cfg(feature = "failpoints")]
             sleep_before_drain_change_event().await;
-            if let Err(e) = event_drain.forward(&mut sink).await {
-                warn!("cdc send failed"; "error" => ?e, "downstream" => peer, "conn_id" => ?conn_id);
-            } else {
-                info!("cdc send closed"; "downstream" => peer, "conn_id" => ?conn_id);
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    warn!("cdc send cancelled"; "downstream" => peer, "conn_id" => ?conn_id);
+                    let status = RpcStatus::with_message(RpcStatusCode::UNKNOWN, "connection cancelled".to_string());
+                    let _ = sink.fail(status).await;
+                    CDC_ABORTED_CONNECTIONS.inc();
+                }
+                result = event_drain.forward(&mut sink, Some(&last_flush_time_for_forward)) => {
+                    if let Err(e) = result {
+                        warn!("cdc send failed"; "error" => ?e, "downstream" => peer, "conn_id" => ?conn_id);
+                    } else {
+                        info!("cdc send closed"; "downstream" => peer, "conn_id" => ?conn_id);
+                    }
+                    // Send signal when eventDrain.forward exits
+                    let _ = forward_exit_tx.send(());
+                }
+            }
+        });
+
+        // Start watchdog to monitor connection activity
+        Self::start_connection_watchdog(
+            self.pool.clone(),
+            last_flush_time_for_watchdog.clone(),
+            peer_for_watchdog.clone(),
+            conn_id,
+            cancel_tx,
+            forward_exit_rx,
+            self.memory_quota.clone(),
+        );
+    }
+
+    /// Start a watchdog to monitor CDC connection activity.
+    ///
+    /// This function creates a background task that periodically checks if the
+    /// connection has been idle for too long and takes appropriate action
+    /// (warning or aborting).
+    fn start_connection_watchdog(
+        pool: Arc<Worker>,
+        last_flush_time: Arc<AtomicCell<Instant>>,
+        peer: String,
+        conn_id: ConnId,
+        cancel_tx: tokio::sync::oneshot::Sender<()>,
+        mut forward_exit_rx: tokio::sync::oneshot::Receiver<()>,
+        memory_quota: Arc<MemoryQuota>,
+    ) {
+        let last_flush_time_clone = last_flush_time.clone();
+        let peer_clone = peer.clone();
+
+        // Create a custom interval task that can be stopped
+        let _ = pool.pool().spawn(async move {
+            let mut interval = GLOBAL_TIMER_HANDLE
+                .interval(
+                    Instant::now(),
+                    Duration::from_secs(CDC_WATCHDOG_CHECK_INTERVAL_SECS),
+                )
+                .compat();
+
+            loop {
+                tokio::select! {
+                    _ = &mut forward_exit_rx => {
+                        info!("cdc connection forward exit signal received, stopping watchdog");
+                        break;
+                    }
+                    _ = interval.next() => {
+                        let elapsed = last_flush_time_clone.load().elapsed();
+
+                        // Check if last flush was more than the warning threshold
+                        if elapsed > Duration::from_secs(CDC_IDLE_WARNING_THRESHOLD_SECS) {
+                            warn!("cdc connection idle too long";
+                                  "downstream" => peer_clone.clone(),
+                                  "conn_id" => ?conn_id,
+                                  "seconds_since_last_flush" => elapsed.as_secs());
+                        }
+
+                        let _idle_threshold = CDC_IDLE_DEREGISTER_THRESHOLD_SECS;
+
+                        #[cfg(feature = "failpoints")]
+                        let _idle_threshold = {
+                            let should_adjust = || {
+                                fail::fail_point!("cdc_idle_deregister_threshold", |_| true);
+                                false
+                            };
+                            if should_adjust() {
+                                5
+                            } else {
+                                CDC_IDLE_DEREGISTER_THRESHOLD_SECS
+                            }
+                        };
+
+                        // Check if last flush was more than the deregister threshold
+                        // To prevent the case that the connection idle since there are a lot of
+                        // incremental scan tasks queueing so won't send events, also check on the
+                        // memory usage, if the memory quota is almost used up, we abort the connection.
+                        if elapsed > Duration::from_secs(_idle_threshold)
+                            && memory_quota.used_ratio() >= CDC_MEMORY_QUOTA_ABORT_THRESHOLD {
+                            error!("cdc connection idle for too long, aborting connection";
+                                   "downstream" => peer_clone.clone(),
+                                   "conn_id" => ?conn_id,
+                                   "seconds_since_last_flush" => elapsed.as_secs());
+                            // Cancel the gRPC connection
+                            let _ = cancel_tx.send(());
+                            break;
+                        }
+                    }
+                }
             }
         });
     }
@@ -524,18 +657,19 @@ async fn sleep_before_drain_change_event() {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use futures::{executor::block_on, SinkExt};
+    use futures::{SinkExt, executor::block_on};
     use grpcio::{self, ChannelBuilder, EnvBuilder, Server, ServerBuilder, WriteFlags};
-    use kvproto::cdcpb::{create_change_data, ChangeDataClient, ResolvedTs};
+    use kvproto::cdcpb::{ChangeDataClient, ResolvedTs, create_change_data};
     use tikv_util::future::block_on_timeout;
 
     use super::*;
-    use crate::channel::{recv_timeout, CdcEvent};
+    use crate::channel::{CdcEvent, recv_timeout};
 
     fn new_rpc_suite(capacity: usize) -> (Server, ChangeDataClient, ReceiverWrapper<Task>) {
         let memory_quota = Arc::new(MemoryQuota::new(capacity));
+        let pool = Arc::new(Builder::new("cdc-watchdog-test").thread_count(1).create());
         let (scheduler, rx) = dummy_scheduler();
-        let cdc_service = Service::new(scheduler, memory_quota);
+        let cdc_service = Service::new(scheduler, memory_quota, pool);
         let env = Arc::new(EnvBuilder::new().build());
         let builder =
             ServerBuilder::new(env.clone()).register_service(create_change_data(cdc_service));
@@ -575,7 +709,14 @@ mod tests {
         let send = || {
             let rts_ = rts.clone();
             let mut sink_ = sink.clone();
-            Box::pin(async move { sink_.send_all(vec![CdcEvent::ResolvedTs(rts_)]).await })
+            Box::pin(async move {
+                sink_
+                    .send_all(
+                        vec![CdcEvent::ResolvedTs(rts_)],
+                        Arc::new(Default::default()),
+                    )
+                    .await
+            })
         };
         let must_fill_window = || {
             let mut window_size = 0;

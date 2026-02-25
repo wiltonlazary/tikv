@@ -1,27 +1,32 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{cmp, sync::Arc};
+use std::{
+    cmp,
+    sync::{Arc, atomic::Ordering},
+};
 
 use collections::{HashMap, HashSet};
 use engine_traits::{KvEngine, RaftEngine};
 use fail::fail_point;
+use health_controller::types::LatencyInspector;
 use kvproto::pdpb;
 use pd_client::{
+    PdClient,
     metrics::{
         REGION_READ_BYTES_HISTOGRAM, REGION_READ_KEYS_HISTOGRAM, REGION_WRITTEN_BYTES_HISTOGRAM,
-        REGION_WRITTEN_KEYS_HISTOGRAM, STORE_SIZE_GAUGE_VEC,
+        REGION_WRITTEN_KEYS_HISTOGRAM,
     },
-    PdClient,
 };
 use prometheus::local::LocalHistogram;
 use raftstore::store::{
-    metrics::STORE_SNAPSHOT_TRAFFIC_GAUGE_VEC, util::LatencyInspector,
     UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryHandle,
+    metrics::STORE_SNAPSHOT_TRAFFIC_GAUGE_VEC,
 };
 use slog::{error, info, warn};
 use tikv_util::{
     metrics::RecordPairVec,
     store::QueryStats,
+    sys::disk,
     time::{Duration, Instant as TiInstant, UnixSecs},
     topn::TopN,
 };
@@ -50,6 +55,12 @@ fn hotspot_query_num_report_threshold() -> u64 {
     const HOTSPOT_QUERY_RATE_THRESHOLD: u64 = 128;
     fail_point!("mock_hotspot_threshold", |_| { 0 });
     HOTSPOT_QUERY_RATE_THRESHOLD * 10
+}
+
+fn hotspot_cpu_usage_report_threshold() -> u64 {
+    const HOTSPOT_CPU_USAGE_THRESHOLD: u64 = 1;
+    fail_point!("mock_hotspot_threshold", |_| { 0 });
+    HOTSPOT_CPU_USAGE_THRESHOLD
 }
 
 pub struct StoreStat {
@@ -125,7 +136,7 @@ fn collect_report_read_peer_stats(
     mut report_read_stats: HashMap<u64, pdpb::PeerStat>,
     mut stats: pdpb::StoreStats,
 ) -> pdpb::StoreStats {
-    if report_read_stats.len() < capacity * 3 {
+    if report_read_stats.len() < capacity * 4 {
         for (_, read_stat) in report_read_stats {
             stats.peer_stats.push(read_stat);
         }
@@ -134,6 +145,7 @@ fn collect_report_read_peer_stats(
     let mut keys_topn_report = TopN::new(capacity);
     let mut bytes_topn_report = TopN::new(capacity);
     let mut stats_topn_report = TopN::new(capacity);
+    let mut cpu_topn_report = TopN::new(capacity);
     for read_stat in report_read_stats.values() {
         let mut cmp_stat = PeerCmpReadStat::default();
         cmp_stat.region_id = read_stat.region_id;
@@ -146,6 +158,9 @@ fn collect_report_read_peer_stats(
         let mut query_cmp_stat = cmp_stat.clone();
         query_cmp_stat.report_stat = get_read_query_num(read_stat.get_query_stats());
         stats_topn_report.push(query_cmp_stat);
+        let mut cpu_cmp_stat = cmp_stat;
+        cpu_cmp_stat.report_stat = read_stat.get_cpu_stats().get_unified_read();
+        cpu_topn_report.push(cpu_cmp_stat);
     }
 
     for x in keys_topn_report {
@@ -161,6 +176,12 @@ fn collect_report_read_peer_stats(
     }
 
     for x in stats_topn_report {
+        if let Some(report_stat) = report_read_stats.remove(&x.region_id) {
+            stats.peer_stats.push(report_stat);
+        }
+    }
+
+    for x in cpu_topn_report {
         if let Some(report_stat) = report_read_stats.remove(&x.region_id) {
             stats.peer_stats.push(report_stat);
         }
@@ -184,34 +205,63 @@ where
         is_fake_hb: bool,
         store_report: Option<pdpb::StoreReport>,
     ) {
-        let mut report_peers = HashMap::default();
-        for (region_id, region_peer) in &mut self.region_peers {
-            let read_bytes = region_peer.read_bytes - region_peer.last_store_report_read_bytes;
-            let read_keys = region_peer.read_keys - region_peer.last_store_report_read_keys;
-            let query_stats = region_peer
-                .query_stats
-                .sub_query_stats(&region_peer.last_store_report_query_stats);
-            region_peer.last_store_report_read_bytes = region_peer.read_bytes;
-            region_peer.last_store_report_read_keys = region_peer.read_keys;
-            region_peer
-                .last_store_report_query_stats
-                .fill_query_stats(&region_peer.query_stats);
-            if read_bytes < hotspot_byte_report_threshold()
-                && read_keys < hotspot_key_report_threshold()
-                && query_stats.get_read_query_num() < hotspot_query_num_report_threshold()
-            {
-                continue;
+        let now = UnixSecs::now();
+        if !is_fake_hb {
+            let mut report_peers = HashMap::default();
+            let interval_seconds = now
+                .into_inner()
+                .saturating_sub(self.store_stat.last_report_ts.into_inner());
+            for (region_id, region_peer) in &mut self.region_peers {
+                let read_bytes = region_peer.read_bytes - region_peer.last_store_report_read_bytes;
+                let read_keys = region_peer.read_keys - region_peer.last_store_report_read_keys;
+                let query_stats = region_peer
+                    .query_stats
+                    .sub_query_stats(&region_peer.last_store_report_query_stats);
+                let cpu_usage = if interval_seconds > 0 {
+                    let cpu_time_duration = Duration::from_millis(
+                        self.region_cpu_records_since_store_heartbeat
+                            .remove(region_id)
+                            .unwrap_or(0) as u64,
+                    );
+                    ((cpu_time_duration.as_secs_f64() * 100.0) / interval_seconds as f64) as u64
+                } else {
+                    self.region_cpu_records_since_store_heartbeat
+                        .remove(region_id);
+                    0
+                };
+                let cpu_usage = if cpu_usage < hotspot_cpu_usage_report_threshold() {
+                    0
+                } else {
+                    cpu_usage
+                };
+                region_peer.last_store_report_read_bytes = region_peer.read_bytes;
+                region_peer.last_store_report_read_keys = region_peer.read_keys;
+                region_peer
+                    .last_store_report_query_stats
+                    .fill_query_stats(&region_peer.query_stats);
+                if read_bytes < hotspot_byte_report_threshold()
+                    && read_keys < hotspot_key_report_threshold()
+                    && query_stats.get_read_query_num() < hotspot_query_num_report_threshold()
+                    && cpu_usage < hotspot_cpu_usage_report_threshold()
+                {
+                    continue;
+                }
+                let mut read_stat = pdpb::PeerStat::default();
+                read_stat.set_region_id(*region_id);
+                read_stat.set_read_keys(read_keys);
+                read_stat.set_read_bytes(read_bytes);
+                read_stat.set_query_stats(query_stats.0);
+                let mut cpu_stats = pdpb::CpuStats::default();
+                cpu_stats.set_unified_read(cpu_usage);
+                read_stat.set_cpu_stats(cpu_stats);
+                report_peers.insert(*region_id, read_stat);
             }
-            let mut read_stat = pdpb::PeerStat::default();
-            read_stat.set_region_id(*region_id);
-            read_stat.set_read_keys(read_keys);
-            read_stat.set_read_bytes(read_bytes);
-            read_stat.set_query_stats(query_stats.0);
-            report_peers.insert(*region_id, read_stat);
-        }
 
-        stats = collect_report_read_peer_stats(HOTSPOT_REPORT_CAPACITY, report_peers, stats);
-        let (capacity, used_size, available) = self.collect_engine_size().unwrap_or_default();
+            // Drain orphan CPU records for regions no longer tracked in `region_peers`.
+            self.region_cpu_records_since_store_heartbeat.clear();
+            stats = collect_report_read_peer_stats(HOTSPOT_REPORT_CAPACITY, report_peers, stats);
+        }
+        let (capacity, used_size, available) = self.collect_engine_size();
         if available == 0 {
             warn!(self.logger, "no available space");
         }
@@ -256,25 +306,17 @@ where
             // normal state.
             self.store_stat.last_report_ts
         } else {
-            UnixSecs::now()
+            now
         };
         self.store_stat.region_bytes_written.flush();
         self.store_stat.region_keys_written.flush();
         self.store_stat.region_bytes_read.flush();
         self.store_stat.region_keys_read.flush();
 
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["capacity"])
-            .set(capacity as i64);
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["available"])
-            .set(available as i64);
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["used"])
-            .set(used_size as i64);
-
         // Update slowness statistics
         self.update_slowness_in_store_stats(&mut stats, last_query_sum);
+
+        stats.set_is_stopping(self.graceful_shutdown_state.load(Ordering::SeqCst));
 
         let resp = self.pd_client.store_heartbeat(stats, store_report, None);
         let logger = self.logger.clone();
@@ -374,7 +416,7 @@ where
                     }
                 }
                 Err(e) => {
-                    error!(logger, "store heartbeat failed"; "err" => ?e);
+                    warn!(logger, "store heartbeat failed"; "err" => ?e);
                 }
             }
         };
@@ -420,7 +462,7 @@ where
         // make the statistics of slowness percepted by PD timely.
         (interval_second > store_heartbeat_interval)
             && (interval_second <= STORE_HEARTBEAT_DELAY_LIMIT)
-            && (interval_second % store_heartbeat_interval == 0)
+            && interval_second.is_multiple_of(store_heartbeat_interval)
     }
 
     pub fn handle_inspect_latency(&self, send_time: TiInstant, inspector: LatencyInspector) {
@@ -446,43 +488,23 @@ where
     }
 
     /// Returns (capacity, used, available).
-    fn collect_engine_size(&self) -> Option<(u64, u64, u64)> {
-        let disk_stats = match fs2::statvfs(self.tablet_registry.tablet_root()) {
-            Err(e) => {
-                error!(
-                    self.logger,
-                    "get disk stat for rocksdb failed";
-                    "engine_path" => self.tablet_registry.tablet_root().display(),
-                    "err" => ?e
-                );
-                return None;
-            }
-            Ok(stats) => stats,
-        };
-        let disk_cap = disk_stats.total_space();
-        let capacity = if self.cfg.value().capacity.0 == 0 {
-            disk_cap
-        } else {
-            std::cmp::min(disk_cap, self.cfg.value().capacity.0)
-        };
-        let mut kv_size = 0;
-        self.tablet_registry.for_each_opened_tablet(|_, cached| {
-            if let Some(tablet) = cached.latest() {
-                kv_size += tablet.get_engine_used_size().unwrap_or(0);
-            }
-            true
-        });
-        let snap_size = self.snap_mgr.total_snap_size().unwrap();
-        let used_size = snap_size
-            + kv_size
-            + self
-                .raft_engine
-                .get_engine_size()
-                .expect("raft engine used size");
-        let mut available = capacity.checked_sub(used_size).unwrap_or_default();
-        // We only care about rocksdb SST file size, so we should check disk available
-        // here.
-        available = cmp::min(available, disk_stats.available_space());
-        Some((capacity, used_size, available))
+    fn collect_engine_size(&self) -> (u64, u64, u64) {
+        // For test purpose, directly set the disk capacity, used size and available
+        // size manually.
+        #[cfg(any(test, feature = "testexport"))]
+        {
+            let (capacity, available) = disk::get_disk_space_stats("./").unwrap();
+
+            disk::set_disk_capacity(capacity);
+            disk::set_disk_used_size(capacity - available);
+            disk::set_disk_available_size(available);
+            return (capacity, capacity - available, available);
+        }
+        #[allow(unreachable_code)]
+        (
+            disk::get_disk_capacity(),
+            disk::get_disk_used_size(),
+            disk::get_disk_available_size(),
+        )
     }
 }

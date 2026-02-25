@@ -1,6 +1,6 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{perf_level_serde, PerfLevel};
+use engine_traits::{KvEngine, PerfLevel, perf_level_serde};
 use online_config::{ConfigChange, ConfigManager, OnlineConfig};
 use serde::{Deserialize, Serialize};
 use tikv_util::{box_err, config::ReadableSize, worker::Scheduler};
@@ -69,8 +69,10 @@ pub enum ConsistencyCheckMethod {
     Mvcc = 1,
 }
 
-/// Default region split size.
-pub const SPLIT_SIZE: ReadableSize = ReadableSize::mb(96);
+/// Default region split size. In version < 8.3.0, the default split size is
+/// 96MB. In version >= 8.3.0, the default split size is increased to 256MB to
+/// allow for larger region size in TiKV.
+pub const SPLIT_SIZE: ReadableSize = ReadableSize::mb(256);
 pub const RAFTSTORE_V2_SPLIT_SIZE: ReadableSize = ReadableSize::gb(10);
 
 /// Default batch split limit.
@@ -168,7 +170,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn validate(&mut self) -> Result<()> {
+    pub fn validate(&mut self, raft_kv_v2: bool) -> Result<()> {
         if self.region_split_keys.is_none() {
             self.region_split_keys = Some((self.region_split_size().as_mb_f64() * 10000.0) as u64);
         }
@@ -199,20 +201,28 @@ impl Config {
             None => self.region_max_keys = Some(self.region_split_keys() / 2 * 3),
         }
         let res = self.validate_bucket_size();
-        // If it's OK to enable bucket, we will prefer to enable it if useful.
-        if let Ok(()) = res && self.enable_region_bucket.is_none() {
-            let useful = self.region_split_size() >= self.region_bucket_size * 2;
-            self.enable_region_bucket = Some(useful);
-        } else if let Err(e) = res && self.enable_region_bucket() {
-            return Err(e);
+        // If it's OK to enable bucket, we will prefer to enable it if useful for
+        // raftstore-v2.
+        match res {
+            Ok(()) => {
+                if self.enable_region_bucket.is_none() && raft_kv_v2 {
+                    let useful = self.region_split_size() >= self.region_bucket_size * 2;
+                    self.enable_region_bucket = Some(useful);
+                }
+            }
+            Err(e) => {
+                if self.enable_region_bucket() {
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
 }
 
-pub struct SplitCheckConfigManager(pub Scheduler<SplitCheckTask>);
+pub struct SplitCheckConfigManager<EK: KvEngine>(pub Scheduler<SplitCheckTask<EK>>);
 
-impl ConfigManager for SplitCheckConfigManager {
+impl<EK: KvEngine> ConfigManager for SplitCheckConfigManager<EK> {
     fn dispatch(
         &mut self,
         change: ConfigChange,
@@ -222,8 +232,8 @@ impl ConfigManager for SplitCheckConfigManager {
     }
 }
 
-impl std::ops::Deref for SplitCheckConfigManager {
-    type Target = Scheduler<SplitCheckTask>;
+impl<EK: KvEngine> std::ops::Deref for SplitCheckConfigManager<EK> {
+    type Target = Scheduler<SplitCheckTask<EK>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -237,39 +247,39 @@ mod tests {
     #[test]
     fn test_config_validate() {
         let mut cfg = Config::default();
-        cfg.validate().unwrap();
+        cfg.validate(false).unwrap();
 
         cfg = Config::default();
         cfg.region_max_size = Some(ReadableSize(10));
         cfg.region_split_size = Some(ReadableSize(20));
-        cfg.validate().unwrap_err();
+        cfg.validate(false).unwrap_err();
 
         cfg = Config::default();
         cfg.region_max_size = None;
         cfg.region_split_size = Some(ReadableSize(20));
-        cfg.validate().unwrap();
+        cfg.validate(false).unwrap();
         assert_eq!(cfg.region_max_size, Some(ReadableSize(30)));
 
         cfg = Config::default();
         cfg.region_max_keys = Some(10);
         cfg.region_split_keys = Some(20);
-        cfg.validate().unwrap_err();
+        cfg.validate(false).unwrap_err();
 
         cfg = Config::default();
         cfg.region_max_keys = None;
         cfg.region_split_keys = Some(20);
-        cfg.validate().unwrap();
+        cfg.validate(false).unwrap();
         assert_eq!(cfg.region_max_keys, Some(30));
 
         cfg = Config::default();
         cfg.enable_region_bucket = Some(false);
         cfg.region_split_size = Some(ReadableSize(20));
         cfg.region_bucket_size = ReadableSize(30);
-        cfg.validate().unwrap();
+        cfg.validate(false).unwrap();
 
         cfg = Config::default();
         cfg.region_split_size = Some(ReadableSize::mb(20));
-        cfg.validate().unwrap();
+        cfg.validate(false).unwrap();
         assert_eq!(cfg.region_split_keys, Some(200000));
     }
 }

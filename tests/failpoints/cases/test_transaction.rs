@@ -2,20 +2,23 @@
 
 use std::{
     sync::{
-        mpsc::{channel, sync_channel},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{channel, sync_channel},
     },
     thread,
     time::Duration,
 };
 
-use futures::executor::block_on;
+use engine_traits::CF_DEFAULT;
+use futures::{StreamExt, executor::block_on};
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::{
     kvrpcpb::{
         self as pb, AssertionLevel, Context, GetRequest, Op, PessimisticLockRequest,
         PrewriteRequest, PrewriteRequestPessimisticAction::*,
     },
+    raft_serverpb::RaftMessage,
     tikvpb::TikvClient,
 };
 use raft::prelude::{ConfChangeType, MessageType};
@@ -28,13 +31,13 @@ use storage::{
     txn::{self, commands},
 };
 use test_raftstore::{
-    configure_for_lease_read, new_learner_peer, new_server_cluster, try_kv_prewrite,
-    DropMessageFilter,
+    DropMessageFilter, configure_for_lease_read, new_learner_peer, new_server_cluster,
+    try_kv_prewrite,
 };
 use tikv::{
     server::gc_worker::gc_by_compact,
     storage::{
-        self,
+        self, Snapshot, TestEngineBuilder, TestStorageBuilderApiV1,
         kv::SnapshotExt,
         lock_manager::MockLockManager,
         txn::tests::{
@@ -42,12 +45,13 @@ use tikv::{
             must_pessimistic_prewrite_put, must_pessimistic_prewrite_put_err, must_prewrite_put,
             must_prewrite_put_err, must_rollback,
         },
-        Snapshot, TestEngineBuilder, TestStorageBuilderApiV1,
     },
 };
+use tikv_kv::{Engine, Modify, WriteData, WriteEvent};
 use tikv_util::{
-    store::{new_peer, peer::new_incoming_voter},
     HandyRwLock,
+    config::ReadableDuration,
+    store::{new_peer, peer::new_incoming_voter},
 };
 use txn_types::{Key, LastChange, Mutation, PessimisticLock, TimeStamp};
 
@@ -339,7 +343,7 @@ fn test_max_commit_ts_error() {
     thread::sleep(Duration::from_millis(200));
     cm.read_key_check(&Key::from_raw(b"k1"), |_| Err(()))
         .unwrap_err();
-    cm.update_max_ts(200.into());
+    cm.update_max_ts(200.into(), "").unwrap();
 
     let res = prewrite_rx.recv().unwrap().unwrap();
     assert!(res.min_commit_ts.is_zero());
@@ -367,7 +371,7 @@ fn test_exceed_max_commit_ts_in_the_middle_of_prewrite() {
     // Pause between getting max ts and store the lock in memory
     fail::cfg("before-set-lock-in-memory", "pause").unwrap();
 
-    cm.update_max_ts(40.into());
+    cm.update_max_ts(40.into(), "").unwrap();
     let mutations = vec![
         Mutation::make_put(Key::from_raw(b"k1"), b"v".to_vec()),
         Mutation::make_put(Key::from_raw(b"k2"), b"v".to_vec()),
@@ -396,7 +400,7 @@ fn test_exceed_max_commit_ts_in_the_middle_of_prewrite() {
     // sleep a while so the first key gets max ts.
     thread::sleep(Duration::from_millis(200));
 
-    cm.update_max_ts(51.into());
+    cm.update_max_ts(51.into(), "").unwrap();
     fail::remove("before-set-lock-in-memory");
     let res = prewrite_rx.recv().unwrap().unwrap();
     assert!(res.min_commit_ts.is_zero());
@@ -558,6 +562,8 @@ fn test_pessimistic_lock_check_valid() {
 
 #[test]
 fn test_concurrent_write_after_transfer_leader_invalidates_locks() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 1);
     cluster.cfg.pessimistic_txn.pipelined = true;
     cluster.cfg.pessimistic_txn.in_memory = true;
@@ -583,7 +589,11 @@ fn test_concurrent_write_after_transfer_leader_invalidates_locks() {
     txn_ext
         .pessimistic_locks
         .write()
-        .insert(vec![(Key::from_raw(b"key"), lock.clone())])
+        .insert(
+            vec![(Key::from_raw(b"key"), lock.clone())],
+            peer_size_limit,
+            instance_size_limit,
+        )
         .unwrap();
 
     let region = cluster.get_region(b"");
@@ -802,4 +812,98 @@ fn test_next_last_change_info_called_when_gc() {
     fail::remove("before_get_write_in_next_last_change_info");
 
     assert_eq!(h.join().unwrap().unwrap().as_slice(), b"v");
+}
+
+fn must_put<E: Engine>(ctx: &Context, engine: &E, key: &[u8], value: &[u8]) {
+    engine.put(ctx, Key::from_raw(key), value.to_vec()).unwrap();
+}
+
+fn must_delete<E: Engine>(ctx: &Context, engine: &E, key: &[u8]) {
+    engine.delete(ctx, Key::from_raw(key)).unwrap();
+}
+
+// Before the fix, a proposal can be proposed twice, which is caused by that
+// write proposal validation and propose are not atomic. So a raft message with
+// higher term between them can make the proposal goes to msg proposal
+// forwarding logic. However, raft proposal forawrd logic is not compatible with
+// the raft store, as the failed proposal makes client retry. The retried
+// proposal coupled with forward proposal makes the propsal applied twice.
+#[test]
+fn test_forbid_forward_propose() {
+    use test_raftstore_v2::*;
+    let count = 3;
+    let mut cluster = new_server_cluster(0, count);
+    cluster.cfg.raft_store.raft_base_tick_interval = ReadableDuration::millis(10);
+    cluster.cfg.raft_store.store_batch_system.pool_size = 2;
+    cluster.run();
+
+    let region = cluster.get_region(b"");
+    let peer1 = new_peer(1, 1);
+    let peer2 = new_peer(2, 2);
+    cluster.must_transfer_leader(region.id, peer2.clone());
+    let storage = cluster.sim.rl().storages[&1].clone();
+    let storage2 = cluster.sim.rl().storages[&2].clone();
+
+    let p = Arc::new(AtomicBool::new(false));
+    let p2 = p.clone();
+    let (tx, rx) = channel();
+    let tx = Mutex::new(tx);
+    cluster.add_recv_filter_on_node(
+        2,
+        Box::new(DropMessageFilter::new(Arc::new(move |_| {
+            if p2.load(Ordering::Relaxed) {
+                tx.lock().unwrap().send(()).unwrap();
+                // One msg is enough
+                p2.store(false, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        }))),
+    );
+
+    let k = Key::from_raw(b"k");
+    let mut ctx = Context::default();
+    ctx.set_region_id(region.get_id());
+    ctx.set_region_epoch(region.get_region_epoch().clone());
+    ctx.set_peer(peer2);
+
+    // block node when collecting message to make async write proposal and a raft
+    // message with higher term occured in a single batch.
+    fail::cfg("on_peer_collect_message_2", "pause").unwrap();
+    let mut res = storage2.async_write(
+        &ctx,
+        WriteData::from_modifies(vec![Modify::Put(CF_DEFAULT, k.clone(), b"val".to_vec())]),
+        WriteEvent::EVENT_PROPOSED,
+        None,
+    );
+
+    // Make node 1 become leader
+    let router = cluster.get_router(1).unwrap();
+    let mut raft_msg = RaftMessage::default();
+    raft_msg.set_region_id(1);
+    raft_msg.set_to_peer(peer1.clone());
+    raft_msg.set_region_epoch(region.get_region_epoch().clone());
+    raft_msg
+        .mut_message()
+        .set_msg_type(MessageType::MsgTimeoutNow);
+    router.send_raft_message(Box::new(raft_msg)).unwrap();
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    ctx.set_peer(peer1);
+    must_put(&ctx, &storage, b"k", b"val");
+    must_delete(&ctx, &storage, b"k");
+
+    p.store(true, Ordering::Release);
+    rx.recv().unwrap();
+    // Ensure the msg is sent by router.
+    std::thread::sleep(Duration::from_millis(100));
+    fail::remove("on_peer_collect_message_2");
+
+    let r = block_on(async { res.next().await }).unwrap();
+    assert!(matches!(r, WriteEvent::Finished(Err { .. })));
+
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(cluster.get(k.as_encoded()), None);
 }

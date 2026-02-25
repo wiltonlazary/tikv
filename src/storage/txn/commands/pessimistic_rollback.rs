@@ -3,20 +3,21 @@
 // #[PerformanceCriticalPath]
 use std::mem;
 
+use tikv_util::Either;
 use txn_types::{Key, TimeStamp};
 
 use crate::storage::{
+    ProcessResult, Result as StorageResult, Snapshot,
     kv::WriteData,
     lock_manager::LockManager,
-    mvcc::{MvccTxn, Result as MvccResult, SnapshotReader},
+    mvcc::{Error as MvccError, MvccTxn, Result as MvccResult, SnapshotReader},
     txn::{
-        commands::{
-            Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
-            WriteCommand, WriteContext, WriteResult,
-        },
         Result,
+        commands::{
+            Command, CommandExt, PessimisticRollbackReadPhase, ReaderWithStats, ReleasedLocks,
+            ResponsePolicy, TypedCommand, WriteCommand, WriteContext, WriteResult,
+        },
     },
-    ProcessResult, Result as StorageResult, Snapshot,
 };
 
 command! {
@@ -25,13 +26,22 @@ command! {
     /// This can roll back an [`AcquirePessimisticLock`](Command::AcquirePessimisticLock) command.
     PessimisticRollback:
         cmd_ty => Vec<StorageResult<()>>,
-        display => "kv::command::pessimistic_rollback keys({:?}) @ {} {} | {:?}", (keys, start_ts, for_update_ts, ctx),
+        display => {
+            "kv::command::pessimistic_rollback keys({:?}) @ {} {} | {:?}",
+            (keys, start_ts, for_update_ts, ctx),
+        }
         content => {
             /// The keys to be rolled back.
             keys: Vec<Key>,
             /// The transaction timestamp.
             start_ts: TimeStamp,
             for_update_ts: TimeStamp,
+            /// The next key to scan using pessimistic rollback read phase.
+            scan_key: Option<Key>,
+        }
+        in_heap => {
+            keys,
+            scan_key,
         }
 }
 
@@ -69,19 +79,64 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for PessimisticRollback {
                 .into()
             ));
             let released_lock: MvccResult<_> = if let Some(lock) = reader.load_lock(&key)? {
-                if lock.is_pessimistic_lock()
-                    && lock.ts == self.start_ts
-                    && lock.for_update_ts <= self.for_update_ts
-                {
-                    Ok(txn.unlock_key(key, true, TimeStamp::zero()))
-                } else {
-                    Ok(None)
+                match lock {
+                    Either::Left(lock) => {
+                        if lock.is_pessimistic_lock()
+                            && lock.ts == self.start_ts
+                            && lock.for_update_ts <= self.for_update_ts
+                        {
+                            Ok(txn.unlock_key(key, true, TimeStamp::zero()))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Either::Right(mut shared_locks) => {
+                        // First check if the lock exists and meets conditions
+                        let should_rollback = shared_locks
+                            .get_lock(&self.start_ts)
+                            .map_err(MvccError::from)?
+                            .map(|lock| {
+                                lock.is_pessimistic_lock()
+                                    && lock.for_update_ts <= self.for_update_ts
+                            })
+                            .unwrap_or(false);
+
+                        if should_rollback {
+                            // Remove the lock
+                            shared_locks
+                                .remove_lock(&self.start_ts)
+                                .map_err(MvccError::from)?;
+                            if shared_locks.is_empty() {
+                                Ok(txn.unlock_key(key, true, TimeStamp::zero()))
+                            } else {
+                                txn.put_shared_locks(key, &shared_locks, false);
+                                Ok(None)
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    }
                 }
             } else {
                 Ok(None)
             };
             released_locks.push(released_lock?);
         }
+
+        let pr = if self.scan_key.is_none() {
+            ProcessResult::MultiRes { results: vec![] }
+        } else {
+            let next_cmd = PessimisticRollbackReadPhase {
+                ctx: ctx.clone(),
+                deadline: self.deadline,
+                start_ts: self.start_ts,
+                for_update_ts: self.for_update_ts,
+                scan_key: self.scan_key.take(),
+            };
+            ProcessResult::NextCommand {
+                cmd: Command::PessimisticRollbackReadPhase(next_cmd),
+            }
+        };
 
         let new_acquired_locks = txn.take_new_locks();
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
@@ -90,18 +145,21 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for PessimisticRollback {
             ctx,
             to_be_write: write_data,
             rows,
-            pr: ProcessResult::MultiRes { results: vec![] },
+            pr,
             lock_info: vec![],
             released_locks,
             new_acquired_locks,
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
+            known_txn_status: vec![],
         })
     }
 }
 
 #[cfg(test)]
 pub mod tests {
+    use std::sync::Arc;
+
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
     use tikv_util::deadline::Deadline;
@@ -109,6 +167,7 @@ pub mod tests {
 
     use super::*;
     use crate::storage::{
+        TestEngineBuilder,
         kv::Engine,
         lock_manager::MockLockManager,
         mvcc::tests::*,
@@ -116,8 +175,8 @@ pub mod tests {
             commands::{WriteCommand, WriteContext},
             scheduler::DEFAULT_EXECUTION_DURATION_LIMIT,
             tests::*,
+            txn_status_cache::TxnStatusCache,
         },
-        TestEngineBuilder,
     };
 
     pub fn must_success<E: Engine>(
@@ -129,7 +188,7 @@ pub mod tests {
         let ctx = Context::default();
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let for_update_ts = for_update_ts.into();
-        let cm = ConcurrencyManager::new(for_update_ts);
+        let cm = ConcurrencyManager::new_for_test(for_update_ts);
         let start_ts = start_ts.into();
         let command = crate::storage::txn::commands::PessimisticRollback {
             ctx: ctx.clone(),
@@ -137,6 +196,7 @@ pub mod tests {
             start_ts,
             for_update_ts,
             deadline: Deadline::from_now(DEFAULT_EXECUTION_DURATION_LIMIT),
+            scan_key: None,
         };
         let lock_mgr = MockLockManager::new();
         let write_context = WriteContext {
@@ -146,6 +206,7 @@ pub mod tests {
             statistics: &mut Default::default(),
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
         };
         let result = command.process_write(snapshot, write_context).unwrap();
         write(engine, &ctx, result.to_be_write.modifies);
@@ -208,5 +269,27 @@ pub mod tests {
         must_success(&mut engine, k, 3, 3);
         must_success(&mut engine, k, 3, 4);
         must_success(&mut engine, k, 3, 5);
+    }
+
+    #[test]
+    fn test_rollback_shared_pessimistic_lock() {
+        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let key = b"shared-rollback";
+        let pk1 = b"pk1";
+        let pk2 = b"pk2";
+
+        // Acquire two shared pessimistic locks on the same key.
+        must_acquire_shared_pessimistic_lock(&mut engine, key, pk1, 10, 30, 3000);
+        must_acquire_shared_pessimistic_lock(&mut engine, key, pk2, 20, 20, 3000);
+
+        // Rolling back one shared pessimistic lock keeps the other entry.
+        must_success(&mut engine, key, 10, 30);
+        let mut shared_lock = must_load_shared_lock(&mut engine, key);
+        assert_eq!(shared_lock.len(), 1);
+        assert!(shared_lock.get_lock(&20.into()).unwrap().is_some());
+
+        // Rolling back the last entry removes the lock entirely.
+        must_success(&mut engine, key, 20, 20);
+        must_unlocked(&mut engine, key);
     }
 }

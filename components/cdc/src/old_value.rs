@@ -2,22 +2,22 @@
 
 use std::ops::{Bound, Deref};
 
-use engine_traits::{ReadOptions, CF_DEFAULT, CF_WRITE};
+use engine_traits::{CF_DEFAULT, CF_WRITE, ReadOptions};
 use getset::CopyGetters;
 use tikv::storage::{
-    mvcc::near_load_data_by_write, Cursor, CursorBuilder, ScanMode, Snapshot as EngineSnapshot,
-    Statistics,
+    Cursor, CursorBuilder, ScanMode, Snapshot as EngineSnapshot, Statistics,
+    mvcc::near_load_data_by_write,
 };
-use tikv_kv::Iterator;
+use tikv_kv::Snapshot;
 use tikv_util::{
+    Either,
     config::ReadableSize,
     lru::{LruCache, SizePolicy},
     time::Instant,
-    Either,
 };
 use txn_types::{Key, MutationType, OldValue, TimeStamp, Value, WriteRef, WriteType};
 
-use crate::{metrics::*, Result};
+use crate::{Result, metrics::*};
 
 pub(crate) type OldValueCallback = Box<
     dyn Fn(Key, TimeStamp, &mut OldValueCache, &mut Statistics) -> Result<Option<Vec<u8>>> + Send,
@@ -235,13 +235,15 @@ pub fn near_seek_old_value<S: EngineSnapshot>(
     }
 }
 
-pub struct OldValueCursors<I: Iterator> {
-    pub write: Cursor<I>,
-    pub default: Cursor<I>,
+pub struct OldValueCursors<S: Snapshot> {
+    pub write: Cursor<S::Iter>,
+    pub default: Cursor<S::Iter>,
 }
 
-impl<I: Iterator> OldValueCursors<I> {
-    pub fn new(write: Cursor<I>, default: Cursor<I>) -> Self {
+impl<S: Snapshot> OldValueCursors<S> {
+    pub fn new(snapshot: &S) -> Self {
+        let write = new_old_value_cursor(snapshot, CF_WRITE);
+        let default = new_old_value_cursor(snapshot, CF_DEFAULT);
         OldValueCursors { write, default }
     }
 }
@@ -349,7 +351,7 @@ mod tests {
         let new_capacity = 256;
         // The memory usage that needs to be removed because of the capacity reduction.
         let dropped = old_value_cache.cache.size() - new_capacity;
-        let dropped_count = if dropped % size != 0 {
+        let dropped_count = if !dropped.is_multiple_of(size) {
             (dropped / size) + 1
         } else {
             dropped / size
@@ -532,7 +534,10 @@ mod tests {
         let mut default_cursor = new_old_value_cursor(&snapshot, CF_DEFAULT);
         let mut load_default = |use_default_cursor: bool| {
             if use_default_cursor {
-                let x = unsafe { std::mem::transmute::<_, &'static mut _>(&mut default_cursor) };
+                let x = unsafe {
+                    #[allow(clippy::missing_transmute_annotations)]
+                    std::mem::transmute::<_, &'static mut _>(&mut default_cursor)
+                };
                 Either::Right(x)
             } else {
                 Either::Left(&snapshot)
@@ -546,7 +551,7 @@ mod tests {
                 let key = Key::from_raw(&raw_key).append_ts(150.into());
                 let ld = load_default(use_default_cursor);
                 let v = near_seek_old_value(&key, &mut cursor, ld, &mut stats).unwrap();
-                assert!(v.map_or(false, |x| x == value()));
+                assert!(v.is_some_and(|x| x == value()));
             }
             assert_eq!(stats.write.seek, 1);
             assert_eq!(stats.write.next, 58);
@@ -565,13 +570,14 @@ mod tests {
                 let key = Key::from_raw(&raw_key).append_ts(150.into());
                 let ld = load_default(use_default_cursor);
                 let v = near_seek_old_value(&key, &mut cursor, ld, &mut stats).unwrap();
-                assert!(v.map_or(false, |x| x == value()));
+                assert!(v.is_some_and(|x| x == value()));
             }
             assert_eq!(stats.write.seek, 2);
             assert_eq!(stats.write.next, 144);
             if use_default_cursor {
                 assert_eq!(stats.data.seek, 2);
-                assert_eq!(stats.data.next, 144);
+                // some unnecessary near seek is avoided
+                assert!(stats.data.next < stats.write.next);
                 assert_eq!(stats.data.get, 0);
             } else {
                 assert_eq!(stats.data.seek, 0);

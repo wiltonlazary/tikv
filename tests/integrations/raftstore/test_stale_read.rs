@@ -8,7 +8,7 @@ use kvproto::{
     metapb::{Peer, Region},
     tikvpb_grpc::TikvClient,
 };
-use test_raftstore::{must_get_equal, new_mutation, new_peer, PeerClient};
+use test_raftstore::{must_get_equal, new_mutation, new_peer};
 use test_raftstore_macro::test_case;
 use tikv_util::{config::ReadableDuration, time::Instant};
 
@@ -181,7 +181,7 @@ fn test_resolved_ts_after_destroy_peer() {
     // Make sure region 1 is removed from store 1.
     cluster.wait_destroy_and_clean(r1, new_peer(1, 1));
 
-    // Must not get destory peer's read progress
+    // Must not get destroy peer's read progress
     let meta = cluster.store_metas[&r1].lock().unwrap();
     assert_eq!(None, meta.region_read_progress.get_resolved_ts(&r1))
 }

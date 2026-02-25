@@ -1,8 +1,9 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
+use core::panic;
 use std::{
     pin::Pin,
-    sync::{atomic::AtomicU64, Arc, RwLock},
+    sync::{Arc, RwLock, atomic::AtomicU64},
     thread,
     time::Duration,
 };
@@ -35,14 +36,14 @@ use kvproto::{
 };
 use security::SecurityManager;
 use tikv_util::{
-    box_err, debug, error, info, slow_log, time::Instant, timer::GLOBAL_TIMER_HANDLE, warn, Either,
-    HandyRwLock,
+    Either, HandyRwLock, box_err, debug, error, info, slow_log, time::Instant,
+    timer::GLOBAL_TIMER_HANDLE, warn,
 };
 use tokio_timer::timer::Handle;
 
 use super::{
-    metrics::*, tso::TimestampOracle, BucketMeta, Config, Error, FeatureGate, PdFuture, Result,
-    REQUEST_TIMEOUT,
+    BucketMeta, Config, Error, FeatureGate, PdFuture, REQUEST_TIMEOUT, Result, metrics::*,
+    tso::TimestampOracle,
 };
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1); // 1s
@@ -436,7 +437,7 @@ impl Client {
     }
 }
 
-/// The context of sending requets.
+/// The context of sending request.
 pub struct Request<Req, F> {
     remain_request_count: usize,
     request_sent: usize,
@@ -493,7 +494,7 @@ where
             Err(err) => {
                 // these errors are not caused by network, no need to retry
                 if err.retryable() && self.remain_request_count > 0 {
-                    error!(?*err; "request failed, retry");
+                    warn!("request failed, retry"; "err" => ?*err);
                     false
                 } else {
                     true
@@ -549,7 +550,7 @@ where
                 return Ok(r);
             }
             Err(e) => {
-                error!(?e; "request failed");
+                warn!("request failed"; "err" => ?e);
                 if retry == 0 {
                     return Err(e);
                 }
@@ -558,7 +559,7 @@ where
         // try reconnect
         retry -= 1;
         if let Err(e) = block_on(client.reconnect(true)) {
-            error!(?e; "reconnect failed");
+            warn!("reconnect failed"; "err" => ?e);
             thread::sleep(REQUEST_RECONNECT_INTERVAL);
         }
     }
@@ -685,7 +686,7 @@ impl PdConnector {
         for m in members
             .iter()
             .filter(|m| *m != previous_leader)
-            .chain(&[previous_leader.clone()])
+            .chain(std::slice::from_ref(previous_leader))
         {
             for ep in m.get_client_urls() {
                 match self.connect(ep.as_str()).await {
@@ -717,7 +718,7 @@ impl PdConnector {
                         }
                     }
                     Err(e) => {
-                        error!("connect failed"; "endpoints" => ep, "error" => ?e);
+                        warn!("connect failed"; "endpoints" => ep, "error" => ?e);
                         continue;
                     }
                 }
@@ -731,10 +732,11 @@ impl PdConnector {
 
     // There are 3 kinds of situations we will return the new client:
     // 1. the force is true which represents the client is newly created or the
-    // original connection has some problem 2. the previous forwarded host is
-    // not empty and it can connect the leader now which represents the network
-    // partition problem to leader may be recovered 3. the member information of
-    // PD has been changed
+    // original connection has some problem.
+    // 2. the previous forwarded host is not empty and it can connect the leader
+    // now which represents the network partition problem to leader may be
+    // recovered.
+    // 3. the member information of PD has been changed.
     pub async fn reconnect_pd(
         &self,
         members_resp: GetMembersResponse,
@@ -815,7 +817,7 @@ impl PdConnector {
                             network_fail_num += 1;
                         }
                     }
-                    error!("failed to connect to PD member"; "endpoints" => ep, "error" => ?e);
+                    warn!("failed to connect to PD member"; "endpoints" => ep, "error" => ?e);
                 }
                 _ => unreachable!(),
             }
@@ -945,14 +947,14 @@ pub fn check_resp_header(header: &ResponseHeader) -> Result<()> {
         ErrorType::IncompatibleVersion => Err(Error::Incompatible),
         ErrorType::StoreTombstone => Err(Error::StoreTombstone(err.get_message().to_owned())),
         ErrorType::RegionNotFound => Err(Error::RegionNotFound(vec![])),
-        ErrorType::GlobalConfigNotFound => {
-            Err(Error::GlobalConfigNotFound(err.get_message().to_owned()))
-        }
         ErrorType::DataCompacted => Err(Error::DataCompacted(err.get_message().to_owned())),
         ErrorType::Ok => Ok(()),
         ErrorType::DuplicatedEntry | ErrorType::EntryNotFound => Err(box_err!(err.get_message())),
         ErrorType::Unknown => Err(box_err!(err.get_message())),
         ErrorType::InvalidValue => Err(box_err!(err.get_message())),
+        ErrorType::GlobalConfigNotFound => panic!("unexpected error {:?}", err),
+        // It will not happen, because we don't call `batch_scan_regions` in TiKV.
+        ErrorType::RegionsNotContainAllKeyRange => Err(box_err!(err.get_message())),
     }
 }
 

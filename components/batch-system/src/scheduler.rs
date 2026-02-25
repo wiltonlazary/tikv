@@ -2,11 +2,11 @@
 
 use crossbeam::channel::SendError;
 use resource_control::channel::Sender;
-use tikv_util::warn;
+use tikv_util::{time::Instant, warn};
 
 use crate::{
-    fsm::{Fsm, FsmScheduler, Priority},
     FsmTypes,
+    fsm::{Fsm, FsmScheduler, Priority},
 };
 pub struct NormalScheduler<N: Fsm, C: Fsm> {
     pub(crate) sender: Sender<FsmTypes<N, C>>,
@@ -44,9 +44,9 @@ where
             Priority::Low => &self.low_sender,
         };
 
-        match sender.send(FsmTypes::Normal(fsm), None) {
+        match sender.send(FsmTypes::Normal((fsm, Instant::now_coarse())), None) {
             Ok(_) => {}
-            Err(SendError(FsmTypes::Normal(fsm))) => warn!("failed to schedule fsm {:p}", fsm),
+            Err(SendError(FsmTypes::Normal((fsm, _)))) => warn!("failed to schedule fsm {:p}", fsm),
             _ => unreachable!(),
         }
     }
@@ -88,9 +88,14 @@ where
 
     #[inline]
     fn schedule(&self, fsm: Box<C>) {
-        match self.sender.send(FsmTypes::Control(fsm), None) {
+        match self
+            .sender
+            .send(FsmTypes::Control((fsm, Instant::now_coarse())), None)
+        {
             Ok(_) => {}
-            Err(SendError(FsmTypes::Control(fsm))) => warn!("failed to schedule fsm {:p}", fsm),
+            Err(SendError(FsmTypes::Control((fsm, _)))) => {
+                warn!("failed to schedule fsm {:p}", fsm)
+            }
             _ => unreachable!(),
         }
     }

@@ -4,10 +4,10 @@
 use std::sync::{Arc, Mutex};
 
 use collections::HashSet;
-use prometheus::local::LocalHistogram;
+use prometheus::local::{LocalHistogram, LocalIntCounter};
 use raft::eraftpb::MessageType;
 use tikv_util::time::{Duration, Instant};
-use tracker::{Tracker, TrackerToken, GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN};
+use tracker::{GLOBAL_TRACKERS, INVALID_TRACKER_TOKEN, Tracker, TrackerToken};
 
 use super::metrics::*;
 
@@ -68,25 +68,31 @@ impl RaftSendMessageMetrics {
     }
 }
 
+/// Buffered statistics for recording local raftstore message duration.
+///
+/// As it's only used for recording local raftstore message duration,
+/// and it will be manually reset preiodically, so it's not necessary
+/// to use `LocalHistogram`.
 #[derive(Default)]
-pub struct RaftCommitLogStatistics {
-    pub last_commit_log_duration_sum: Duration,
-    pub last_commit_log_count_sum: u64,
+struct LocalHealthStatistics {
+    duration_sum: Duration,
+    count: u64,
 }
 
-impl RaftCommitLogStatistics {
+impl LocalHealthStatistics {
     #[inline]
-    pub fn record(&mut self, dur: Duration) {
-        self.last_commit_log_count_sum += 1;
-        self.last_commit_log_duration_sum += dur;
+    fn observe(&mut self, dur: Duration) {
+        self.count += 1;
+        self.duration_sum += dur;
     }
 
     #[inline]
-    pub fn avg(&self) -> Duration {
-        if self.last_commit_log_count_sum > 0 {
+    fn avg(&self) -> Duration {
+        if self.count > 0 {
             Duration::from_micros(
-                self.last_commit_log_duration_sum.as_micros() as u64
-                    / self.last_commit_log_count_sum,
+                (self.duration_sum.as_micros() as u64)
+                    .checked_div(self.count)
+                    .unwrap_or(0),
             )
         } else {
             Duration::default()
@@ -94,9 +100,53 @@ impl RaftCommitLogStatistics {
     }
 
     #[inline]
+    fn reset(&mut self) {
+        self.count = 0;
+        self.duration_sum = Duration::default();
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoType {
+    Disk = 0,
+    Network = 1,
+}
+
+/// Buffered statistics for recording the health of raftstore.
+#[derive(Default)]
+pub struct HealthStatistics {
+    // represents periodic latency on the disk io.
+    disk_io_dur: LocalHealthStatistics,
+    // represents the latency of the network io.
+    network_io_dur: LocalHealthStatistics,
+}
+
+impl HealthStatistics {
+    #[inline]
+    pub fn observe(&mut self, dur: Duration, io_type: IoType) {
+        match io_type {
+            IoType::Disk => self.disk_io_dur.observe(dur),
+            IoType::Network => self.network_io_dur.observe(dur),
+        }
+    }
+
+    #[inline]
+    pub fn avg(&self, io_type: IoType) -> Duration {
+        match io_type {
+            IoType::Disk => self.disk_io_dur.avg(),
+            IoType::Network => self.network_io_dur.avg(),
+        }
+    }
+
+    #[inline]
+    /// Reset HealthStatistics.
+    ///
+    /// Should be manually reset when the metrics are
+    /// accepted by slowness inspector.
     pub fn reset(&mut self) {
-        self.last_commit_log_count_sum = 0;
-        self.last_commit_log_duration_sum = Duration::default();
+        self.disk_io_dur.reset();
+        self.network_io_dur.reset();
     }
 }
 
@@ -112,13 +162,30 @@ pub struct RaftMetrics {
 
     // local histogram
     pub store_time: LocalHistogram,
+    // the wait time for processing a raft command
     pub propose_wait_time: LocalHistogram,
+    // the wait time for processing a raft message
+    pub process_wait_time: LocalHistogram,
     pub process_ready: LocalHistogram,
     pub event_time: RaftEventDurationVec,
     pub peer_msg_len: LocalHistogram,
     pub commit_log: LocalHistogram,
     pub write_block_wait: LocalHistogram,
     pub propose_log_size: LocalHistogram,
+
+    // Raftstore disk IO metrics
+    pub io_write_init_raft_state: LocalHistogram,
+    pub io_write_init_apply_state: LocalHistogram,
+    pub io_write_peer_destroy_kv: LocalHistogram,
+    pub io_write_peer_destroy_raft: LocalHistogram,
+    pub io_read_entry_storage_create: LocalHistogram,
+    pub io_read_store_check_msg: LocalHistogram,
+    pub io_read_peer_check_merge_target_stale: LocalHistogram,
+    pub io_read_peer_maybe_create: LocalHistogram,
+    pub io_read_peer_snapshot_read: LocalHistogram,
+    pub io_read_v2_compatible_learner: LocalHistogram,
+    pub io_read_raft_term: LocalHistogram,
+    pub io_read_raft_fetch_log: LocalHistogram,
 
     // waterfall metrics
     pub waterfall_metrics: bool,
@@ -130,8 +197,9 @@ pub struct RaftMetrics {
     pub wf_commit_not_persist_log: LocalHistogram,
 
     // local statistics for slowness
-    pub stat_commit_log: RaftCommitLogStatistics,
+    pub health_stats: HealthStatistics,
 
+    pub check_stale_peer: LocalIntCounter,
     pub leader_missing: Arc<Mutex<HashSet<u64>>>,
 
     last_flush_time: Instant,
@@ -152,6 +220,7 @@ impl RaftMetrics {
             raft_log_gc_skipped: RaftLogGcSkippedCounterVec::from(&RAFT_LOG_GC_SKIPPED_VEC),
             store_time: STORE_TIME_HISTOGRAM.local(),
             propose_wait_time: REQUEST_WAIT_TIME_HISTOGRAM.local(),
+            process_wait_time: RAFT_MESSAGE_WAIT_TIME_HISTOGRAM.local(),
             process_ready: PEER_RAFT_PROCESS_DURATION
                 .with_label_values(&["ready"])
                 .local(),
@@ -160,6 +229,42 @@ impl RaftMetrics {
             commit_log: PEER_COMMIT_LOG_HISTOGRAM.local(),
             write_block_wait: STORE_WRITE_MSG_BLOCK_WAIT_DURATION_HISTOGRAM.local(),
             propose_log_size: PEER_PROPOSE_LOG_SIZE_HISTOGRAM.local(),
+            io_write_peer_destroy_kv: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["write", "peer_destroy_kv_write"])
+                .local(),
+            io_write_peer_destroy_raft: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["write", "peer_destroy_raft_write"])
+                .local(),
+            io_write_init_raft_state: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["write", "init_raft_state"])
+                .local(),
+            io_write_init_apply_state: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["write", "init_apply_state"])
+                .local(),
+            io_read_entry_storage_create: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["read", "entry_storage_create"])
+                .local(),
+            io_read_store_check_msg: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["read", "store_check_msg"])
+                .local(),
+            io_read_peer_check_merge_target_stale: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["read", "peer_check_merge_target_stale"])
+                .local(),
+            io_read_peer_maybe_create: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["read", "peer_maybe_create"])
+                .local(),
+            io_read_peer_snapshot_read: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["read", "peer_snapshot_read"])
+                .local(),
+            io_read_v2_compatible_learner: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["read", "v2_compatible_learner"])
+                .local(),
+            io_read_raft_term: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["read", "raft_term"])
+                .local(),
+            io_read_raft_fetch_log: STORE_IO_DURATION_HISTOGRAM
+                .with_label_values(&["read", "raft_fetch_log"])
+                .local(),
             waterfall_metrics,
             wf_batch_wait: STORE_WF_BATCH_WAIT_DURATION_HISTOGRAM.local(),
             wf_send_to_queue: STORE_WF_SEND_TO_QUEUE_DURATION_HISTOGRAM.local(),
@@ -167,7 +272,8 @@ impl RaftMetrics {
             wf_persist_log: STORE_WF_PERSIST_LOG_DURATION_HISTOGRAM.local(),
             wf_commit_log: STORE_WF_COMMIT_LOG_DURATION_HISTOGRAM.local(),
             wf_commit_not_persist_log: STORE_WF_COMMIT_NOT_PERSIST_LOG_DURATION_HISTOGRAM.local(),
-            stat_commit_log: RaftCommitLogStatistics::default(),
+            health_stats: HealthStatistics::default(),
+            check_stale_peer: CHECK_STALE_PEER_COUNTER.local(),
             leader_missing: Arc::default(),
             last_flush_time: Instant::now_coarse(),
         }
@@ -190,12 +296,26 @@ impl RaftMetrics {
 
         self.store_time.flush();
         self.propose_wait_time.flush();
+        self.process_wait_time.flush();
         self.process_ready.flush();
         self.event_time.flush();
         self.peer_msg_len.flush();
         self.commit_log.flush();
         self.write_block_wait.flush();
         self.propose_log_size.flush();
+
+        self.io_write_init_raft_state.flush();
+        self.io_write_init_apply_state.flush();
+        self.io_write_peer_destroy_kv.flush();
+        self.io_write_peer_destroy_raft.flush();
+        self.io_read_entry_storage_create.flush();
+        self.io_read_store_check_msg.flush();
+        self.io_read_peer_check_merge_target_stale.flush();
+        self.io_read_peer_maybe_create.flush();
+        self.io_read_peer_snapshot_read.flush();
+        self.io_read_v2_compatible_learner.flush();
+        self.io_read_raft_term.flush();
+        self.io_read_raft_fetch_log.flush();
 
         if self.waterfall_metrics {
             self.wf_batch_wait.flush();
@@ -206,6 +326,7 @@ impl RaftMetrics {
             self.wf_commit_not_persist_log.flush();
         }
 
+        self.check_stale_peer.flush();
         let mut missing = self.leader_missing.lock().unwrap();
         LEADER_MISSING.set(missing.len() as i64);
         missing.clear();

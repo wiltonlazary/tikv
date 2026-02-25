@@ -2,31 +2,30 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use causal_ts::CausalTsProviderImpl;
 use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{KvEngine, RaftEngine, TabletRegistry};
+use health_controller::types::{InspectFactor, LatencyInspector, RaftstoreDuration};
 use kvproto::{metapb, pdpb};
 use pd_client::{BucketStat, PdClient};
 use raftstore::store::{
-    metrics::STORE_INSPECT_DURATION_HISTOGRAM,
-    util::{KeysInfoFormatter, LatencyInspector, RaftstoreDuration},
-    AutoSplitController, Config, FlowStatsReporter, PdStatsMonitor, ReadStats,
-    RegionReadProgressRegistry, SplitInfo, StoreStatsReporter, TabletSnapManager, TxnExt,
-    WriteStats, NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT,
+    AutoSplitController, Config, FlowStatsReporter, NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT,
+    PdStatsMonitor, ReadStats, SplitInfo, SplitValidator, StoreStatsReporter, TabletSnapManager,
+    TxnExt, WriteStats, metrics::STORE_INSPECT_DURATION_HISTOGRAM, util::KeysInfoFormatter,
 };
 use resource_metering::{Collector, CollectorRegHandle, RawRecords};
 use service::service_manager::GrpcServiceManager;
-use slog::{error, warn, Logger};
+use slog::{Logger, error, warn};
 use tikv_util::{
     config::VersionTrack,
     time::{Instant as TiInstant, UnixSecs},
     worker::{Runnable, Scheduler},
 };
-use yatp::{task::future::TaskCell, Remote};
+use yatp::{Remote, task::future::TaskCell};
 
 use crate::{
     batch::StoreRouter,
@@ -57,7 +56,6 @@ pub enum Task {
     },
     // In region.rs.
     RegionHeartbeat(RegionHeartbeatTask),
-    ReportRegionBuckets(BucketStat),
     UpdateReadStats(ReadStats),
     UpdateWriteStats(WriteStats),
     UpdateRegionCpuRecords(Arc<RawRecords>),
@@ -85,6 +83,7 @@ pub enum Task {
         initial_status: u64,
         txn_ext: Arc<TxnExt>,
     },
+    // BucketStat is the delta write flow of the bucket.
     ReportBuckets(BucketStat),
     ReportMinResolvedTs {
         store_id: u64,
@@ -99,6 +98,9 @@ pub enum Task {
     UpdateSlownessStats {
         tick_id: u64,
         duration: RaftstoreDuration,
+    },
+    GracefulShutdownState {
+        state: bool,
     },
 }
 
@@ -123,7 +125,6 @@ impl Display for Task {
                 hb_task.region,
                 hb_task.peer.get_id(),
             ),
-            Task::ReportRegionBuckets(ref buckets) => write!(f, "report buckets: {:?}", buckets),
             Task::UpdateReadStats(ref stats) => {
                 write!(f, "update read stats: {stats:?}")
             }
@@ -181,6 +182,9 @@ impl Display for Task {
                 "update slowness statistics: tick_id {}, duration {:?}",
                 tick_id, duration
             ),
+            Task::GracefulShutdownState { state } => {
+                write!(f, "graceful shutdown state: {}", state)
+            }
         }
     }
 }
@@ -193,7 +197,9 @@ where
 {
     store_id: u64,
     pd_client: Arc<T>,
+    #[allow(dead_code)]
     raft_engine: ER,
+    #[allow(dead_code)]
     tablet_registry: TabletRegistry<EK>,
     snap_mgr: TabletSnapManager,
     router: StoreRouter<EK, ER>,
@@ -209,8 +215,12 @@ where
     // For region.
     region_peers: HashMap<u64, region::PeerStat>,
     region_buckets: HashMap<u64, region::ReportBucket>,
-    // region_id -> total_cpu_time_ms (since last region heartbeat)
-    region_cpu_records: HashMap<u64, u32>,
+    // region_id -> total_cpu_time_ms accumulated for RegionHeartbeat reporting.
+    // This map is consumed/cleared by the region-heartbeat path.
+    region_cpu_records_since_region_heartbeat: HashMap<u64, u32>,
+    // region_id -> total_cpu_time_ms accumulated for StoreHeartbeat peer_stats.
+    // This map is consumed/cleared by real store heartbeats (not fake ones).
+    region_cpu_records_since_store_heartbeat: HashMap<u64, u32>,
     is_hb_receiver_scheduled: bool,
 
     // For update_max_timestamp.
@@ -225,7 +235,10 @@ where
 
     logger: Logger,
     shutdown: Arc<AtomicBool>,
+    #[allow(dead_code)]
     cfg: Arc<VersionTrack<Config>>,
+
+    graceful_shutdown_state: Arc<AtomicBool>,
 }
 
 impl<EK, ER, T> Runner<EK, ER, T>
@@ -246,25 +259,25 @@ where
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used for rawkv apiv2
         pd_scheduler: Scheduler<Task>,
         auto_split_controller: AutoSplitController,
-        region_read_progress: RegionReadProgressRegistry,
         collector_reg_handle: CollectorRegHandle,
         grpc_service_manager: GrpcServiceManager,
         logger: Logger,
         shutdown: Arc<AtomicBool>,
         cfg: Arc<VersionTrack<Config>>,
+        graceful_shutdown_state: Arc<AtomicBool>,
     ) -> Result<Self, std::io::Error> {
         let store_heartbeat_interval = cfg.value().pd_store_heartbeat_tick_interval.0;
         let mut stats_monitor = PdStatsMonitor::new(
             store_heartbeat_interval / NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT,
-            cfg.value().report_min_resolved_ts_interval.0,
             cfg.value().inspect_interval.0,
+            std::time::Duration::default(),
+            cfg.value().inspect_network_interval.0,
             PdReporter::new(pd_scheduler, logger.clone()),
         );
         stats_monitor.start(
             auto_split_controller,
-            region_read_progress,
             collector_reg_handle,
-            store_id,
+            SplitValidator::new(),
         )?;
         let slowness_stats = slowness::SlownessStatistics::new(&cfg.value());
         Ok(Self {
@@ -281,7 +294,8 @@ where
             store_stat: store::StoreStat::default(),
             region_peers: HashMap::default(),
             region_buckets: HashMap::default(),
-            region_cpu_records: HashMap::default(),
+            region_cpu_records_since_region_heartbeat: HashMap::default(),
+            region_cpu_records_since_store_heartbeat: HashMap::default(),
             is_hb_receiver_scheduled: false,
             concurrency_manager,
             causal_ts_provider,
@@ -290,6 +304,7 @@ where
             logger,
             shutdown,
             cfg,
+            graceful_shutdown_state,
         })
     }
 }
@@ -314,7 +329,6 @@ where
                 write_io_rates,
             } => self.handle_update_store_infos(cpu_usages, read_io_rates, write_io_rates),
             Task::RegionHeartbeat(task) => self.handle_region_heartbeat(task),
-            Task::ReportRegionBuckets(buckets) => self.handle_report_region_buckets(buckets),
             Task::UpdateReadStats(stats) => self.handle_update_read_stats(stats),
             Task::UpdateWriteStats(stats) => self.handle_update_write_stats(stats),
             Task::UpdateRegionCpuRecords(records) => self.handle_update_region_cpu_records(records),
@@ -341,7 +355,7 @@ where
                 initial_status,
                 txn_ext,
             } => self.handle_update_max_timestamp(region_id, initial_status, txn_ext),
-            Task::ReportBuckets(buckets) => self.handle_report_region_buckets(buckets),
+            Task::ReportBuckets(delta_buckets) => self.handle_report_region_buckets(delta_buckets),
             Task::ReportMinResolvedTs {
                 store_id,
                 min_resolved_ts,
@@ -354,6 +368,7 @@ where
             Task::UpdateSlownessStats { tick_id, duration } => {
                 self.handle_update_slowness_stats(tick_id, duration)
             }
+            Task::GracefulShutdownState { state } => self.handle_graceful_shutdown_state(state),
         }
     }
 }
@@ -438,7 +453,7 @@ impl StoreStatsReporter for PdReporter {
         }
     }
 
-    fn update_latency_stats(&self, timer_tick: u64) {
+    fn update_latency_stats(&self, timer_tick: u64, _factor: InspectFactor) {
         // Tick slowness statistics.
         {
             if let Err(e) = self.scheduler.schedule(Task::TickSlownessStats) {
@@ -533,7 +548,7 @@ mod requests {
             None => PeerMsg::admin_command(req).0,
         };
         if let Err(e) = router.send(region_id, msg) {
-            error!(
+            warn!(
                 logger,
                 "send request failed";
                 "region_id" => region_id, "cmd_type" => ?cmd_type, "err" => ?e,

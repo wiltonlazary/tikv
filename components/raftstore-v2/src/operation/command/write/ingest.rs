@@ -2,13 +2,14 @@
 
 use collections::HashMap;
 use crossbeam::channel::TrySendError;
-use engine_traits::{data_cf_offset, KvEngine, RaftEngine, DATA_CFS_LEN};
+use engine_traits::{DATA_CFS_LEN, KvEngine, RaftEngine, data_cf_offset};
 use kvproto::import_sstpb::SstMeta;
+use pd_client::metrics::STORE_SIZE_EVENT_INT_VEC;
 use raftstore::{
-    store::{check_sst_for_ingestion, metrics::PEER_WRITE_CMD_COUNTER, util},
     Result,
+    store::{check_sst_for_ingestion, metrics::PEER_WRITE_CMD_COUNTER, util},
 };
-use slog::{error, info};
+use slog::{error, info, warn};
 use sst_importer::range_overlaps;
 use tikv_util::{box_try, slog_panic};
 
@@ -20,11 +21,11 @@ use crate::{
     worker::tablet,
 };
 
-impl<'a, EK: KvEngine, ER: RaftEngine, T> StoreFsmDelegate<'a, EK, ER, T> {
+impl<EK: KvEngine, ER: RaftEngine, T> StoreFsmDelegate<'_, EK, ER, T> {
     #[inline]
     pub fn on_cleanup_import_sst(&mut self) {
         if let Err(e) = self.fsm.store.on_cleanup_import_sst(self.store_ctx) {
-            error!(self.fsm.store.logger(), "cleanup import sst failed"; "error" => ?e);
+            warn!(self.fsm.store.logger(), "cleanup import sst failed"; "error" => ?e);
         }
         self.schedule_tick(
             StoreTick::CleanupImportSst,
@@ -39,7 +40,14 @@ impl Store {
         &mut self,
         ctx: &mut StoreContext<EK, ER, T>,
     ) -> Result<()> {
+        let import_size = box_try!(ctx.sst_importer.get_total_size());
+        STORE_SIZE_EVENT_INT_VEC.import_size.set(import_size as i64);
         let ssts = box_try!(ctx.sst_importer.list_ssts());
+        // filter old version SSTs
+        let ssts: Vec<_> = ssts
+            .into_iter()
+            .filter(|sst| sst.1 >= sst_importer::API_VERSION_2)
+            .collect();
         if ssts.is_empty() {
             return Ok(());
         }
@@ -47,16 +55,23 @@ impl Store {
         let mut region_ssts: HashMap<_, Vec<_>> = HashMap::default();
         for sst in ssts {
             region_ssts
-                .entry(sst.get_region_id())
+                .entry(sst.0.get_region_id())
                 .or_default()
-                .push(sst);
+                .push(sst.0);
         }
 
         let ranges = ctx.sst_importer.ranges_in_import();
         for (region_id, ssts) in region_ssts {
-            if let Err(TrySendError::Disconnected(msg)) = ctx.router.send(region_id, PeerMsg::CleanupImportSst(ssts.into()))
-                && !ctx.router.is_shutdown() {
-                let PeerMsg::CleanupImportSst( ssts) = msg else { unreachable!() };
+            if let Err(TrySendError::Disconnected(msg)) = ctx
+                .router
+                .send(region_id, PeerMsg::CleanupImportSst(ssts.into()))
+            {
+                if ctx.router.is_shutdown() {
+                    continue;
+                }
+                let PeerMsg::CleanupImportSst(ssts) = msg else {
+                    unreachable!()
+                };
                 let mut ssts = ssts.into_vec();
                 ssts.retain(|sst| {
                     for range in &ranges {
@@ -66,7 +81,10 @@ impl Store {
                     }
                     true
                 });
-                let _ = ctx.schedulers.tablet.schedule(tablet::Task::CleanupImportSst(ssts.into()));
+                let _ = ctx
+                    .schedulers
+                    .tablet
+                    .schedule(tablet::Task::CleanupImportSst(ssts.into()));
             }
         }
 

@@ -3,7 +3,7 @@
 use std::{collections::HashMap, string::ToString};
 
 use kvproto::diagnosticspb::{ServerInfoItem, ServerInfoPair};
-use tikv_util::sys::{cpu_time::LinuxStyleCpuTime, ioload, SysQuota, *};
+use tikv_util::sys::{SysQuota, cpu_time::LinuxStyleCpuTime, ioload, *};
 use walkdir::WalkDir;
 
 use crate::server::service::diagnostics::SYS_INFO;
@@ -198,7 +198,7 @@ fn nic_load_info(prev_nic: HashMap<String, NicSnapshot>, collector: &mut Vec<Ser
 
 fn io_load_info(prev_io: HashMap<String, ioload::IoLoad>, collector: &mut Vec<ServerInfoItem>) {
     let current = ioload::IoLoad::snapshot();
-    let rate = |cur, prev| (cur - prev);
+    let rate = |cur, prev| cur - prev;
     for (name, cur) in current.into_iter() {
         let prev = match prev_io.get(&name) {
             Some(p) => p,
@@ -601,7 +601,7 @@ mod tests {
             ]
         );
         // memory
-        for name in ["virtual", "swap"].into_iter() {
+        for name in vec!["virtual", "swap"].into_iter() {
             let item = collector
                 .iter()
                 .find(|x| x.get_tp() == "memory" && x.get_name() == name);
@@ -682,6 +682,8 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    // this test verifies that memory quota matches /proc/meminfo which is not true for docker
+    #[cfg(not(feature = "docker_test"))]
     fn test_memory() {
         let mut mem_total_kb: u64 = 0;
         {

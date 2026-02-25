@@ -3,19 +3,20 @@
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 use engine_traits::KvEngine;
-use futures::{channel::oneshot::Receiver, compat::Future01CompatExt, FutureExt};
+use futures::{FutureExt, channel::oneshot::Receiver, compat::Future01CompatExt};
 use kvproto::metapb::Region;
 use raftstore::{
     coprocessor::ObserveHandle,
     router::CdcHandle,
-    store::{fsm::ChangeObserver, msg::Callback, RegionSnapshot},
+    store::{RegionSnapshot, fsm::ChangeObserver, msg::Callback},
 };
 use tikv::storage::{
     kv::{ScanMode as MvccScanMode, Snapshot},
     mvcc::MvccReader,
 };
 use tikv_util::{
-    sys::thread::ThreadBuildWrapper, time::Instant, timer::GLOBAL_TIMER_HANDLE, worker::Scheduler,
+    sys::thread::ThreadBuildWrapper, thread_name_prefix::RESOLVED_TS_SCANNER_THREAD, time::Instant,
+    timer::GLOBAL_TIMER_HANDLE, worker::Scheduler,
 };
 use tokio::{
     runtime::{Builder, Runtime},
@@ -24,9 +25,9 @@ use tokio::{
 use txn_types::{Key, Lock, LockType, TimeStamp};
 
 use crate::{
+    Task,
     errors::{Error, Result},
     metrics::*,
-    Task,
 };
 
 const DEFAULT_SCAN_BATCH_SIZE: usize = 128;
@@ -43,7 +44,7 @@ pub struct ScanTask {
 }
 
 impl ScanTask {
-    async fn send_entries(&self, entries: ScanEntries, apply_index: u64) {
+    fn send_entries(&self, entries: ScanEntries, apply_index: u64) {
         let task = Task::ScanLocks {
             region_id: self.region.get_id(),
             observe_id: self.handle.id,
@@ -91,7 +92,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine> ScannerPool<T, E> {
     pub fn new(count: usize, cdc_handle: T) -> Self {
         let workers = Arc::new(
             Builder::new_multi_thread()
-                .thread_name("inc-scan")
+                .thread_name(RESOLVED_TS_SCANNER_THREAD)
                 .worker_threads(count)
                 .with_sys_hooks()
                 .build()
@@ -159,16 +160,14 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine> ScannerPool<T, E> {
                 if has_remaining {
                     start_key = Some(locks.last().unwrap().0.clone())
                 }
-                task.send_entries(ScanEntries::Lock(locks), apply_index)
-                    .await;
+                task.send_entries(ScanEntries::Lock(locks), apply_index);
             }
             RTS_SCAN_DURATION_HISTOGRAM.observe(start.saturating_elapsed().as_secs_f64());
-            task.send_entries(ScanEntries::None, apply_index).await;
+            task.send_entries(ScanEntries::None, apply_index);
         };
         self.workers.spawn(fut);
     }
 
-    #[allow(clippy::needless_pass_by_ref_mut)]
     async fn get_snapshot(
         task: &mut ScanTask,
         cdc_handle: T,
@@ -230,13 +229,24 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine> ScannerPool<T, E> {
         _checkpoint_ts: TimeStamp,
     ) -> Result<(Vec<(Key, Lock)>, bool)> {
         let (locks, has_remaining) = reader
-            .scan_locks(
+            .scan_locks_from_storage(
                 start,
                 None,
-                |lock| matches!(lock.lock_type, LockType::Put | LockType::Delete),
+                |_, lock| matches!(lock.lock_type, LockType::Put | LockType::Delete),
                 DEFAULT_SCAN_BATCH_SIZE,
             )
             .map_err(|e| Error::Other(box_err!("{:?}", e)))?;
-        Ok((locks, has_remaining))
+        Ok((
+            locks
+                .into_iter()
+                .map(|(key, lock)| {
+                    (
+                        key,
+                        lock.left().expect("only put/delete lock should be here"),
+                    )
+                })
+                .collect(),
+            has_remaining,
+        ))
     }
 }

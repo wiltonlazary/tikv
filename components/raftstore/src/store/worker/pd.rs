@@ -1,14 +1,13 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    cmp,
-    cmp::Ordering as CmpOrdering,
+    cmp::{self, Ordering as CmpOrdering},
     fmt::{self, Display, Formatter},
     io, mem,
     sync::{
-        atomic::Ordering,
-        mpsc::{self, Receiver, Sender},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread::{Builder, JoinHandle},
     time::{Duration, Instant},
@@ -19,8 +18,12 @@ use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{KvEngine, RaftEngine};
 use fail::fail_point;
-use futures::{compat::Future01CompatExt, FutureExt};
-use grpcio_health::{HealthService, ServingStatus};
+use futures::{FutureExt, compat::Future01CompatExt};
+use health_controller::{
+    HealthController,
+    reporters::{RaftstoreReporter, RaftstoreReporterConfig},
+    types::{InspectFactor, LatencyInspector, RaftstoreDuration},
+};
 use kvproto::{
     kvrpcpb::DiskFullOpt,
     metapb, pdpb,
@@ -31,48 +34,51 @@ use kvproto::{
     raft_serverpb::RaftMessage,
     replication_modepb::{RegionReplicationStatus, StoreDrAutoSyncStatus},
 };
-use ordered_float::OrderedFloat;
-use pd_client::{metrics::*, BucketStat, Error, PdClient, RegionStat};
+use pd_client::{BucketStat, Error, PdClient, RegionStat, RegionWriteCfCopDetail, metrics::*};
 use prometheus::local::LocalHistogram;
 use raft::eraftpb::ConfChangeType;
 use resource_metering::{Collector, CollectorGuard, CollectorRegHandle, RawRecords};
 use service::service_manager::GrpcServiceManager;
 use tikv_util::{
-    box_err, debug, error, info,
+    GLOBAL_SERVER_READINESS, box_err, debug, error, info,
     metrics::ThreadInfoStatistics,
     store::QueryStats,
-    sys::thread::StdThreadBuildWrapper,
+    sys::{SysQuota, disk, thread::StdThreadBuildWrapper},
     thd_name,
+    thread_name_prefix::STATS_MONITOR_THREAD,
     time::{Instant as TiInstant, UnixSecs},
     timer::GLOBAL_TIMER_HANDLE,
     topn::TopN,
-    trend::{RequestPerSecRecorder, Trend},
     warn,
-    worker::{Runnable, RunnableWithTimer, ScheduleError, Scheduler},
+    worker::{Runnable, ScheduleError, Scheduler},
 };
-use txn_types::TimeStamp;
 use yatp::Remote;
 
+use super::split_controller::AutoSplitControllerContext;
 use crate::{
     coprocessor::CoprocessorHost,
     router::RaftStoreRouter,
     store::{
+        Callback, CasualMessage, Config, PeerMsg, RaftCmdExtraOpts, RaftCommand, RaftRouter,
+        SnapManager, StoreMsg, StoreTick, TxnExt,
         cmd_resp::new_error,
         metrics::*,
         unsafe_recovery::{
             UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryHandle,
         },
-        util::{is_epoch_stale, KeysInfoFormatter, LatencyInspector, RaftstoreDuration},
+        util::{KeysInfoFormatter, is_epoch_stale},
         worker::{
+            AutoSplitController, ReadStats, SplitConfigChange, SplitValidator, WriteStats,
             split_controller::{SplitInfo, TOP_N},
-            AutoSplitController, ReadStats, SplitConfigChange, WriteStats,
         },
-        Callback, CasualMessage, Config, PeerMsg, RaftCmdExtraOpts, RaftCommand, RaftRouter,
-        RegionReadProgressRegistry, SnapManager, StoreInfo, StoreMsg, TxnExt,
     },
 };
 
 pub const NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT: u32 = 2;
+/// The upper bound of buffered stats messages.
+/// It prevents unexpected memory buildup when AutoSplitController
+/// runs slowly.
+const STATS_CHANNEL_CAPACITY_LIMIT: usize = 128;
 
 type RecordPairVec = Vec<pdpb::RecordPair>;
 
@@ -97,20 +103,19 @@ pub trait FlowStatsReporter: Send + Clone + Sync + 'static {
     fn report_write_stats(&self, write_stats: WriteStats);
 }
 
-impl<EK, ER> FlowStatsReporter for Scheduler<Task<EK, ER>>
+impl<EK> FlowStatsReporter for Scheduler<Task<EK>>
 where
     EK: KvEngine,
-    ER: RaftEngine,
 {
     fn report_read_stats(&self, read_stats: ReadStats) {
         if let Err(e) = self.schedule(Task::ReadStats { read_stats }) {
-            error!("Failed to send read flow statistics"; "err" => ?e);
+            warn!("Failed to send read flow statistics"; "err" => ?e);
         }
     }
 
     fn report_write_stats(&self, write_stats: WriteStats) {
         if let Err(e) = self.schedule(Task::WriteStats { write_stats }) {
-            error!("Failed to send write flow statistics"; "err" => ?e);
+            warn!("Failed to send write flow statistics"; "err" => ?e);
         }
     }
 }
@@ -130,10 +135,9 @@ pub struct HeartbeatTask {
 }
 
 /// Uses an asynchronous thread to tell PD something.
-pub enum Task<EK, ER>
+pub enum Task<EK>
 where
     EK: KvEngine,
-    ER: RaftEngine,
 {
     AskSplit {
         region: metapb::Region,
@@ -152,6 +156,7 @@ where
         right_derive: bool,
         share_source_region_size: bool,
         callback: Callback<EK::Snapshot>,
+        split_reason: pdpb::SplitReason,
     },
     AutoSplit {
         split_infos: Vec<SplitInfo>,
@@ -159,7 +164,6 @@ where
     Heartbeat(HeartbeatTask),
     StoreHeartbeat {
         stats: pdpb::StoreStats,
-        store_info: Option<StoreInfo<EK, ER>>,
         report: Option<pdpb::StoreReport>,
         dr_autosync_status: Option<StoreDrAutoSyncStatus>,
     },
@@ -194,6 +198,7 @@ where
     },
     UpdateSlowScore {
         id: u64,
+        factor: InspectFactor,
         duration: RaftstoreDuration,
     },
     RegionCpuRecords(Arc<RawRecords>),
@@ -203,6 +208,12 @@ where
     },
     ReportBuckets(BucketStat),
     ControlGrpcServer(pdpb::ControlGrpcEvent),
+    InspectLatency {
+        factor: InspectFactor,
+    },
+    GracefulShutdownState {
+        state: bool,
+    },
 }
 
 pub struct StoreStat {
@@ -225,6 +236,9 @@ pub struct StoreStat {
     pub store_cpu_usages: RecordPairVec,
     pub store_read_io_rates: RecordPairVec,
     pub store_write_io_rates: RecordPairVec,
+
+    store_cpu_quota: f64, // quota of cpu usage
+    store_cpu_busy_thd: f64,
 }
 
 impl Default for StoreStat {
@@ -249,7 +263,30 @@ impl Default for StoreStat {
             store_cpu_usages: RecordPairVec::default(),
             store_read_io_rates: RecordPairVec::default(),
             store_write_io_rates: RecordPairVec::default(),
+
+            store_cpu_quota: 0.0_f64,
+            store_cpu_busy_thd: 0.8_f64,
         }
+    }
+}
+
+impl StoreStat {
+    fn set_cpu_quota(&mut self, cpu_cores: f64, busy_thd: f64) {
+        self.store_cpu_quota = cpu_cores * 100.0;
+        self.store_cpu_busy_thd = busy_thd;
+    }
+
+    fn maybe_busy(&self) -> bool {
+        if self.store_cpu_quota < 1.0 || self.store_cpu_busy_thd > 1.0 {
+            return false;
+        }
+
+        let mut cpu_usage = 0_u64;
+        for record in self.store_cpu_usages.iter() {
+            cpu_usage += record.get_value();
+        }
+
+        (cpu_usage as f64 / self.store_cpu_quota) >= self.store_cpu_busy_thd
     }
 }
 
@@ -258,10 +295,12 @@ pub struct PeerStat {
     pub read_bytes: u64,
     pub read_keys: u64,
     pub query_stats: QueryStats,
+    pub cop_detail: RegionWriteCfCopDetail,
     // last_region_report_attributes records the state of the last region heartbeat
     pub last_region_report_read_bytes: u64,
     pub last_region_report_read_keys: u64,
     pub last_region_report_query_stats: QueryStats,
+    pub last_region_report_cop_detail: RegionWriteCfCopDetail,
     pub last_region_report_written_bytes: u64,
     pub last_region_report_written_keys: u64,
     pub last_region_report_ts: UnixSecs,
@@ -343,10 +382,9 @@ impl PartialOrd for PeerCmpReadStat {
     }
 }
 
-impl<EK, ER> Display for Task<EK, ER>
+impl<EK> Display for Task<EK>
 where
     EK: KvEngine,
-    ER: RaftEngine,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match *self {
@@ -414,8 +452,16 @@ where
             Task::QueryRegionLeader { region_id } => {
                 write!(f, "query the leader of region {}", region_id)
             }
-            Task::UpdateSlowScore { id, ref duration } => {
-                write!(f, "compute slow score: id {}, duration {:?}", id, duration)
+            Task::UpdateSlowScore {
+                id,
+                factor,
+                ref duration,
+            } => {
+                write!(
+                    f,
+                    "compute slow score: id {}, factor: {:?}, duration {:?}",
+                    id, factor, duration
+                )
             }
             Task::RegionCpuRecords(ref cpu_records) => {
                 write!(f, "get region cpu records: {:?}", cpu_records)
@@ -436,6 +482,12 @@ where
             Task::ControlGrpcServer(ref event) => {
                 write!(f, "control grpc server: {:?}", event)
             }
+            Task::InspectLatency { factor } => {
+                write!(f, "inspect raftstore latency: {:?}", factor)
+            }
+            Task::GracefulShutdownState { state } => {
+                write!(f, "graceful shutdown state: {:?}", state)
+            }
         }
     }
 }
@@ -450,14 +502,50 @@ fn default_collect_tick_interval() -> Duration {
     DEFAULT_COLLECT_TICK_INTERVAL
 }
 
-fn config(interval: Duration) -> Duration {
-    fail_point!("mock_min_resolved_ts_interval", |_| {
-        Duration::from_millis(50)
-    });
-    fail_point!("mock_min_resolved_ts_interval_disable", |_| {
-        Duration::from_millis(0)
-    });
-    interval
+/// Determines the minimal interval for latency inspection ticks based on raft
+/// and kvdb inspection intervals.
+///
+/// This function handles different scenarios for latency inspection:
+/// 1. Both intervals are zero: Inspection is disabled, returns a large interval
+///    (1 hour)
+/// 2. Only raft interval is zero: Uses kvdb interval (raft inspection disabled)
+/// 3. Only kvdb interval is zero: Uses raft interval (kvdb inspection disabled)
+/// 4. Both intervals non-zero: Uses the smaller of the two intervals
+///
+/// # Arguments
+///
+/// * `inspect_latency_interval` - Interval for raft latency inspection
+/// * `inspect_kvdb_latency_interval` - Interval for kvdb latency inspection
+///
+/// # Returns
+///
+/// The minimal interval that should be used for latency inspection ticks
+fn get_minimal_inspect_tick_interval(
+    inspect_latency_interval: Duration,
+    inspect_kvdb_latency_interval: Duration,
+) -> Duration {
+    match (
+        inspect_latency_interval.is_zero(),
+        inspect_kvdb_latency_interval.is_zero(),
+    ) {
+        (true, true) => {
+            // Both inspections are disabled - return a large interval to avoid misleading
+            // tick checks
+            Duration::from_secs(3600)
+        }
+        (true, false) => {
+            // raft inspection disabled - use kvdb interval
+            inspect_kvdb_latency_interval
+        }
+        (false, true) => {
+            // kvdb inspection disabled - use raft interval
+            inspect_latency_interval
+        }
+        (false, false) => {
+            // Both inspections enabled - use the smaller interval
+            std::cmp::min(inspect_latency_interval, inspect_kvdb_latency_interval)
+        }
+    }
 }
 
 #[inline]
@@ -473,12 +561,11 @@ fn convert_record_pairs(m: HashMap<String, u64>) -> RecordPairVec {
 }
 
 #[derive(Clone)]
-pub struct WrappedScheduler<EK: KvEngine, ER: RaftEngine>(Scheduler<Task<EK, ER>>);
+pub struct WrappedScheduler<EK: KvEngine>(Scheduler<Task<EK>>);
 
-impl<EK, ER> Collector for WrappedScheduler<EK, ER>
+impl<EK> Collector for WrappedScheduler<EK>
 where
     EK: KvEngine,
-    ER: RaftEngine,
 {
     fn collect(&self, records: Arc<RawRecords>) {
         self.0.schedule(Task::RegionCpuRecords(records)).ok();
@@ -494,13 +581,12 @@ pub trait StoreStatsReporter: Send + Clone + Sync + 'static + Collector {
     );
     fn report_min_resolved_ts(&self, store_id: u64, min_resolved_ts: u64);
     fn auto_split(&self, split_infos: Vec<SplitInfo>);
-    fn update_latency_stats(&self, timer_tick: u64);
+    fn update_latency_stats(&self, timer_tick: u64, factor: InspectFactor);
 }
 
-impl<EK, ER> StoreStatsReporter for WrappedScheduler<EK, ER>
+impl<EK> StoreStatsReporter for WrappedScheduler<EK>
 where
     EK: KvEngine,
-    ER: RaftEngine,
 {
     fn report_store_infos(
         &self,
@@ -527,7 +613,7 @@ where
             min_resolved_ts,
         };
         if let Err(e) = self.0.schedule(task) {
-            error!(
+            warn!(
                 "failed to send min resolved ts to pd worker";
                 "err" => ?e,
             );
@@ -537,16 +623,23 @@ where
     fn auto_split(&self, split_infos: Vec<SplitInfo>) {
         let task = Task::AutoSplit { split_infos };
         if let Err(e) = self.0.schedule(task) {
-            error!(
+            warn!(
                 "failed to send split infos to pd worker";
                 "err" => ?e,
             );
         }
     }
 
-    fn update_latency_stats(&self, timer_tick: u64) {
-        debug!("update latency statistics not implemented for raftstore-v1";
+    fn update_latency_stats(&self, timer_tick: u64, factor: InspectFactor) {
+        debug!("update latency statistics for raftstore-v1";
                 "tick" => timer_tick);
+        let task = Task::InspectLatency { factor };
+        if let Err(e) = self.0.schedule(task) {
+            warn!(
+                "failed to send inspect raftstore latency task to pd worker";
+                "err" => ?e,
+            );
+        }
     }
 }
 
@@ -557,13 +650,14 @@ where
     reporter: T,
     handle: Option<JoinHandle<()>>,
     timer: Option<Sender<bool>>,
-    read_stats_sender: Option<Sender<ReadStats>>,
-    cpu_stats_sender: Option<Sender<Arc<RawRecords>>>,
+    read_stats_sender: Option<SyncSender<ReadStats>>,
+    cpu_stats_sender: Option<SyncSender<Arc<RawRecords>>>,
     collect_store_infos_interval: Duration,
     load_base_split_check_interval: Duration,
     collect_tick_interval: Duration,
-    report_min_resolved_ts_interval: Duration,
-    inspect_latency_interval: Duration,
+    inspect_latency_interval: Duration,      // for raft mount path
+    inspect_kvdb_latency_interval: Duration, // for kvdb mount path
+    inspect_network_interval: Duration,
 }
 
 impl<T> StatsMonitor<T>
@@ -572,8 +666,9 @@ where
 {
     pub fn new(
         interval: Duration,
-        report_min_resolved_ts_interval: Duration,
         inspect_latency_interval: Duration,
+        inspect_kvdb_latency_interval: Duration,
+        inspect_network_interval: Duration,
         reporter: T,
     ) -> Self {
         StatsMonitor {
@@ -587,13 +682,17 @@ where
                 DEFAULT_LOAD_BASE_SPLIT_CHECK_INTERVAL,
                 interval,
             ),
-            report_min_resolved_ts_interval: config(report_min_resolved_ts_interval),
-            // Use `inspect_latency_interval` as the minimal limitation for collecting tick.
+            // Use the smallest inspect latency as the minimal limitation for collecting tick.
             collect_tick_interval: cmp::min(
-                inspect_latency_interval,
-                cmp::min(default_collect_tick_interval(), interval),
+                get_minimal_inspect_tick_interval(
+                    inspect_latency_interval,
+                    inspect_kvdb_latency_interval,
+                ),
+                interval.min(default_collect_tick_interval()),
             ),
             inspect_latency_interval,
+            inspect_kvdb_latency_interval,
+            inspect_network_interval,
         }
     }
 
@@ -602,13 +701,15 @@ where
     pub fn start(
         &mut self,
         mut auto_split_controller: AutoSplitController,
-        region_read_progress: RegionReadProgressRegistry,
         collector_reg_handle: CollectorRegHandle,
-        store_id: u64,
+        split_validator: SplitValidator,
     ) -> Result<(), io::Error> {
         if self.collect_tick_interval
             < cmp::min(
-                self.inspect_latency_interval,
+                get_minimal_inspect_tick_interval(
+                    self.inspect_latency_interval,
+                    self.inspect_kvdb_latency_interval,
+                ),
                 default_collect_tick_interval(),
             )
         {
@@ -625,30 +726,35 @@ where
         let load_base_split_check_interval = self
             .load_base_split_check_interval
             .div_duration_f64(tick_interval) as u64;
-        let report_min_resolved_ts_interval = self
-            .report_min_resolved_ts_interval
-            .div_duration_f64(tick_interval) as u64;
-        let update_latency_stats_interval = self
-            .inspect_latency_interval
-            .div_duration_f64(tick_interval) as u64;
+        let update_raftdisk_latency_stats_interval =
+            self.inspect_latency_interval
+                .div_duration_f64(tick_interval) as u64;
+        let update_kvdisk_latency_stats_interval =
+            self.inspect_kvdb_latency_interval
+                .div_duration_f64(tick_interval) as u64;
+        let update_network_latency_stats_interval =
+            self.inspect_network_interval
+                .div_duration_f64(tick_interval) as u64;
 
         let (timer_tx, timer_rx) = mpsc::channel();
         self.timer = Some(timer_tx);
 
-        let (read_stats_sender, read_stats_receiver) = mpsc::channel();
+        let (read_stats_sender, read_stats_receiver) =
+            mpsc::sync_channel(STATS_CHANNEL_CAPACITY_LIMIT);
         self.read_stats_sender = Some(read_stats_sender);
 
-        let (cpu_stats_sender, cpu_stats_receiver) = mpsc::channel();
+        let (cpu_stats_sender, cpu_stats_receiver) =
+            mpsc::sync_channel(STATS_CHANNEL_CAPACITY_LIMIT);
         self.cpu_stats_sender = Some(cpu_stats_sender);
 
         let reporter = self.reporter.clone();
         let props = tikv_util::thread_group::current_properties();
 
         fn is_enable_tick(timer_cnt: u64, interval: u64) -> bool {
-            interval != 0 && timer_cnt % interval == 0
+            interval != 0 && timer_cnt.is_multiple_of(interval)
         }
         let h = Builder::new()
-            .name(thd_name!("stats-monitor"))
+            .name(thd_name!(STATS_MONITOR_THREAD))
             .spawn_wrapper(move || {
                 tikv_util::thread_group::set_properties(props);
 
@@ -657,6 +763,9 @@ where
                 let mut collect_store_infos_thread_stats = ThreadInfoStatistics::new();
                 let mut load_base_split_thread_stats = ThreadInfoStatistics::new();
                 let mut region_cpu_records_collector = None;
+                let mut auto_split_controller_ctx =
+                    AutoSplitControllerContext::new(STATS_CHANNEL_CAPACITY_LIMIT);
+                let split_validator = split_validator;
                 // Register the region CPU records collector.
                 if auto_split_controller
                     .cfg
@@ -678,22 +787,24 @@ where
                     if is_enable_tick(timer_cnt, load_base_split_check_interval) {
                         StatsMonitor::load_base_split(
                             &mut auto_split_controller,
+                            &mut auto_split_controller_ctx,
                             &read_stats_receiver,
                             &cpu_stats_receiver,
                             &mut load_base_split_thread_stats,
                             &reporter,
                             &collector_reg_handle,
                             &mut region_cpu_records_collector,
+                            &split_validator,
                         );
                     }
-                    if is_enable_tick(timer_cnt, report_min_resolved_ts_interval) {
-                        reporter.report_min_resolved_ts(
-                            store_id,
-                            region_read_progress.get_min_resolved_ts(),
-                        );
+                    if is_enable_tick(timer_cnt, update_raftdisk_latency_stats_interval) {
+                        reporter.update_latency_stats(timer_cnt, InspectFactor::RaftDisk);
                     }
-                    if is_enable_tick(timer_cnt, update_latency_stats_interval) {
-                        reporter.update_latency_stats(timer_cnt);
+                    if is_enable_tick(timer_cnt, update_kvdisk_latency_stats_interval) {
+                        reporter.update_latency_stats(timer_cnt, InspectFactor::KvDisk);
+                    }
+                    if is_enable_tick(timer_cnt, update_network_latency_stats_interval) {
+                        reporter.update_latency_stats(timer_cnt, InspectFactor::Network);
                     }
                     timer_cnt += 1;
                 }
@@ -714,12 +825,14 @@ where
 
     pub fn load_base_split(
         auto_split_controller: &mut AutoSplitController,
+        auto_split_controller_ctx: &mut AutoSplitControllerContext,
         read_stats_receiver: &Receiver<ReadStats>,
         cpu_stats_receiver: &Receiver<Arc<RawRecords>>,
         thread_stats: &mut ThreadInfoStatistics,
         reporter: &T,
         collector_reg_handle: &CollectorRegHandle,
         region_cpu_records_collector: &mut Option<CollectorGuard>,
+        split_validator: &SplitValidator,
     ) {
         let start_time = TiInstant::now();
         match auto_split_controller.refresh_and_check_cfg() {
@@ -735,18 +848,15 @@ where
             }
             SplitConfigChange::Noop => {}
         }
-        let mut read_stats_vec = vec![];
-        while let Ok(read_stats) = read_stats_receiver.try_recv() {
-            read_stats_vec.push(read_stats);
-        }
-        let mut cpu_stats_vec = vec![];
-        while let Ok(cpu_stats) = cpu_stats_receiver.try_recv() {
-            cpu_stats_vec.push(cpu_stats);
-        }
-        thread_stats.record();
-        let (top_qps, split_infos) =
-            auto_split_controller.flush(read_stats_vec, cpu_stats_vec, thread_stats);
+        let (top_qps, split_infos) = auto_split_controller.flush(
+            auto_split_controller_ctx,
+            read_stats_receiver,
+            cpu_stats_receiver,
+            thread_stats,
+            split_validator,
+        );
         auto_split_controller.clear();
+        auto_split_controller_ctx.maybe_gc();
         reporter.auto_split(split_infos);
         for i in 0..TOP_N {
             if i < top_qps.len() {
@@ -774,8 +884,8 @@ where
     #[inline]
     pub fn maybe_send_read_stats(&self, read_stats: ReadStats) {
         if let Some(sender) = &self.read_stats_sender {
-            if sender.send(read_stats).is_err() {
-                warn!("send read_stats failed, are we shutting down?")
+            if sender.try_send(read_stats).is_err() {
+                debug!("send read_stats failed, are we shutting down or channel is full?")
             }
         }
     }
@@ -783,8 +893,8 @@ where
     #[inline]
     pub fn maybe_send_cpu_stats(&self, cpu_stats: &Arc<RawRecords>) {
         if let Some(sender) = &self.cpu_stats_sender {
-            if sender.send(cpu_stats.clone()).is_err() {
-                warn!("send region cpu info failed, are we shutting down?")
+            if sender.try_send(cpu_stats.clone()).is_err() {
+                debug!("send region cpu info failed, are we shutting down or channel is full?")
             }
         }
     }
@@ -794,8 +904,16 @@ const HOTSPOT_KEY_RATE_THRESHOLD: u64 = 128;
 const HOTSPOT_QUERY_RATE_THRESHOLD: u64 = 128;
 const HOTSPOT_BYTE_RATE_THRESHOLD: u64 = 8 * 1024;
 const HOTSPOT_REPORT_CAPACITY: usize = 1000;
+const HOTSPOT_REPORT_METRICS: usize = 4;
 
 // TODO: support dynamic configure threshold in future.
+fn hotspot_cpu_usage_report_threshold() -> u64 {
+    const HOTSPOT_CPU_USAGE_THRESHOLD: u64 = 1;
+    fail_point!("mock_hotspot_threshold", |_| { 0 });
+
+    HOTSPOT_CPU_USAGE_THRESHOLD
+}
+
 fn hotspot_key_report_threshold() -> u64 {
     fail_point!("mock_hotspot_threshold", |_| { 0 });
 
@@ -814,110 +932,76 @@ fn hotspot_query_num_report_threshold() -> u64 {
     HOTSPOT_QUERY_RATE_THRESHOLD * 10
 }
 
+#[inline]
+fn should_report_hotspot_read_peer(
+    read_bytes: u64,
+    read_keys: u64,
+    query_stats: &QueryStats,
+    cpu_usage: u64,
+) -> bool {
+    !(read_bytes < hotspot_byte_report_threshold()
+        && read_keys < hotspot_key_report_threshold()
+        && query_stats.get_read_query_num() < hotspot_query_num_report_threshold()
+        && cpu_usage < hotspot_cpu_usage_report_threshold())
+}
+
+fn collect_report_peers_for_store_heartbeat(
+    region_peers: &mut HashMap<u64, PeerStat>,
+    // region_id -> total_cpu_time_ms accumulated since last store heartbeat.
+    region_cpu_records_since_store_heartbeat: &mut HashMap<u64, u32>,
+    interval_seconds: u64,
+) -> HashMap<u64, pdpb::PeerStat> {
+    let has_interval = interval_seconds > 0;
+    let mut report_peers = HashMap::default();
+    for (region_id, region_peer) in region_peers.iter_mut() {
+        let read_bytes = region_peer.read_bytes - region_peer.last_store_report_read_bytes;
+        let read_keys = region_peer.read_keys - region_peer.last_store_report_read_keys;
+        let query_stats = region_peer
+            .query_stats
+            .sub_query_stats(&region_peer.last_store_report_query_stats);
+        let cpu_usage = if has_interval {
+            let cpu_time_duration = Duration::from_millis(
+                region_cpu_records_since_store_heartbeat
+                    .remove(region_id)
+                    .unwrap_or(0) as u64,
+            );
+            ((cpu_time_duration.as_secs_f64() * 100.0) / interval_seconds as f64) as u64
+        } else {
+            // `interval_seconds == 0` is unexpected but can happen in corner cases.
+            // Drain the record and report 0 to avoid division by zero.
+            region_cpu_records_since_store_heartbeat.remove(region_id);
+            0
+        };
+        let cpu_usage = if cpu_usage < hotspot_cpu_usage_report_threshold() {
+            0
+        } else {
+            cpu_usage
+        };
+        region_peer.last_store_report_read_bytes = region_peer.read_bytes;
+        region_peer.last_store_report_read_keys = region_peer.read_keys;
+        region_peer
+            .last_store_report_query_stats
+            .fill_query_stats(&region_peer.query_stats);
+        if !should_report_hotspot_read_peer(read_bytes, read_keys, &query_stats, cpu_usage) {
+            continue;
+        }
+        let mut read_stat = pdpb::PeerStat::default();
+        read_stat.set_region_id(*region_id);
+        read_stat.set_read_keys(read_keys);
+        read_stat.set_read_bytes(read_bytes);
+        read_stat.set_query_stats(query_stats.0);
+        let mut cpu_stats = pdpb::CpuStats::default();
+        cpu_stats.set_unified_read(cpu_usage);
+        read_stat.set_cpu_stats(cpu_stats);
+        report_peers.insert(*region_id, read_stat);
+    }
+    // Drain orphan CPU records for regions no longer tracked in `region_peers`.
+    region_cpu_records_since_store_heartbeat.clear();
+    report_peers
+}
+
 /// Max limitation of delayed store_heartbeat.
 const STORE_HEARTBEAT_DELAY_LIMIT: u64 = 5 * 60;
-
-// Slow score is a value that represents the speed of a store and ranges in [1,
-// 100]. It is maintained in the AIMD way.
-// If there are some inspecting requests timeout during a round, by default the
-// score will be increased at most 1x when above 10% inspecting requests
-// timeout. If there is not any timeout inspecting requests, the score will go
-// back to 1 in at least 5min.
-struct SlowScore {
-    value: OrderedFloat<f64>,
-    last_record_time: Instant,
-    last_update_time: Instant,
-
-    timeout_requests: usize,
-    total_requests: usize,
-
-    inspect_interval: Duration,
-    // The maximal tolerated timeout ratio.
-    ratio_thresh: OrderedFloat<f64>,
-    // Minimal time that the score could be decreased from 100 to 1.
-    min_ttr: Duration,
-
-    // After how many ticks the value need to be updated.
-    round_ticks: u64,
-    // Identify every ticks.
-    last_tick_id: u64,
-    // If the last tick does not finished, it would be recorded as a timeout.
-    last_tick_finished: bool,
-}
-
-impl SlowScore {
-    fn new(inspect_interval: Duration) -> SlowScore {
-        SlowScore {
-            value: OrderedFloat(1.0),
-
-            timeout_requests: 0,
-            total_requests: 0,
-
-            inspect_interval,
-            ratio_thresh: OrderedFloat(0.1),
-            min_ttr: Duration::from_secs(5 * 60),
-            last_record_time: Instant::now(),
-            last_update_time: Instant::now(),
-            round_ticks: 30,
-            last_tick_id: 0,
-            last_tick_finished: true,
-        }
-    }
-
-    fn record(&mut self, id: u64, duration: Duration) {
-        self.last_record_time = Instant::now();
-        if id != self.last_tick_id {
-            return;
-        }
-        self.last_tick_finished = true;
-        self.total_requests += 1;
-        if duration >= self.inspect_interval {
-            self.timeout_requests += 1;
-        }
-    }
-
-    fn record_timeout(&mut self) {
-        self.last_tick_finished = true;
-        self.total_requests += 1;
-        self.timeout_requests += 1;
-    }
-
-    fn update(&mut self) -> f64 {
-        let elapsed = self.last_update_time.elapsed();
-        self.update_impl(elapsed).into()
-    }
-
-    fn get(&self) -> f64 {
-        self.value.into()
-    }
-
-    // Update the score in a AIMD way.
-    fn update_impl(&mut self, elapsed: Duration) -> OrderedFloat<f64> {
-        if self.timeout_requests == 0 {
-            let desc = 100.0 * (elapsed.as_millis() as f64 / self.min_ttr.as_millis() as f64);
-            if OrderedFloat(desc) > self.value - OrderedFloat(1.0) {
-                self.value = 1.0.into();
-            } else {
-                self.value -= desc;
-            }
-        } else {
-            let timeout_ratio = self.timeout_requests as f64 / self.total_requests as f64;
-            let near_thresh =
-                cmp::min(OrderedFloat(timeout_ratio), self.ratio_thresh) / self.ratio_thresh;
-            let value = self.value * (OrderedFloat(1.0) + near_thresh);
-            self.value = cmp::min(OrderedFloat(100.0), value);
-        }
-
-        self.total_requests = 0;
-        self.timeout_requests = 0;
-        self.last_update_time = Instant::now();
-        self.value
-    }
-
-    fn should_force_report_slow_store(&self) -> bool {
-        self.value >= OrderedFloat(100.0) && (self.last_tick_id % self.round_ticks == 0)
-    }
-}
 
 pub struct Runner<EK, ER, T>
 where
@@ -928,7 +1012,7 @@ where
     store_id: u64,
     pd_client: Arc<T>,
     router: RaftRouter<EK, ER>,
-    region_peers: HashMap<u64, PeerStat>,
+    region_peers: Arc<RwLock<HashMap<u64, PeerStat>>>,
     region_buckets: HashMap<u64, ReportBucket>,
     store_stat: StoreStat,
     is_hb_receiver_scheduled: bool,
@@ -938,29 +1022,34 @@ where
     // use for Runner inner handle function to send Task to itself
     // actually it is the sender connected to Runner's Worker which
     // calls Runner's run() on Task received.
-    scheduler: Scheduler<Task<EK, ER>>,
-    stats_monitor: StatsMonitor<WrappedScheduler<EK, ER>>,
+    scheduler: Scheduler<Task<EK>>,
+    stats_monitor: StatsMonitor<WrappedScheduler<EK>>,
     store_heartbeat_interval: Duration,
 
-    // region_id -> total_cpu_time_ms (since last region heartbeat)
-    region_cpu_records: HashMap<u64, u32>,
+    // region_id -> total_cpu_time_ms accumulated for RegionHeartbeat reporting.
+    // This map is consumed/cleared by the region-heartbeat path.
+    region_cpu_records_since_region_heartbeat: HashMap<u64, u32>,
+    // region_id -> total_cpu_time_ms accumulated for StoreHeartbeat peer_stats.
+    // This map is consumed/cleared by real store heartbeats (not fake ones).
+    region_cpu_records_since_store_heartbeat: HashMap<u64, u32>,
 
     concurrency_manager: ConcurrencyManager,
     snap_mgr: SnapManager,
     remote: Remote<yatp::task::future::TaskCell>,
-    slow_score: SlowScore,
-    slow_trend_cause: Trend,
-    slow_trend_result: Trend,
-    slow_trend_result_recorder: RequestPerSecRecorder,
 
-    // The health status of the store is updated by the slow score mechanism.
-    health_service: Option<HealthService>,
-    curr_health_status: ServingStatus,
+    health_reporter: RaftstoreReporter,
+    health_controller: HealthController,
+
     coprocessor_host: CoprocessorHost<EK>,
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used for rawkv apiv2
 
     // Service manager for grpc service.
     grpc_service_manager: GrpcServiceManager,
+
+    // Graceful shutdown state for evict leader during shutdown
+    graceful_shutdown_state: Arc<AtomicBool>,
+
+    split_validator: SplitValidator,
 }
 
 impl<EK, ER, T> Runner<EK, ER, T>
@@ -974,90 +1063,91 @@ where
         store_id: u64,
         pd_client: Arc<T>,
         router: RaftRouter<EK, ER>,
-        scheduler: Scheduler<Task<EK, ER>>,
+        scheduler: Scheduler<Task<EK>>,
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
         snap_mgr: SnapManager,
         remote: Remote<yatp::task::future::TaskCell>,
         collector_reg_handle: CollectorRegHandle,
-        region_read_progress: RegionReadProgressRegistry,
-        health_service: Option<HealthService>,
+        health_controller: HealthController,
         coprocessor_host: CoprocessorHost<EK>,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used for rawkv apiv2
         grpc_service_manager: GrpcServiceManager,
+        graceful_shutdown_state: Arc<std::sync::atomic::AtomicBool>,
     ) -> Runner<EK, ER, T> {
+        let mut store_stat = StoreStat::default();
+        store_stat.set_cpu_quota(SysQuota::cpu_cores_quota(), cfg.inspect_cpu_util_thd);
         let store_heartbeat_interval = cfg.pd_store_heartbeat_tick_interval.0;
         let interval = store_heartbeat_interval / NUM_COLLECT_STORE_INFOS_PER_HEARTBEAT;
         let mut stats_monitor = StatsMonitor::new(
             interval,
-            cfg.report_min_resolved_ts_interval.0,
             cfg.inspect_interval.0,
+            cfg.inspect_kvdb_interval.0,
+            cfg.inspect_network_interval.0,
             WrappedScheduler(scheduler.clone()),
         );
+        let split_validator = SplitValidator::new();
         if let Err(e) = stats_monitor.start(
             auto_split_controller,
-            region_read_progress,
             collector_reg_handle,
-            store_id,
+            split_validator.clone(),
         ) {
             error!("failed to start stats collector, error = {:?}", e);
         }
+
+        let health_reporter_config: RaftstoreReporterConfig = RaftstoreReporterConfig {
+            inspect_interval: cfg.inspect_interval.0,
+            inspect_kvdb_interval: cfg.inspect_kvdb_interval.0,
+            inspect_network_interval: cfg.inspect_network_interval.0,
+
+            unsensitive_cause: cfg.slow_trend_unsensitive_cause,
+            unsensitive_result: cfg.slow_trend_unsensitive_result,
+            net_io_factor: cfg.slow_trend_network_io_factor,
+
+            cause_spike_filter_value_gauge: STORE_SLOW_TREND_MISC_GAUGE_VEC
+                .with_label_values(&["spike_filter_value"]),
+            cause_spike_filter_count_gauge: STORE_SLOW_TREND_MISC_GAUGE_VEC
+                .with_label_values(&["spike_filter_count"]),
+            cause_l1_gap_gauges: STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
+                .with_label_values(&["L1"]),
+            cause_l2_gap_gauges: STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
+                .with_label_values(&["L2"]),
+            result_spike_filter_value_gauge: STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC
+                .with_label_values(&["spike_filter_value"]),
+            result_spike_filter_count_gauge: STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC
+                .with_label_values(&["spike_filter_count"]),
+            result_l1_gap_gauges: STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
+                .with_label_values(&["L1"]),
+            result_l2_gap_gauges: STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
+                .with_label_values(&["L2"]),
+        };
+
+        let health_reporter = RaftstoreReporter::new(&health_controller, health_reporter_config);
 
         Runner {
             store_id,
             pd_client,
             router,
             is_hb_receiver_scheduled: false,
-            region_peers: HashMap::default(),
+            region_peers: Arc::new(RwLock::new(HashMap::default())),
             region_buckets: HashMap::default(),
-            store_stat: StoreStat::default(),
+            store_stat,
             start_ts: UnixSecs::now(),
             scheduler,
             store_heartbeat_interval,
             stats_monitor,
-            region_cpu_records: HashMap::default(),
+            region_cpu_records_since_region_heartbeat: HashMap::default(),
+            region_cpu_records_since_store_heartbeat: HashMap::default(),
             concurrency_manager,
             snap_mgr,
             remote,
-            slow_score: SlowScore::new(cfg.inspect_interval.0),
-            slow_trend_cause: Trend::new(
-                // Disable SpikeFilter for now
-                Duration::from_secs(0),
-                STORE_SLOW_TREND_MISC_GAUGE_VEC.with_label_values(&["spike_filter_value"]),
-                STORE_SLOW_TREND_MISC_GAUGE_VEC.with_label_values(&["spike_filter_count"]),
-                Duration::from_secs(180),
-                Duration::from_secs(30),
-                Duration::from_secs(120),
-                Duration::from_secs(600),
-                1,
-                tikv_util::time::duration_to_us(Duration::from_micros(500)),
-                STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC.with_label_values(&["L1"]),
-                STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC.with_label_values(&["L2"]),
-                cfg.slow_trend_unsensitive_cause,
-            ),
-            slow_trend_result: Trend::new(
-                // Disable SpikeFilter for now
-                Duration::from_secs(0),
-                STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC.with_label_values(&["spike_filter_value"]),
-                STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC.with_label_values(&["spike_filter_count"]),
-                Duration::from_secs(120),
-                Duration::from_secs(15),
-                Duration::from_secs(60),
-                Duration::from_secs(300),
-                1,
-                2000,
-                STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
-                    .with_label_values(&["L1"]),
-                STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
-                    .with_label_values(&["L2"]),
-                cfg.slow_trend_unsensitive_result,
-            ),
-            slow_trend_result_recorder: RequestPerSecRecorder::new(),
-            health_service,
-            curr_health_status: ServingStatus::Serving,
+            health_reporter,
+            health_controller,
             coprocessor_host,
             causal_ts_provider,
             grpc_service_manager,
+            graceful_shutdown_state,
+            split_validator,
         }
     }
 
@@ -1119,8 +1209,9 @@ where
     // be called in an asynchronous context.
     fn handle_ask_batch_split(
         router: RaftRouter<EK, ER>,
-        scheduler: Scheduler<Task<EK, ER>>,
+        scheduler: Scheduler<Task<EK>>,
         pd_client: Arc<T>,
+        split_validator: SplitValidator,
         mut region: metapb::Region,
         mut split_keys: Vec<Vec<u8>>,
         peer: metapb::Peer,
@@ -1129,13 +1220,17 @@ where
         callback: Callback<EK::Snapshot>,
         task: String,
         remote: Remote<yatp::task::future::TaskCell>,
+        reason: pdpb::SplitReason,
     ) {
         if split_keys.is_empty() {
             info!("empty split key, skip ask batch split";
                 "region_id" => region.get_id());
             return;
         }
-        let resp = pd_client.ask_batch_split(region.clone(), split_keys.len());
+        if reason != pdpb::SplitReason::Admin && split_validator.is_disabled(region.get_id()) {
+            return;
+        }
+        let resp = pd_client.ask_batch_split(region.clone(), split_keys.len(), reason);
         let f = async move {
             match resp.await {
                 Ok(mut resp) => {
@@ -1232,6 +1327,8 @@ where
             .region_keys_read
             .observe(region_stat.read_keys as f64);
 
+        self.coprocessor_host
+            .on_region_heartbeat(&region, &region_stat);
         let resp = self.pd_client.region_heartbeat(
             term,
             region.clone(),
@@ -1254,66 +1351,38 @@ where
     fn handle_store_heartbeat(
         &mut self,
         mut stats: pdpb::StoreStats,
-        store_info: Option<StoreInfo<EK, ER>>,
+        is_fake_heartbeat: bool,
         store_report: Option<pdpb::StoreReport>,
         dr_autosync_status: Option<StoreDrAutoSyncStatus>,
     ) {
-        let mut report_peers = HashMap::default();
-        for (region_id, region_peer) in &mut self.region_peers {
-            let read_bytes = region_peer.read_bytes - region_peer.last_store_report_read_bytes;
-            let read_keys = region_peer.read_keys - region_peer.last_store_report_read_keys;
-            let query_stats = region_peer
-                .query_stats
-                .sub_query_stats(&region_peer.last_store_report_query_stats);
-            region_peer.last_store_report_read_bytes = region_peer.read_bytes;
-            region_peer.last_store_report_read_keys = region_peer.read_keys;
-            region_peer
-                .last_store_report_query_stats
-                .fill_query_stats(&region_peer.query_stats);
-            if read_bytes < hotspot_byte_report_threshold()
-                && read_keys < hotspot_key_report_threshold()
-                && query_stats.get_read_query_num() < hotspot_query_num_report_threshold()
-            {
-                continue;
-            }
-            let mut read_stat = pdpb::PeerStat::default();
-            read_stat.set_region_id(*region_id);
-            read_stat.set_read_keys(read_keys);
-            read_stat.set_read_bytes(read_bytes);
-            read_stat.set_query_stats(query_stats.0);
-            report_peers.insert(*region_id, read_stat);
+        let now = UnixSecs::now();
+        // For fake heartbeats, keep peer deltas and CPU records untouched so the
+        // next real heartbeat still reports a full interval.
+        if !is_fake_heartbeat {
+            let interval_seconds = now
+                .into_inner()
+                .saturating_sub(self.store_stat.last_report_ts.into_inner());
+            let report_peers = {
+                let mut region_peers = self.region_peers.write().unwrap();
+                collect_report_peers_for_store_heartbeat(
+                    &mut region_peers,
+                    &mut self.region_cpu_records_since_store_heartbeat,
+                    interval_seconds,
+                )
+            };
+            stats = collect_report_read_peer_stats(HOTSPOT_REPORT_CAPACITY, report_peers, stats);
         }
-
-        stats = collect_report_read_peer_stats(HOTSPOT_REPORT_CAPACITY, report_peers, stats);
-        let (capacity, used_size, available) = if store_info.is_some() {
-            match collect_engine_size(
-                &self.coprocessor_host,
-                store_info.as_ref(),
-                self.snap_mgr.get_total_snap_size().unwrap(),
-            ) {
-                Some((capacity, used_size, available)) => {
-                    // Update last reported infos on engine_size.
-                    self.store_stat.engine_last_capacity_size = capacity;
-                    self.store_stat.engine_last_used_size = used_size;
-                    self.store_stat.engine_last_available_size = available;
-                    (capacity, used_size, available)
-                }
-                None => return,
-            }
-        } else {
-            (
-                self.store_stat.engine_last_capacity_size,
-                self.store_stat.engine_last_used_size,
-                self.store_stat.engine_last_available_size,
-            )
-        };
-
-        stats.set_capacity(capacity);
-        stats.set_used_size(used_size);
-
+        // Fetch all size infos and update last reported infos on engine_size.
+        let (capacity, used_size, available) = collect_engine_size(&self.coprocessor_host);
         if available == 0 {
             warn!("no available space");
         }
+        self.store_stat.engine_last_capacity_size = capacity;
+        self.store_stat.engine_last_used_size = used_size;
+        self.store_stat.engine_last_available_size = available;
+
+        stats.set_capacity(capacity);
+        stats.set_used_size(used_size);
         stats.set_available(available);
         stats.set_bytes_read(
             self.store_stat.engine_total_bytes_read - self.store_stat.engine_last_total_bytes_read,
@@ -1329,9 +1398,7 @@ where
             .store_stat
             .engine_total_query_num
             .sub_query_stats(&self.store_stat.engine_last_query_num);
-        let total_query_num = self
-            .slow_trend_result_recorder
-            .record_and_get_current_rps(res.get_all_query_num(), Instant::now());
+        let all_query_num = res.get_all_query_num();
         stats.set_query_stats(res.0);
 
         stats.set_cpu_usages(self.store_stat.store_cpu_usages.clone().into());
@@ -1346,12 +1413,12 @@ where
         self.store_stat
             .engine_last_query_num
             .fill_query_stats(&self.store_stat.engine_total_query_num);
-        self.store_stat.last_report_ts = if store_info.is_some() {
-            UnixSecs::now()
+        self.store_stat.last_report_ts = if !is_fake_heartbeat {
+            now
         } else {
-            // If `store_info` is None, the given Task::StoreHeartbeat should be a fake
-            // heartbeat to PD, we won't update the last_report_ts to avoid incorrectly
-            // marking current TiKV node in normal state.
+            // If `is_fake_heartbeat == true`, the given Task::StoreHeartbeat should be a
+            // fake heartbeat to PD, we won't update the last_report_ts to avoid
+            // incorrectly marking current TiKV node in normal state.
             self.store_stat.last_report_ts
         };
         self.store_stat.region_bytes_written.flush();
@@ -1359,30 +1426,48 @@ where
         self.store_stat.region_bytes_read.flush();
         self.store_stat.region_keys_read.flush();
 
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["capacity"])
-            .set(capacity as i64);
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["available"])
-            .set(available as i64);
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["used"])
-            .set(used_size as i64);
+        stats.set_slow_score(self.health_reporter.get_disk_slow_score() as u64);
+        // Filter out network slow scores equal to 1 to reduce message volume
+        let network_scores = self
+            .health_reporter
+            .get_network_slow_score()
+            .into_iter()
+            .filter(|(_, score)| *score != 1)
+            .collect();
+        stats.set_network_slow_scores(network_scores);
 
-        let slow_score = self.slow_score.get();
-        stats.set_slow_score(slow_score as u64);
-        self.set_slow_trend_to_store_stats(&mut stats, total_query_num);
+        let (rps, slow_trend_pb) = self
+            .health_reporter
+            .update_slow_trend(all_query_num, Instant::now());
+        self.flush_slow_trend_metrics(rps, &slow_trend_pb);
+        stats.set_slow_trend(slow_trend_pb);
 
         stats.set_is_grpc_paused(self.grpc_service_manager.is_paused());
 
+        stats.set_is_stopping(
+            self.graceful_shutdown_state
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+
         let scheduler = self.scheduler.clone();
         let router = self.router.clone();
+        let region_peers = self.region_peers.clone();
+        let mut snap_mgr = self.snap_mgr.clone();
         let resp = self
             .pd_client
             .store_heartbeat(stats, store_report, dr_autosync_status);
         let f = async move {
             match resp.await {
                 Ok(mut resp) => {
+                    if GLOBAL_SERVER_READINESS
+                        .connected_to_pd
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        // Log when the server readiness condition changes.
+                        info!("ServerReadiness: connected to PD");
+                    }
+
                     if let Some(status) = resp.replication_status.take() {
                         let _ = router.send_control(StoreMsg::UpdateReplicationMode(status));
                     }
@@ -1433,13 +1518,39 @@ where
                             }
                         }
                     }
-                    // Forcely awaken all hibernated regions if there existed slow stores in this
-                    // cluster.
+                    // Force awaken all hibernated regions if there are slow stores in this
+                    // cluster. To mitigate the impact of stalls when awakening too many regions,
+                    // we break up all regions into small batches.
                     if let Some(awaken_regions) = resp.awaken_regions.take() {
                         info!("forcely awaken hibernated regions in this store");
-                        let _ = router.send_store_msg(StoreMsg::AwakenRegions {
-                            abnormal_stores: awaken_regions.get_abnormal_stores().to_vec(),
-                        });
+                        let abnormal_stores = awaken_regions.get_abnormal_stores().to_vec();
+                        // The chunk_size of 1024 is an empirical batch size that balances
+                        // between generating too many `StoreMsg::AwakenRegions` messages and
+                        // keeping each batch small enough to avoid stalling Raftstore for
+                        // extended periods.
+                        let chunk_size = 1024;
+                        let mut region_ids = Vec::with_capacity(chunk_size);
+
+                        for (id, _) in region_peers.read().unwrap().iter() {
+                            region_ids.push(*id);
+
+                            // Send batch when it reaches the chunk size
+                            if region_ids.len() >= chunk_size {
+                                let _ = router.send_store_msg(StoreMsg::AwakenRegions {
+                                    abnormal_stores: abnormal_stores.clone(),
+                                    region_ids: std::mem::take(&mut region_ids),
+                                });
+                                region_ids.reserve(chunk_size);
+                            }
+                        }
+
+                        // Send remaining regions if any
+                        if !region_ids.is_empty() {
+                            let _ = router.send_store_msg(StoreMsg::AwakenRegions {
+                                abnormal_stores: abnormal_stores.clone(),
+                                region_ids,
+                            });
+                        }
                     }
                     // Control grpc server.
                     if let Some(op) = resp.control_grpc.take() {
@@ -1449,59 +1560,79 @@ where
                             warn!("fail to schedule control grpc task"; "err" => ?e);
                         }
                     }
+                    // NodeState for this store.
+                    {
+                        let state = (|| {
+                            #[cfg(feature = "failpoints")]
+                            fail_point!("manually_set_store_offline", |_| {
+                                metapb::NodeState::Removing
+                            });
+                            resp.get_state()
+                        })();
+                        match state {
+                            metapb::NodeState::Removing | metapb::NodeState::Removed => {
+                                let is_offlined = snap_mgr.is_offlined();
+                                if !is_offlined {
+                                    snap_mgr.set_offline(true);
+                                    info!("store is offlined by pd");
+                                }
+                            }
+                            // As for NodeState::Preparing | Serving, if `is_offlined == true`,
+                            // it means the store has been re-added into the cluster and
+                            // the offline operation is terminated. Therefore, the state
+                            // `is_offlined` should be reset with `false`.
+                            _ => {
+                                let is_offlined = snap_mgr.is_offlined();
+                                if is_offlined {
+                                    snap_mgr.set_offline(false);
+                                    info!("store is remarked with serving state by pd");
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
-                    error!("store heartbeat failed"; "err" => ?e);
+                    warn!("store heartbeat failed"; "err" => ?e);
                 }
             }
         };
         self.remote.spawn(f);
     }
 
-    fn set_slow_trend_to_store_stats(
+    fn flush_slow_trend_metrics(
         &mut self,
-        stats: &mut pdpb::StoreStats,
-        total_query_num: Option<f64>,
+        requests_per_sec: Option<f64>,
+        slow_trend_pb: &pdpb::SlowTrend,
     ) {
-        let slow_trend_cause_rate = self.slow_trend_cause.increasing_rate();
-        STORE_SLOW_TREND_GAUGE.set(slow_trend_cause_rate);
-        let mut slow_trend = pdpb::SlowTrend::default();
-        slow_trend.set_cause_rate(slow_trend_cause_rate);
-        slow_trend.set_cause_value(self.slow_trend_cause.l0_avg());
-        if let Some(total_query_num) = total_query_num {
-            self.slow_trend_result
-                .record(total_query_num as u64, Instant::now());
-            slow_trend.set_result_value(self.slow_trend_result.l0_avg());
-            let slow_trend_result_rate = self.slow_trend_result.increasing_rate();
-            slow_trend.set_result_rate(slow_trend_result_rate);
-            STORE_SLOW_TREND_RESULT_GAUGE.set(slow_trend_result_rate);
-            STORE_SLOW_TREND_RESULT_VALUE_GAUGE.set(total_query_num);
+        let slow_trend = self.health_reporter.get_slow_trend();
+        // Latest result.
+        STORE_SLOW_TREND_GAUGE.set(slow_trend_pb.get_cause_rate());
+        if let Some(requests_per_sec) = requests_per_sec {
+            STORE_SLOW_TREND_RESULT_GAUGE.set(slow_trend_pb.get_result_rate());
+            STORE_SLOW_TREND_RESULT_VALUE_GAUGE.set(requests_per_sec);
         } else {
             // Just to mark the invalid range on the graphic
             STORE_SLOW_TREND_RESULT_VALUE_GAUGE.set(-100.0);
         }
-        stats.set_slow_trend(slow_trend);
-        self.write_slow_trend_metrics();
-    }
 
-    fn write_slow_trend_metrics(&mut self) {
-        STORE_SLOW_TREND_L0_GAUGE.set(self.slow_trend_cause.l0_avg());
-        STORE_SLOW_TREND_L1_GAUGE.set(self.slow_trend_cause.l1_avg());
-        STORE_SLOW_TREND_L2_GAUGE.set(self.slow_trend_cause.l2_avg());
-        STORE_SLOW_TREND_L0_L1_GAUGE.set(self.slow_trend_cause.l0_l1_rate());
-        STORE_SLOW_TREND_L1_L2_GAUGE.set(self.slow_trend_cause.l1_l2_rate());
-        STORE_SLOW_TREND_L1_MARGIN_ERROR_GAUGE.set(self.slow_trend_cause.l1_margin_error_base());
-        STORE_SLOW_TREND_L2_MARGIN_ERROR_GAUGE.set(self.slow_trend_cause.l2_margin_error_base());
+        // Current internal states.
+        STORE_SLOW_TREND_L0_GAUGE.set(slow_trend.slow_cause.l0_avg());
+        STORE_SLOW_TREND_L1_GAUGE.set(slow_trend.slow_cause.l1_avg());
+        STORE_SLOW_TREND_L2_GAUGE.set(slow_trend.slow_cause.l2_avg());
+        STORE_SLOW_TREND_L0_L1_GAUGE.set(slow_trend.slow_cause.l0_l1_rate());
+        STORE_SLOW_TREND_L1_L2_GAUGE.set(slow_trend.slow_cause.l1_l2_rate());
+        STORE_SLOW_TREND_L1_MARGIN_ERROR_GAUGE.set(slow_trend.slow_cause.l1_margin_error_base());
+        STORE_SLOW_TREND_L2_MARGIN_ERROR_GAUGE.set(slow_trend.slow_cause.l2_margin_error_base());
         // Report results of all slow Trends.
-        STORE_SLOW_TREND_RESULT_L0_GAUGE.set(self.slow_trend_result.l0_avg());
-        STORE_SLOW_TREND_RESULT_L1_GAUGE.set(self.slow_trend_result.l1_avg());
-        STORE_SLOW_TREND_RESULT_L2_GAUGE.set(self.slow_trend_result.l2_avg());
-        STORE_SLOW_TREND_RESULT_L0_L1_GAUGE.set(self.slow_trend_result.l0_l1_rate());
-        STORE_SLOW_TREND_RESULT_L1_L2_GAUGE.set(self.slow_trend_result.l1_l2_rate());
+        STORE_SLOW_TREND_RESULT_L0_GAUGE.set(slow_trend.slow_result.l0_avg());
+        STORE_SLOW_TREND_RESULT_L1_GAUGE.set(slow_trend.slow_result.l1_avg());
+        STORE_SLOW_TREND_RESULT_L2_GAUGE.set(slow_trend.slow_result.l2_avg());
+        STORE_SLOW_TREND_RESULT_L0_L1_GAUGE.set(slow_trend.slow_result.l0_l1_rate());
+        STORE_SLOW_TREND_RESULT_L1_L2_GAUGE.set(slow_trend.slow_result.l1_l2_rate());
         STORE_SLOW_TREND_RESULT_L1_MARGIN_ERROR_GAUGE
-            .set(self.slow_trend_result.l1_margin_error_base());
+            .set(slow_trend.slow_result.l1_margin_error_base());
         STORE_SLOW_TREND_RESULT_L2_MARGIN_ERROR_GAUGE
-            .set(self.slow_trend_result.l2_margin_error_base());
+            .set(slow_trend.slow_result.l2_margin_error_base());
     }
 
     fn handle_report_batch_split(&self, regions: Vec<metapb::Region>) {
@@ -1573,11 +1704,17 @@ where
                     }
                 }
                 Ok(None) => {
-                    // splitted Region has not yet reported to PD.
-                    // TODO: handle merge
+                    // Splitted region has not yet reported to PD.
+                    //
+                    // Or region has been merged. This case is handled by
+                    // message `MsgCheckStalePeer`, stale peers will be
+                    // removed eventually.
+                    PD_VALIDATE_PEER_COUNTER_VEC
+                        .with_label_values(&["region not found"])
+                        .inc();
                 }
                 Err(e) => {
-                    error!("get region failed"; "err" => ?e);
+                    warn!("get region failed"; "err" => ?e);
                 }
             }
         };
@@ -1587,12 +1724,21 @@ where
     fn schedule_heartbeat_receiver(&mut self) {
         let router = self.router.clone();
         let store_id = self.store_id;
+        let split_validator = self.split_validator.clone();
 
         let fut = self.pd_client
             .handle_region_heartbeat_response(self.store_id, move |mut resp| {
                 let region_id = resp.get_region_id();
                 let epoch = resp.take_region_epoch();
                 let peer = resp.take_target_peer();
+
+                if resp.has_change_split() {
+                    if resp.get_change_split().get_auto_split_enabled() {
+                        split_validator.enable(region_id);
+                    } else {
+                        split_validator.disable(region_id);
+                    }
+                }
 
                 if resp.has_change_peer() {
                     PD_HEARTBEAT_COUNTER_VEC
@@ -1664,7 +1810,7 @@ where
                             cb: Callback::None,
                         }
                     };
-                    if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg)) {
+                    if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(Box::new(msg))) {
                         error!("send halfsplit request failed"; "region_id" => region_id, "err" => ?e);
                     }
                 } else if resp.has_merge() {
@@ -1710,14 +1856,18 @@ where
 
     fn handle_read_stats(&mut self, mut read_stats: ReadStats) {
         for (region_id, region_info) in read_stats.region_infos.iter_mut() {
-            let peer_stat = self.region_peers.entry(*region_id).or_default();
-            peer_stat.read_bytes += region_info.flow.read_bytes as u64;
-            peer_stat.read_keys += region_info.flow.read_keys as u64;
-            self.store_stat.engine_total_bytes_read += region_info.flow.read_bytes as u64;
-            self.store_stat.engine_total_keys_read += region_info.flow.read_keys as u64;
-            peer_stat
-                .query_stats
-                .add_query_stats(&region_info.query_stats.0);
+            {
+                let mut region_peers = self.region_peers.write().unwrap();
+                let peer_stat = region_peers.entry(*region_id).or_default();
+                peer_stat.read_bytes += region_info.flow.read_bytes as u64;
+                peer_stat.read_keys += region_info.flow.read_keys as u64;
+                self.store_stat.engine_total_bytes_read += region_info.flow.read_bytes as u64;
+                self.store_stat.engine_total_keys_read += region_info.flow.read_keys as u64;
+                peer_stat
+                    .query_stats
+                    .add_query_stats(&region_info.query_stats.0);
+                peer_stat.cop_detail.add(&region_info.cop_detail);
+            }
             self.store_stat
                 .engine_total_query_num
                 .add_query_stats(&region_info.query_stats.0);
@@ -1732,8 +1882,11 @@ where
 
     fn handle_write_stats(&mut self, mut write_stats: WriteStats) {
         for (region_id, region_info) in write_stats.region_infos.iter_mut() {
-            let peer_stat = self.region_peers.entry(*region_id).or_default();
-            peer_stat.query_stats.add_query_stats(&region_info.0);
+            {
+                let mut region_peers = self.region_peers.write().unwrap();
+                let peer_stat = region_peers.entry(*region_id).or_default();
+                peer_stat.query_stats.add_query_stats(&region_info.0);
+            }
             self.store_stat
                 .engine_total_query_num
                 .add_query_stats(&region_info.0);
@@ -1741,9 +1894,26 @@ where
     }
 
     fn handle_destroy_peer(&mut self, region_id: u64) {
-        match self.region_peers.remove(&region_id) {
-            None => {}
-            Some(_) => info!("remove peer statistic record in pd"; "region_id" => region_id),
+        let removed = {
+            let mut region_peers = self.region_peers.write().unwrap();
+            remove_peer_stat_from_maps(
+                region_id,
+                &mut region_peers,
+                &mut self.region_cpu_records_since_region_heartbeat,
+                &mut self.region_cpu_records_since_store_heartbeat,
+            )
+        };
+        if removed {
+            info!("remove peer statistic record in pd"; "region_id" => region_id);
+        }
+    }
+
+    fn handle_graceful_shutdown(&mut self, state: bool) {
+        self.graceful_shutdown_state.store(state, Ordering::SeqCst);
+        info!("handle graceful shutdown"; "state" => state);
+        let msg = StoreMsg::Tick(StoreTick::PdStoreHeartbeat);
+        if let Err(e) = self.router.send_control(msg) {
+            warn!("handle graceful shutdown failed"; "err" => ?e);
         }
     }
 
@@ -1781,7 +1951,7 @@ where
                 // And it won't break correctness of transaction commands, as
                 // causal_ts_provider.flush() is implemented as pd_client.get_tso() + renew TSO
                 // cached.
-                let res: crate::Result<TimeStamp> =
+                let res: crate::Result<()> =
                     if let Some(causal_ts_provider) = &causal_ts_provider {
                         causal_ts_provider
                             .async_flush()
@@ -1789,11 +1959,15 @@ where
                             .map_err(|e| box_err!(e))
                     } else {
                         pd_client.get_tso().await.map_err(Into::into)
-                    };
+                    }
+                    .and_then(|ts| {
+                        concurrency_manager
+                            .update_max_ts(ts, "raftstore")
+                            .map_err(|e| crate::Error::Other(box_err!(e)))
+                    });
 
                 match res {
-                    Ok(ts) => {
-                        concurrency_manager.update_max_ts(ts);
+                    Ok(()) => {
                         // Set the least significant bit to 1 to mark it as synced.
                         success = txn_ext
                             .max_ts_sync_status
@@ -1854,15 +2028,15 @@ where
             match resp.await {
                 Ok(Some((region, leader))) => {
                     if leader.get_store_id() != 0 {
-                        let msg = CasualMessage::QueryRegionLeaderResp { region, leader };
+                        let msg = Box::new(CasualMessage::QueryRegionLeaderResp { region, leader });
                         if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg)) {
-                            error!("send region info message failed"; "region_id" => region_id, "err" => ?e);
+                            warn!("send region info message failed"; "region_id" => region_id, "err" => ?e);
                         }
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    error!("get region failed"; "err" => ?e);
+                    warn!("get region failed"; "err" => ?e);
                 }
             }
         };
@@ -1878,7 +2052,16 @@ where
     fn handle_region_cpu_records(&mut self, records: Arc<RawRecords>) {
         // Send Region CPU info to AutoSplitController inside the stats_monitor.
         self.stats_monitor.maybe_send_cpu_stats(&records);
-        calculate_region_cpu_records(self.store_id, records, &mut self.region_cpu_records);
+        calculate_region_cpu_records(
+            self.store_id,
+            records.clone(),
+            &mut self.region_cpu_records_since_region_heartbeat,
+        );
+        calculate_region_cpu_records(
+            self.store_id,
+            records,
+            &mut self.region_cpu_records_since_store_heartbeat,
+        );
     }
 
     fn handle_report_min_resolved_ts(&self, store_id: u64, min_resolved_ts: u64) {
@@ -1939,19 +2122,12 @@ where
             .or_insert_with(|| ReportBucket::new(buckets));
     }
 
-    fn update_health_status(&mut self, status: ServingStatus) {
-        self.curr_health_status = status;
-        if let Some(health_service) = &self.health_service {
-            health_service.set_serving_status("", status);
-        }
-    }
-
     /// Force to send a special heartbeat to pd when current store is hung on
     /// some special circumstances, i.e. disk busy, handler busy and others.
     fn handle_fake_store_heartbeat(&mut self) {
         let mut stats = pdpb::StoreStats::default();
         stats.set_store_id(self.store_id);
-        stats.set_region_count(self.region_peers.len() as u32);
+        stats.set_region_count(self.region_peers.read().unwrap().len() as u32);
 
         let snap_stats = self.snap_mgr.stats();
         stats.set_sending_snap_count(snap_stats.sending_count as u32);
@@ -1970,7 +2146,7 @@ where
         stats.set_is_busy(true);
 
         // We do not need to report store_info, so we just set `None` here.
-        self.handle_store_heartbeat(stats, None, None, None);
+        self.handle_store_heartbeat(stats, true, None, None);
         warn!("scheduling store_heartbeat timeout, force report store slow score to pd.";
             "store_id" => self.store_id,
         );
@@ -1989,7 +2165,7 @@ where
 
     fn handle_control_grpc_server(&mut self, event: pdpb::ControlGrpcEvent) {
         info!("forcely control grpc server";
-                "curr_health_status" => ?self.curr_health_status,
+                "curr_health_status" => ?self.health_controller.get_serving_status(),
                 "event" => ?event,
         );
         match event {
@@ -1998,7 +2174,7 @@ where
                     warn!("failed to send service event to PAUSE grpc server";
                             "err" => ?e);
                 } else {
-                    self.update_health_status(ServingStatus::NotServing);
+                    self.health_controller.set_is_serving(false);
                 }
             }
             pdpb::ControlGrpcEvent::Resume => {
@@ -2006,9 +2182,103 @@ where
                     warn!("failed to send service event to RESUME grpc server";
                             "err" => ?e);
                 } else {
-                    self.update_health_status(ServingStatus::Serving);
+                    self.health_controller.set_is_serving(true);
                 }
             }
+        }
+    }
+
+    fn handle_inspect_latency(&mut self, factor: InspectFactor) {
+        let slow_score_tick_result = self
+            .health_reporter
+            .tick(self.store_stat.maybe_busy(), factor);
+        if let Some(score) = slow_score_tick_result.updated_score {
+            STORE_SLOW_SCORE_GAUGE
+                .with_label_values(&[factor.as_str()])
+                .set(score as i64);
+        }
+        let id = slow_score_tick_result.tick_id;
+        let scheduler = self.scheduler.clone();
+
+        let inspector = {
+            match factor {
+                InspectFactor::RaftDisk => {
+                    // If the last slow_score already reached abnormal state and was delayed for
+                    // reporting by `store-heartbeat` to PD, we should report it here manually as
+                    // a FAKE `store-heartbeat`.
+                    if slow_score_tick_result.should_force_report_slow_store
+                        && self.is_store_heartbeat_delayed()
+                    {
+                        self.handle_fake_store_heartbeat();
+                    }
+                    LatencyInspector::new(
+                        id,
+                        Box::new(move |id, duration| {
+                            STORE_INSPECT_DURATION_HISTOGRAM
+                                .with_label_values(&["store_wait"])
+                                .observe(tikv_util::time::duration_to_sec(
+                                    duration.store_wait_duration.unwrap_or_default(),
+                                ));
+                            STORE_INSPECT_DURATION_HISTOGRAM
+                                .with_label_values(&["store_commit"])
+                                .observe(tikv_util::time::duration_to_sec(
+                                    duration.store_commit_duration.unwrap_or_default(),
+                                ));
+
+                            STORE_INSPECT_DURATION_HISTOGRAM
+                                .with_label_values(&["all"])
+                                .observe(tikv_util::time::duration_to_sec(duration.sum()));
+                            if let Err(e) = scheduler.schedule(Task::UpdateSlowScore {
+                                id,
+                                factor,
+                                duration,
+                            }) {
+                                warn!("schedule pd task failed"; "err" => ?e);
+                            }
+                        }),
+                    )
+                }
+                InspectFactor::KvDisk => LatencyInspector::new(
+                    id,
+                    Box::new(move |id, duration| {
+                        STORE_INSPECT_DURATION_HISTOGRAM
+                            .with_label_values(&["apply_wait"])
+                            .observe(tikv_util::time::duration_to_sec(
+                                duration.apply_wait_duration.unwrap_or_default(),
+                            ));
+                        STORE_INSPECT_DURATION_HISTOGRAM
+                            .with_label_values(&["apply_process"])
+                            .observe(tikv_util::time::duration_to_sec(
+                                duration.apply_process_duration.unwrap_or_default(),
+                            ));
+                        if let Err(e) = scheduler.schedule(Task::UpdateSlowScore {
+                            id,
+                            factor,
+                            duration,
+                        }) {
+                            warn!("schedule pd task failed"; "err" => ?e);
+                        }
+                    }),
+                ),
+                InspectFactor::Network => {
+                    let network_durations = self.health_reporter.record_network_duration(id);
+
+                    for (store_id, network_duration) in &network_durations {
+                        STORE_INSPECT_NETWORK_DURATION_HISTOGRAM
+                            .with_label_values(&[&store_id.to_string()])
+                            .observe(tikv_util::time::duration_to_sec(*network_duration));
+                    }
+                    return;
+                }
+            }
+        };
+        let msg = StoreMsg::LatencyInspect {
+            factor,
+            send_time: TiInstant::now(),
+            inspector,
+        };
+        if let Err(e) = self.router.send_control(msg) {
+            warn!("pd worker send latency inspector failed"; "err" => ?e);
         }
     }
 }
@@ -2034,9 +2304,9 @@ where
     ER: RaftEngine,
     T: PdClient,
 {
-    type Task = Task<EK, ER>;
+    type Task = Task<EK>;
 
-    fn run(&mut self, task: Task<EK, ER>) {
+    fn run(&mut self, task: Task<EK>) {
         debug!("executing task"; "task" => %task);
 
         if !self.is_hb_receiver_scheduled {
@@ -2068,10 +2338,12 @@ where
                 right_derive,
                 share_source_region_size,
                 callback,
+                split_reason,
             } => Self::handle_ask_batch_split(
                 self.router.clone(),
                 self.scheduler.clone(),
                 self.pd_client.clone(),
+                self.split_validator.clone(),
                 region,
                 split_keys,
                 peer,
@@ -2080,12 +2352,14 @@ where
                 callback,
                 String::from("batch_split"),
                 self.remote.clone(),
+                split_reason,
             ),
             Task::AutoSplit { split_infos } => {
                 let pd_client = self.pd_client.clone();
                 let router = self.router.clone();
                 let scheduler = self.scheduler.clone();
                 let remote = self.remote.clone();
+                let split_validator = self.split_validator.clone();
 
                 let f = async move {
                     for split_info in split_infos {
@@ -2100,6 +2374,7 @@ where
                                 router.clone(),
                                 scheduler.clone(),
                                 pd_client.clone(),
+                                split_validator.clone(),
                                 region,
                                 vec![split_key],
                                 split_info.peer,
@@ -2108,23 +2383,26 @@ where
                                 Callback::None,
                                 String::from("auto_split"),
                                 remote.clone(),
+                                pdpb::SplitReason::Load,
                             );
                         // Try to split the region on half within the given key
                         // range if there is no `split_key` been given.
                         } else if split_info.start_key.is_some() && split_info.end_key.is_some() {
+                            #[allow(clippy::unnecessary_unwrap)]
                             let start_key = split_info.start_key.unwrap();
+                            #[allow(clippy::unnecessary_unwrap)]
                             let end_key = split_info.end_key.unwrap();
                             let region_id = region.get_id();
-                            let msg = CasualMessage::HalfSplitRegion {
+                            let msg = Box::new(CasualMessage::HalfSplitRegion {
                                 region_epoch: region.get_region_epoch().clone(),
                                 start_key: Some(start_key.clone()),
                                 end_key: Some(end_key.clone()),
                                 policy: pdpb::CheckPolicy::Scan,
                                 source: "auto_split",
                                 cb: Callback::None,
-                            };
+                            });
                             if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg)) {
-                                error!("send auto half split request failed";
+                                warn!("send auto half split request failed";
                                     "region_id" => region_id,
                                     "start_key" => log_wrappers::Value::key(&start_key),
                                     "end_key" => log_wrappers::Value::key(&end_key),
@@ -2155,10 +2433,13 @@ where
                     written_keys_delta,
                     last_report_ts,
                     query_stats,
+                    cop_detail,
                     cpu_usage,
+                    cpu_stats,
                 ) = {
                     let region_id = hb_task.region.get_id();
-                    let peer_stat = self.region_peers.entry(region_id).or_default();
+                    let mut region_peers = self.region_peers.write().unwrap();
+                    let peer_stat = region_peers.entry(region_id).or_default();
                     peer_stat.approximate_size = approximate_size;
                     peer_stat.approximate_keys = approximate_keys;
 
@@ -2173,12 +2454,16 @@ where
                     let query_stats = peer_stat
                         .query_stats
                         .sub_query_stats(&peer_stat.last_region_report_query_stats);
+                    let cop_detail = peer_stat
+                        .cop_detail
+                        .sub(&peer_stat.last_region_report_cop_detail);
                     let mut last_report_ts = peer_stat.last_region_report_ts;
                     peer_stat.last_region_report_written_bytes = hb_task.written_bytes;
                     peer_stat.last_region_report_written_keys = hb_task.written_keys;
                     peer_stat.last_region_report_read_bytes = peer_stat.read_bytes;
                     peer_stat.last_region_report_read_keys = peer_stat.read_keys;
                     peer_stat.last_region_report_query_stats = peer_stat.query_stats.clone();
+                    peer_stat.last_region_report_cop_detail = peer_stat.cop_detail.clone();
                     let unix_secs_now = UnixSecs::now();
                     peer_stat.last_region_report_ts = unix_secs_now;
 
@@ -2189,7 +2474,9 @@ where
                     let cpu_usage = {
                         // Take out the region CPU record.
                         let cpu_time_duration = Duration::from_millis(
-                            self.region_cpu_records.remove(&region_id).unwrap_or(0) as u64,
+                            self.region_cpu_records_since_region_heartbeat
+                                .remove(&region_id)
+                                .unwrap_or(0) as u64,
                         );
                         let interval_second =
                             unix_secs_now.into_inner() - last_report_ts.into_inner();
@@ -2202,6 +2489,8 @@ where
                             0
                         }
                     };
+                    let mut cpu_stats = pdpb::CpuStats::default();
+                    cpu_stats.set_unified_read(cpu_usage);
                     (
                         read_bytes_delta,
                         read_keys_delta,
@@ -2209,7 +2498,9 @@ where
                         written_keys_delta,
                         last_report_ts,
                         query_stats.0,
+                        cop_detail,
                         cpu_usage,
+                        cpu_stats,
                     )
                 };
                 self.handle_heartbeat(
@@ -2224,20 +2515,21 @@ where
                         read_bytes: read_bytes_delta,
                         read_keys: read_keys_delta,
                         query_stats,
+                        cop_detail,
                         approximate_size,
                         approximate_keys,
                         last_report_ts,
                         cpu_usage,
+                        cpu_stats,
                     },
                     hb_task.replication_status,
                 )
             }
             Task::StoreHeartbeat {
                 stats,
-                store_info,
                 report,
                 dr_autosync_status,
-            } => self.handle_store_heartbeat(stats, store_info, report, dr_autosync_status),
+            } => self.handle_store_heartbeat(stats, false, report, dr_autosync_status),
             Task::ReportBatchSplit { regions } => self.handle_report_batch_split(regions),
             Task::ValidatePeer { region, peer } => self.handle_validate_peer(region, peer),
             Task::ReadStats { read_stats } => self.handle_read_stats(read_stats),
@@ -2254,11 +2546,16 @@ where
                 txn_ext,
             } => self.handle_update_max_timestamp(region_id, initial_status, txn_ext),
             Task::QueryRegionLeader { region_id } => self.handle_query_region_leader(region_id),
-            Task::UpdateSlowScore { id, duration } => {
-                self.slow_score.record(id, duration.sum());
-                self.slow_trend_cause.record(
-                    tikv_util::time::duration_to_us(duration.store_wait_duration.unwrap()),
-                    Instant::now(),
+            Task::UpdateSlowScore {
+                id,
+                factor,
+                duration,
+            } => {
+                self.health_reporter.record_duration(
+                    id,
+                    factor,
+                    duration,
+                    !self.store_stat.maybe_busy(),
                 );
             }
             Task::RegionCpuRecords(records) => self.handle_region_cpu_records(records),
@@ -2272,92 +2569,17 @@ where
             Task::ControlGrpcServer(event) => {
                 self.handle_control_grpc_server(event);
             }
+            Task::InspectLatency { factor } => {
+                self.handle_inspect_latency(factor);
+            }
+            Task::GracefulShutdownState { state } => {
+                self.handle_graceful_shutdown(state);
+            }
         };
     }
 
     fn shutdown(&mut self) {
         self.stats_monitor.stop();
-    }
-}
-
-impl<EK, ER, T> RunnableWithTimer for Runner<EK, ER, T>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-    T: PdClient + 'static,
-{
-    fn on_timeout(&mut self) {
-        // Record a fairly great value when timeout
-        self.slow_trend_cause.record(500_000, Instant::now());
-
-        // The health status is recovered to serving as long as any tick
-        // does not timeout.
-        if self.curr_health_status == ServingStatus::ServiceUnknown
-            && self.slow_score.last_tick_finished
-        {
-            self.update_health_status(ServingStatus::Serving);
-        }
-        if !self.slow_score.last_tick_finished {
-            self.slow_score.record_timeout();
-            // If the last slow_score already reached abnormal state and was delayed for
-            // reporting by `store-heartbeat` to PD, we should report it here manually as
-            // a FAKE `store-heartbeat`.
-            if self.slow_score.should_force_report_slow_store() && self.is_store_heartbeat_delayed()
-            {
-                self.handle_fake_store_heartbeat();
-            }
-        }
-        let scheduler = self.scheduler.clone();
-        let id = self.slow_score.last_tick_id + 1;
-        self.slow_score.last_tick_id += 1;
-        self.slow_score.last_tick_finished = false;
-
-        if self.slow_score.last_tick_id % self.slow_score.round_ticks == 0 {
-            // `last_update_time` is refreshed every round. If no update happens in a whole
-            // round, we set the status to unknown.
-            if self.curr_health_status == ServingStatus::Serving
-                && self.slow_score.last_record_time < self.slow_score.last_update_time
-            {
-                self.update_health_status(ServingStatus::ServiceUnknown);
-            }
-            let slow_score = self.slow_score.update();
-            STORE_SLOW_SCORE_GAUGE.set(slow_score);
-        }
-
-        let inspector = LatencyInspector::new(
-            id,
-            Box::new(move |id, duration| {
-                let dur = duration.sum();
-
-                STORE_INSPECT_DURATION_HISTOGRAM
-                    .with_label_values(&["store_process"])
-                    .observe(tikv_util::time::duration_to_sec(
-                        duration.store_process_duration.unwrap(),
-                    ));
-                STORE_INSPECT_DURATION_HISTOGRAM
-                    .with_label_values(&["store_wait"])
-                    .observe(tikv_util::time::duration_to_sec(
-                        duration.store_wait_duration.unwrap(),
-                    ));
-                STORE_INSPECT_DURATION_HISTOGRAM
-                    .with_label_values(&["all"])
-                    .observe(tikv_util::time::duration_to_sec(dur));
-                if let Err(e) = scheduler.schedule(Task::UpdateSlowScore { id, duration }) {
-                    warn!("schedule pd task failed"; "err" => ?e);
-                }
-            }),
-        );
-        let msg = StoreMsg::LatencyInspect {
-            send_time: TiInstant::now(),
-            inspector,
-        };
-        if let Err(e) = self.router.send_control(msg) {
-            warn!("pd worker send latency inspecter failed"; "err" => ?e);
-        }
-    }
-
-    fn get_interval(&self) -> Duration {
-        self.slow_score.inspect_interval
     }
 }
 
@@ -2484,7 +2706,7 @@ fn send_admin_request<EK, ER>(
 
     let cmd = RaftCommand::new_ext(req, callback, extra_opts);
     if let Err(e) = router.send_raft_command(cmd) {
-        error!(
+        warn!(
             "send request failed";
             "region_id" => region_id, "cmd_type" => ?cmd_type, "err" => ?e,
         );
@@ -2521,7 +2743,7 @@ fn collect_report_read_peer_stats(
     mut report_read_stats: HashMap<u64, pdpb::PeerStat>,
     mut stats: pdpb::StoreStats,
 ) -> pdpb::StoreStats {
-    if report_read_stats.len() < capacity * 3 {
+    if report_read_stats.len() < capacity * HOTSPOT_REPORT_METRICS {
         for (_, read_stat) in report_read_stats {
             stats.peer_stats.push(read_stat);
         }
@@ -2530,6 +2752,7 @@ fn collect_report_read_peer_stats(
     let mut keys_topn_report = TopN::new(capacity);
     let mut bytes_topn_report = TopN::new(capacity);
     let mut stats_topn_report = TopN::new(capacity);
+    let mut cpu_topn_report = TopN::new(capacity);
     for read_stat in report_read_stats.values() {
         let mut cmp_stat = PeerCmpReadStat::default();
         cmp_stat.region_id = read_stat.region_id;
@@ -2542,6 +2765,9 @@ fn collect_report_read_peer_stats(
         let mut query_cmp_stat = cmp_stat.clone();
         query_cmp_stat.report_stat = get_read_query_num(read_stat.get_query_stats());
         stats_topn_report.push(query_cmp_stat);
+        let mut cpu_cmp_stat = cmp_stat;
+        cpu_cmp_stat.report_stat = read_stat.get_cpu_stats().get_unified_read();
+        cpu_topn_report.push(cpu_cmp_stat);
     }
 
     for x in keys_topn_report {
@@ -2561,49 +2787,37 @@ fn collect_report_read_peer_stats(
             stats.peer_stats.push(report_stat);
         }
     }
+
+    for x in cpu_topn_report {
+        if let Some(report_stat) = report_read_stats.remove(&x.region_id) {
+            stats.peer_stats.push(report_stat);
+        }
+    }
     stats
 }
 
-fn collect_engine_size<EK: KvEngine, ER: RaftEngine>(
-    coprocessor_host: &CoprocessorHost<EK>,
-    store_info: Option<&StoreInfo<EK, ER>>,
-    snap_mgr_size: u64,
-) -> Option<(u64, u64, u64)> {
+fn remove_peer_stat_from_maps(
+    region_id: u64,
+    region_peers: &mut HashMap<u64, PeerStat>,
+    region_cpu_records_since_region_heartbeat: &mut HashMap<u64, u32>,
+    region_cpu_records_since_store_heartbeat: &mut HashMap<u64, u32>,
+) -> bool {
+    let removed = region_peers.remove(&region_id).is_some();
+    region_cpu_records_since_region_heartbeat.remove(&region_id);
+    region_cpu_records_since_store_heartbeat.remove(&region_id);
+    removed
+}
+
+fn collect_engine_size<EK: KvEngine>(coprocessor_host: &CoprocessorHost<EK>) -> (u64, u64, u64) {
     if let Some(engine_size) = coprocessor_host.on_compute_engine_size() {
-        return Some((engine_size.capacity, engine_size.used, engine_size.avail));
-    }
-    let store_info = store_info.unwrap();
-    let disk_stats = match fs2::statvfs(store_info.kv_engine.path()) {
-        Err(e) => {
-            error!(
-                "get disk stat for rocksdb failed";
-                "engine_path" => store_info.kv_engine.path(),
-                "err" => ?e
-            );
-            return None;
-        }
-        Ok(stats) => stats,
-    };
-    let disk_cap = disk_stats.total_space();
-    let capacity = if store_info.capacity == 0 || disk_cap < store_info.capacity {
-        disk_cap
+        (engine_size.capacity, engine_size.used, engine_size.avail)
     } else {
-        store_info.capacity
-    };
-    let used_size = snap_mgr_size
-        + store_info
-            .kv_engine
-            .get_engine_used_size()
-            .expect("kv engine used size")
-        + store_info
-            .raft_engine
-            .get_engine_size()
-            .expect("raft engine used size");
-    let mut available = capacity.checked_sub(used_size).unwrap_or_default();
-    // We only care about rocksdb SST file size, so we should check disk available
-    // here.
-    available = cmp::min(available, disk_stats.available_space());
-    Some((capacity, used_size, available))
+        (
+            disk::get_disk_capacity(),
+            disk::get_disk_used_size(),
+            disk::get_disk_available_size(),
+        )
+    }
 }
 
 fn get_read_query_num(stat: &pdpb::QueryStats) -> u64 {
@@ -2615,9 +2829,11 @@ mod tests {
     use std::thread::sleep;
 
     use kvproto::{kvrpcpb, pdpb::QueryKind};
-    use pd_client::{new_bucket_stats, BucketMeta};
+    use pd_client::{BucketMeta, new_bucket_stats};
+    use tikv_util::worker::LazyWorker;
 
     use super::*;
+    use crate::store::util::build_key_range;
 
     const DEFAULT_TEST_STORE_ID: u64 = 1;
 
@@ -2626,35 +2842,30 @@ mod tests {
     fn test_collect_stats() {
         use std::{sync::Mutex, time::Instant};
 
-        use engine_test::{kv::KvTestEngine, raft::RaftTestEngine};
-        use tikv_util::worker::LazyWorker;
-
-        use crate::store::fsm::StoreMeta;
+        use engine_test::kv::KvTestEngine;
 
         struct RunnerTest {
             store_stat: Arc<Mutex<StoreStat>>,
-            stats_monitor: StatsMonitor<WrappedScheduler<KvTestEngine, RaftTestEngine>>,
+            stats_monitor: StatsMonitor<WrappedScheduler<KvTestEngine>>,
         }
 
         impl RunnerTest {
             fn new(
                 interval: u64,
-                scheduler: Scheduler<Task<KvTestEngine, RaftTestEngine>>,
+                scheduler: Scheduler<Task<KvTestEngine>>,
                 store_stat: Arc<Mutex<StoreStat>>,
             ) -> RunnerTest {
                 let mut stats_monitor = StatsMonitor::new(
                     Duration::from_secs(interval),
-                    Duration::from_secs(0),
                     Duration::from_secs(interval),
+                    Duration::default(),
+                    Duration::default(),
                     WrappedScheduler(scheduler),
                 );
-                let store_meta = Arc::new(Mutex::new(StoreMeta::new(0)));
-                let region_read_progress = store_meta.lock().unwrap().region_read_progress.clone();
                 if let Err(e) = stats_monitor.start(
                     AutoSplitController::default(),
-                    region_read_progress,
                     CollectorRegHandle::new_for_test(),
-                    1,
+                    SplitValidator::new(),
                 ) {
                     error!("failed to start stats collector, error = {:?}", e);
                 }
@@ -2679,9 +2890,9 @@ mod tests {
         }
 
         impl Runnable for RunnerTest {
-            type Task = Task<KvTestEngine, RaftTestEngine>;
+            type Task = Task<KvTestEngine>;
 
-            fn run(&mut self, task: Task<KvTestEngine, RaftTestEngine>) {
+            fn run(&mut self, task: Task<KvTestEngine>) {
                 if let Task::StoreInfos {
                     cpu_usages,
                     read_io_rates,
@@ -2733,6 +2944,11 @@ mod tests {
             stat.set_read_bytes(6 - i);
             stat.read_keys = i;
             stat.read_bytes = 6 - i;
+            if i == 2 {
+                let mut cpu_stats = pdpb::CpuStats::default();
+                cpu_stats.set_unified_read(10);
+                stat.set_cpu_stats(cpu_stats);
+            }
             let mut query_stat = QueryStats::default();
             if i == 3 {
                 query_stat.add_query_num(QueryKind::Get, 6);
@@ -2744,63 +2960,99 @@ mod tests {
         }
         let mut store_stats = pdpb::StoreStats::default();
         store_stats = collect_report_read_peer_stats(1, report_stats, store_stats);
-        assert_eq!(store_stats.peer_stats.len(), 3)
+        let reported: HashSet<u64> = store_stats
+            .peer_stats
+            .iter()
+            .map(|stat| stat.get_region_id())
+            .collect();
+        assert_eq!(reported.len(), 4);
+        for region_id in 1..5 {
+            assert!(reported.contains(&region_id));
+        }
     }
 
     #[test]
-    fn test_slow_score() {
-        let mut slow_score = SlowScore::new(Duration::from_millis(500));
-        slow_score.timeout_requests = 5;
-        slow_score.total_requests = 100;
-        assert_eq!(
-            OrderedFloat(1.5),
-            slow_score.update_impl(Duration::from_secs(10))
-        );
-
-        slow_score.timeout_requests = 10;
-        slow_score.total_requests = 100;
-        assert_eq!(
-            OrderedFloat(3.0),
-            slow_score.update_impl(Duration::from_secs(10))
-        );
-
-        slow_score.timeout_requests = 20;
-        slow_score.total_requests = 100;
-        assert_eq!(
-            OrderedFloat(6.0),
-            slow_score.update_impl(Duration::from_secs(10))
-        );
-
-        slow_score.timeout_requests = 100;
-        slow_score.total_requests = 100;
-        assert_eq!(
-            OrderedFloat(12.0),
-            slow_score.update_impl(Duration::from_secs(10))
-        );
-
-        slow_score.timeout_requests = 11;
-        slow_score.total_requests = 100;
-        assert_eq!(
-            OrderedFloat(24.0),
-            slow_score.update_impl(Duration::from_secs(10))
-        );
-
-        slow_score.timeout_requests = 0;
-        slow_score.total_requests = 100;
-        assert_eq!(
-            OrderedFloat(19.0),
-            slow_score.update_impl(Duration::from_secs(15))
-        );
-
-        slow_score.timeout_requests = 0;
-        slow_score.total_requests = 100;
-        assert_eq!(
-            OrderedFloat(1.0),
-            slow_score.update_impl(Duration::from_secs(57))
-        );
+    fn test_should_report_hotspot_read_peer_cpu_threshold() {
+        let query_stats = QueryStats::default();
+        let threshold = hotspot_cpu_usage_report_threshold();
+        if threshold > 0 {
+            assert!(!should_report_hotspot_read_peer(
+                0,
+                0,
+                &query_stats,
+                threshold.saturating_sub(1),
+            ));
+        }
+        assert!(should_report_hotspot_read_peer(
+            0,
+            0,
+            &query_stats,
+            threshold
+        ));
     }
 
-    use engine_test::{kv::KvTestEngine, raft::RaftTestEngine};
+    #[test]
+    fn test_collect_report_peers_for_store_heartbeat_clears_orphan_cpu_records() {
+        let mut region_peers = HashMap::default();
+        region_peers.insert(1, PeerStat::default());
+        let mut region_cpu_records_since_store_heartbeat = HashMap::default();
+        region_cpu_records_since_store_heartbeat.insert(1, 10);
+        region_cpu_records_since_store_heartbeat.insert(2, 12);
+
+        collect_report_peers_for_store_heartbeat(
+            &mut region_peers,
+            &mut region_cpu_records_since_store_heartbeat,
+            1,
+        );
+
+        assert!(region_cpu_records_since_store_heartbeat.is_empty());
+    }
+
+    #[test]
+    fn test_collect_report_peers_for_store_heartbeat_with_zero_interval() {
+        let mut region_peers = HashMap::default();
+        let peer_stat = PeerStat {
+            read_bytes: hotspot_byte_report_threshold(),
+            ..Default::default()
+        };
+        region_peers.insert(1, peer_stat);
+
+        let mut region_cpu_records_since_store_heartbeat = HashMap::default();
+        region_cpu_records_since_store_heartbeat.insert(1, 42);
+
+        let report_peers = collect_report_peers_for_store_heartbeat(
+            &mut region_peers,
+            &mut region_cpu_records_since_store_heartbeat,
+            0,
+        );
+
+        assert!(region_cpu_records_since_store_heartbeat.is_empty());
+        let reported = report_peers.get(&1).unwrap();
+        assert_eq!(reported.get_cpu_stats().get_unified_read(), 0);
+        assert_eq!(reported.get_read_bytes(), hotspot_byte_report_threshold());
+    }
+
+    #[test]
+    fn test_remove_peer_stat_from_maps() {
+        let mut region_peers = HashMap::default();
+        region_peers.insert(1, PeerStat::default());
+        let mut region_cpu_records_since_region_heartbeat = HashMap::default();
+        region_cpu_records_since_region_heartbeat.insert(1, 10);
+        let mut region_cpu_records_since_store_heartbeat = HashMap::default();
+        region_cpu_records_since_store_heartbeat.insert(1, 12);
+
+        assert!(remove_peer_stat_from_maps(
+            1,
+            &mut region_peers,
+            &mut region_cpu_records_since_region_heartbeat,
+            &mut region_cpu_records_since_store_heartbeat,
+        ));
+        assert!(region_peers.is_empty());
+        assert!(region_cpu_records_since_region_heartbeat.is_empty());
+        assert!(region_cpu_records_since_store_heartbeat.is_empty());
+    }
+
+    use engine_test::kv::KvTestEngine;
     use metapb::Peer;
     use resource_metering::{RawRecord, TagInfos};
 
@@ -2809,7 +3061,7 @@ mod tests {
     #[test]
     fn test_calculate_region_cpu_records() {
         // region_id -> total_cpu_time_ms
-        let mut region_cpu_records: HashMap<u64, u32> = HashMap::default();
+        let mut region_cpu_records_since_region_heartbeat: HashMap<u64, u32> = HashMap::default();
 
         let region_num = 3;
         for i in 0..region_num * 10 {
@@ -2836,6 +3088,10 @@ mod tests {
                             cpu_time: 10,
                             read_keys: 0,
                             write_keys: 0,
+                            network_in_bytes: 0,
+                            network_out_bytes: 0,
+                            logical_read_bytes: 0,
+                            logical_write_bytes: 0,
                         },
                     );
                     records
@@ -2845,14 +3101,19 @@ mod tests {
             calculate_region_cpu_records(
                 DEFAULT_TEST_STORE_ID,
                 cpu_records,
-                &mut region_cpu_records,
+                &mut region_cpu_records_since_region_heartbeat,
             );
 
             sleep(Duration::from_millis(50));
         }
 
         for region_id in 1..region_num + 1 {
-            assert!(*region_cpu_records.get(&region_id).unwrap_or(&0) > 0)
+            assert!(
+                *region_cpu_records_since_region_heartbeat
+                    .get(&region_id)
+                    .unwrap_or(&0)
+                    > 0
+            )
         }
     }
 
@@ -2931,14 +3192,76 @@ mod tests {
         let obs = PdObserver::default();
         host.registry
             .register_pd_task_observer(1, BoxPdTaskObserver::new(obs));
-        let store_size = collect_engine_size::<KvTestEngine, RaftTestEngine>(&host, None, 0);
-        let (cap, used, avail) = if let Some((cap, used, avail)) = store_size {
-            (cap, used, avail)
-        } else {
-            panic!("store_size should not be none");
-        };
+        let (cap, used, avail) = collect_engine_size::<KvTestEngine>(&host);
         assert_eq!(cap, 444);
         assert_eq!(used, 111);
         assert_eq!(avail, 333);
+    }
+
+    #[test]
+    fn test_pd_worker_send_stats_on_read_and_cpu() {
+        let mut pd_worker: LazyWorker<Task<KvTestEngine>> =
+            LazyWorker::new("test-pd-worker-collect-stats");
+        // Set the interval long enough for mocking the channel full state.
+        let interval = 600_u64;
+        let mut stats_monitor = StatsMonitor::new(
+            Duration::from_secs(interval),
+            Duration::from_secs(interval),
+            Duration::default(),
+            Duration::default(),
+            WrappedScheduler(pd_worker.scheduler()),
+        );
+        stats_monitor
+            .start(
+                AutoSplitController::default(),
+                CollectorRegHandle::new_for_test(),
+                SplitValidator::new(),
+            )
+            .unwrap();
+        // Add some read stats and cpu stats to the stats monitor.
+        {
+            for _ in 0..=STATS_CHANNEL_CAPACITY_LIMIT + 10 {
+                let mut read_stats = ReadStats::with_sample_num(1);
+                read_stats.add_query_num(
+                    1,
+                    &Peer::default(),
+                    build_key_range(b"a", b"b", false),
+                    QueryKind::Get,
+                );
+                stats_monitor.maybe_send_read_stats(read_stats);
+            }
+
+            let raw_records = Arc::new(RawRecords {
+                begin_unix_time_secs: UnixSecs::now().into_inner(),
+                duration: Duration::default(),
+                records: {
+                    let mut records = HashMap::default();
+                    records.insert(
+                        Arc::new(TagInfos {
+                            store_id: 0,
+                            region_id: 1,
+                            peer_id: 0,
+                            key_ranges: vec![],
+                            extra_attachment: Arc::new(b"a".to_vec()),
+                        }),
+                        RawRecord {
+                            cpu_time: 111,
+                            read_keys: 1,
+                            write_keys: 0,
+                            network_in_bytes: 0,
+                            network_out_bytes: 0,
+                            logical_read_bytes: 0,
+                            logical_write_bytes: 0,
+                        },
+                    );
+                    records
+                },
+            });
+            for _ in 0..=STATS_CHANNEL_CAPACITY_LIMIT + 10 {
+                stats_monitor.maybe_send_cpu_stats(&raw_records);
+            }
+        }
+
+        pd_worker.stop();
     }
 }

@@ -1,8 +1,5 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-#![feature(let_chains)]
-#![feature(lazy_cell)]
-
 #[macro_use]
 extern crate log;
 
@@ -16,21 +13,26 @@ use std::{
     sync::{Arc, Mutex, RwLock},
     thread,
     time::Duration,
-    u64,
 };
 
 use collections::HashMap;
-use encryption_export::{
-    create_backend, data_key_manager_from_config, from_engine_encryption_method, DataKeyManager,
-    DecrypterReader, Iv,
+use compact_log_backup::{
+    TraceResultExt,
+    exec_hooks::{self as compact_log_hooks, skip_small_compaction::SkipSmallCompaction},
+    execute as compact_log,
 };
-use engine_rocks::get_env;
-use engine_traits::{EncryptionKeyManager, Peekable};
+use crypto::fips;
+use encryption_export::{
+    DataKeyManager, DecrypterReader, Iv, create_backend, data_key_manager_from_config,
+};
+use engine_rocks::{RocksEngine, get_env, util::new_engine_opt};
+use engine_traits::Peekable;
 use file_system::calc_crc32;
 use futures::{executor::block_on, future::try_join_all};
 use gag::BufferRedirect;
 use grpcio::{CallOption, ChannelBuilder, Environment};
 use kvproto::{
+    brpb,
     debugpb::{Db as DbType, *},
     encryptionpb::EncryptionMethod,
     kvrpcpb::SplitRegionRequest,
@@ -44,13 +46,20 @@ use raft_log_engine::ManagedFileSystem;
 use raftstore::store::util::build_key_range;
 use regex::Regex;
 use security::{SecurityConfig, SecurityManager};
-use structopt::{clap::ErrorKind, StructOpt};
+use structopt::{StructOpt, clap::ErrorKind};
+use tempfile::TempDir;
 use tikv::{
     config::TikvConfig,
-    server::{debug::BottommostLevelCompaction, KvEngineFactoryBuilder},
+    server::{KvEngineFactoryBuilder, debug::BottommostLevelCompaction},
     storage::config::EngineType,
 };
-use tikv_util::{escape, run_and_wait_child_process, sys::thread::StdThreadBuildWrapper, unescape};
+use tikv_util::{
+    escape,
+    logger::{Level, get_log_level},
+    run_and_wait_child_process,
+    sys::thread::StdThreadBuildWrapper,
+    unescape, warn,
+};
 use txn_types::Key;
 
 use crate::{cmd::*, executor::*, util::*};
@@ -61,10 +70,16 @@ mod fork_readonly_tikv;
 mod util;
 
 fn main() {
+    // OpenSSL FIPS mode should be enabled at the very start.
+    fips::maybe_enable();
+
     let opt = Opt::from_args();
 
     // Initialize logger.
-    init_ctl_logger(&opt.log_level);
+    init_ctl_logger(&opt.log_level, &opt.log_format);
+
+    // Print OpenSSL FIPS mode status.
+    fips::log_status();
 
     // Initialize configuration and security manager.
     let cfg_path = opt.config.as_ref();
@@ -115,13 +130,13 @@ fn main() {
             }
         }
         Cmd::RaftEngineCtl { args } => {
+            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
+                return;
+            }
             let key_manager =
                 data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
                     .expect("data_key_manager_from_config should success");
-            let file_system = Arc::new(ManagedFileSystem::new(
-                key_manager.map(|m| Arc::new(m)),
-                None,
-            ));
+            let file_system = Arc::new(ManagedFileSystem::new(key_manager.map(Arc::new), None));
             raft_engine_ctl::run_command(args, file_system);
         }
         Cmd::BadSsts { manifest, pd } => {
@@ -136,6 +151,9 @@ fn main() {
             dump_snap_meta_file(path);
         }
         Cmd::DecryptFile { file, out_file } => {
+            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
+                return;
+            }
             let message =
                 "This action will expose sensitive data as plaintext on persistent storage";
             if !warning_prompt(message) {
@@ -160,7 +178,7 @@ fn main() {
             let infile1 = Path::new(infile).canonicalize().unwrap();
             let file_info = key_manager.get_file(infile1.to_str().unwrap()).unwrap();
 
-            let mthd = from_engine_encryption_method(file_info.method);
+            let mthd = file_info.method;
             if mthd == EncryptionMethod::Plaintext {
                 println!(
                     "{} is not encrypted, skip to decrypt it into {}",
@@ -184,28 +202,36 @@ fn main() {
             io::copy(&mut reader, &mut outf).unwrap();
             println!("crc32: {}", calc_crc32(outfile).unwrap());
         }
-        Cmd::EncryptionMeta { cmd: subcmd } => match subcmd {
-            EncryptionMetaCmd::DumpKey { ids } => {
-                let message = "This action will expose encryption key(s) as plaintext. Do not output the \
+        Cmd::EncryptionMeta { cmd: subcmd } => {
+            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
+                return;
+            }
+            match subcmd {
+                EncryptionMetaCmd::DumpKey { ids } => {
+                    let message = "This action will expose encryption key(s) as plaintext. Do not output the \
                     result in file on disk.";
-                if !warning_prompt(message) {
-                    return;
+                    if !warning_prompt(message) {
+                        return;
+                    }
+                    DataKeyManager::dump_key_dict(
+                        create_backend(&cfg.security.encryption.master_key)
+                            .expect("encryption-meta master key creation"),
+                        &cfg.storage.data_dir,
+                        ids,
+                    )
+                    .unwrap();
                 }
-                DataKeyManager::dump_key_dict(
-                    create_backend(&cfg.security.encryption.master_key)
-                        .expect("encryption-meta master key creation"),
-                    &cfg.storage.data_dir,
-                    ids,
-                )
-                .unwrap();
+                EncryptionMetaCmd::DumpFile { path } => {
+                    let path = path
+                        .map(|path| fs::canonicalize(path).unwrap().to_str().unwrap().to_owned());
+                    DataKeyManager::dump_file_dict(&cfg.storage.data_dir, path.as_deref()).unwrap();
+                }
             }
-            EncryptionMetaCmd::DumpFile { path } => {
-                let path =
-                    path.map(|path| fs::canonicalize(path).unwrap().to_str().unwrap().to_owned());
-                DataKeyManager::dump_file_dict(&cfg.storage.data_dir, path.as_deref()).unwrap();
-            }
-        },
+        }
         Cmd::CleanupEncryptionMeta {} => {
+            if !validate_storage_data_dir(&mut cfg, opt.data_dir) {
+                return;
+            }
             let key_manager =
                 match data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
                     .expect("data_key_manager_from_config should success")
@@ -367,6 +393,111 @@ fn main() {
                 start_key,
                 end_key,
             );
+        }
+        Cmd::CompactLogBackup {
+            from_ts,
+            until_ts,
+            max_concurrent_compactions: max_compaction_num,
+            storage_base64,
+            compression,
+            compression_level,
+            name,
+            force_regenerate,
+            minimal_compaction_size,
+            prefetch_running_count,
+            prefetch_buffer_count,
+        } => {
+            let tmp_engine =
+                TemporaryRocks::new(&cfg).expect("failed to create temp engine for writing SSTs.");
+            let maybe_external_storage = base64::decode(storage_base64)
+                .map_err(|err| format!("cannot parse base64: {}", err))
+                .and_then(|storage_bytes| {
+                    let mut ext_storage = brpb::StorageBackend::new();
+                    ext_storage
+                        .merge_from_bytes(&storage_bytes)
+                        .map_err(|err| format!("cannot parse bytes as StorageBackend: {}", err))?;
+                    Result::Ok(ext_storage)
+                });
+            let external_storage = match maybe_external_storage {
+                Ok(s) => s,
+                Err(err) => {
+                    clap::Error {
+                        message: format!("(-s, --storage-base64) is invalid: {:?}", err),
+                        kind: ErrorKind::InvalidValue,
+                        info: None,
+                    }
+                    .exit();
+                }
+            };
+            let ccfg = compact_log::ExecutionConfig {
+                from_ts,
+                until_ts,
+                prefetch_running_count,
+                prefetch_buffer_count,
+                compression,
+                compression_level,
+            };
+            let exec = compact_log::Execution {
+                out_prefix: ccfg.recommended_prefix(&name),
+                cfg: ccfg,
+                max_concurrent_subcompaction: max_compaction_num,
+                external_storage,
+                db: Some(tmp_engine.rocks),
+            };
+
+            use tikv::server::status_server::lite::Server as StatusServerLite;
+            struct ExportTiKVInfo {
+                cfg: TikvConfig,
+            }
+            impl compact_log::hooking::ExecHooks for ExportTiKVInfo {
+                async fn before_execution_started(
+                    &mut self,
+                    cx: compact_log::hooking::BeforeStartCtx<'_>,
+                ) -> compact_log_backup::Result<()> {
+                    use compact_log_backup::OtherErrExt;
+                    tikv_util::info!("Welcome to TiKV control: compact log backup.");
+                    tikv_util::info!("TiKV version info."; "info_string" => tikv::tikv_version_info(None));
+
+                    let level = get_log_level();
+                    if level < Some(Level::Info) {
+                        warn!("Most of compact-log progress logs are only enabled in the `info` level."; "current_level" => ?level);
+                    }
+
+                    let srv = StatusServerLite::new(Arc::new(self.cfg.security.clone()));
+                    let _enter = cx.async_rt.enter();
+                    let hnd = srv
+                        .start(&self.cfg.server.status_addr)
+                        .adapt_err()
+                        .annotate("failed to start status server lite")?;
+                    tikv_util::info!("Started status server lite."; "at" => %hnd.address());
+                    Ok(())
+                }
+            }
+
+            let log_to_term = compact_log_hooks::observability::Observability::default();
+            let save_meta = compact_log_hooks::save_meta::SaveMeta::default();
+            let with_lock = compact_log_hooks::consistency::StorageConsistencyGuard::default();
+            let with_status_server = ExportTiKVInfo { cfg: cfg.clone() };
+            let checkpoint = if force_regenerate {
+                None
+            } else {
+                Some(compact_log_hooks::checkpoint::Checkpoint::default())
+            };
+            let skip_small_compaction = SkipSmallCompaction::new(minimal_compaction_size.0);
+            let hooks = (
+                (
+                    (log_to_term, checkpoint),
+                    (with_status_server, skip_small_compaction),
+                ),
+                (save_meta, with_lock),
+            );
+            match exec.run(hooks) {
+                Ok(()) => tikv_util::info!("Compact log backup successfully."),
+                Err(err) => {
+                    tikv_util::error!("Failed to compact log backup."; "err" => %err, "err_verbose" => ?err);
+                    std::process::exit(1);
+                }
+            }
         }
         // Commands below requires either the data dir or the host.
         cmd => {
@@ -776,12 +907,18 @@ fn compact_whole_cluster(
     threads: u32,
     bottommost: BottommostLevelCompaction,
 ) {
-    let stores = pd_client
+    let all_stores = pd_client
         .get_all_stores(true) // Exclude tombstone stores.
         .unwrap_or_else(|e| perror_and_exit("Get all cluster stores from PD failed", e));
 
+    let tikv_stores = all_stores.iter().filter(|s| {
+        !s.get_labels()
+            .iter()
+            .any(|l| l.get_key() == "engine" && l.get_value() == "tiflash")
+    });
+
     let mut handles = Vec::new();
-    for s in stores {
+    for s in tikv_stores {
         let cfg = cfg.clone();
         let mgr = Arc::clone(&mgr);
         let addr = s.address.clone();
@@ -906,7 +1043,7 @@ fn flashback_whole_cluster(
             .await
             {
                 Ok(res) => {
-                    if let Err(key_range) = res {
+                    if let Err((key_range, _)) = res {
                         // Retry specific key range to prepare flashback.
                         let stale_key_range = (key_range.start_key.clone(), key_range.end_key.clone());
                         let mut key_range_to_prepare = key_range_to_prepare.write().unwrap();
@@ -986,7 +1123,21 @@ fn flashback_whole_cluster(
             {
                 Ok(res) => match res {
                     Ok(_) => break,
-                    Err(_) => {
+                    Err((key_range, err)) => {
+                        // Retry `NotLeader` or `RegionNotFound`.
+                        if err.to_string().contains("not leader") || err.to_string().contains("not found") {
+                            // When finished `PrepareFlashback`, the region may change leader in the `flashback in progress`
+                            // Neet to retry specific key range to finish flashback.
+                            let stale_key_range = (key_range.start_key.clone(), key_range.end_key.clone());
+                            let mut key_range_to_finish = key_range_to_finish.write().unwrap();
+                            // Remove stale key range.
+                            key_range_to_finish.remove(&stale_key_range);
+                            load_key_range(&pd_client, stale_key_range.0.clone(), stale_key_range.1.clone())
+                                .into_iter().for_each(|(key_range, region_info)| {
+                                // Need to update `key_range_to_finish` to replace stale key range.
+                                key_range_to_finish.insert(key_range, region_info);
+                            });
+                        }
                         thread::sleep(Duration::from_micros(WAIT_APPLY_FLASHBACK_STATE));
                         continue;
                     }
@@ -1043,12 +1194,51 @@ fn read_fail_file(path: &str) -> Vec<(String, String)> {
     list
 }
 
+/// A temporary RocksDB instance.
+/// Its content will be saved at a temp dir, so don't put too many stuffs into
+/// it. The configurations are loaded to this instance, so it can be used for
+/// constructing / reading SST files.
+struct TemporaryRocks {
+    rocks: RocksEngine,
+    #[allow(dead_code)]
+    tmp: TempDir,
+}
+
+impl TemporaryRocks {
+    fn new(cfg: &TikvConfig) -> Result<Self, String> {
+        let tmp = TempDir::new().map_err(|v| format!("failed to create tmp dir: {}", v))?;
+        let opt = build_rocks_opts(cfg);
+        let cf_opts = cfg.rocksdb.build_cf_opts(
+            &cfg.rocksdb.build_cf_resources(
+                cfg.storage.block_cache.build_shared_cache(),
+                Default::default(),
+            ),
+            None,
+            cfg.storage.api_version(),
+            None,
+            cfg.storage.engine,
+        );
+        let rocks = new_engine_opt(
+            tmp.path().to_str().ok_or_else(|| {
+                format!(
+                    "temp path isn't valid utf-8 string: {}",
+                    tmp.path().display()
+                )
+            })?,
+            opt,
+            cf_opts,
+        )
+        .map_err(|v| format!("failed to build engine: {}", v))?;
+        Ok(Self { rocks, tmp })
+    }
+}
+
 fn build_rocks_opts(cfg: &TikvConfig) -> engine_rocks::RocksDbOptions {
     let key_manager = data_key_manager_from_config(&cfg.security.encryption, &cfg.storage.data_dir)
         .unwrap()
         .map(Arc::new);
     let env = get_env(key_manager, None /* io_rate_limiter */).unwrap();
-    let resource = cfg.rocksdb.build_resources(env);
+    let resource = cfg.rocksdb.build_resources(env, cfg.storage.engine);
     cfg.rocksdb.build_opt(&resource, cfg.storage.engine)
 }
 
@@ -1105,6 +1295,9 @@ fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, 
     stderr_buf.read_to_end(&mut buffer).unwrap();
     let corruptions = unsafe { String::from_utf8_unchecked(buffer) };
 
+    let r = Regex::new(r"/\w*\.sst").unwrap();
+    let column_r = Regex::new(r"--------------- (.*) --------------\n(.*)").unwrap();
+    let sst_stat_r = Regex::new(r".*\n\d+:\d+\[\d+ .. \d+\]\['(\w*)' seq:\d+, type:\d+ .. '(\w*)' seq:\d+, type:\d+\] at level \d+").unwrap();
     for line in corruptions.lines() {
         println!("--------------------------------------------------------");
         // The corruption format may like this:
@@ -1113,7 +1306,6 @@ fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, 
         // ```
         println!("corruption info:\n{}", line);
 
-        let r = Regex::new(r"/\w*\.sst").unwrap();
         let sst_file_number = match r.captures(line) {
             None => {
                 println!("skip bad line format");
@@ -1174,15 +1366,13 @@ fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, 
         // --------------- Column family "write"  (ID 2) --------------
         // 63:132906243[3555338 .. 3555338]['7A311B40EFCC2CB4C5911ECF3937D728DED26AE53FA5E61BE04F23F2BE54EACC73' seq:3555338, type:1 .. '7A313030302E25CD5F57252E' seq:3555338, type:1] at level 0
         // ```
-        let column_r = Regex::new(r"--------------- (.*) --------------\n(.*)").unwrap();
         if let Some(m) = column_r.captures(&output) {
             println!(
                 "{} for {}",
                 m.get(2).unwrap().as_str(),
                 m.get(1).unwrap().as_str()
             );
-            let r = Regex::new(r".*\n\d+:\d+\[\d+ .. \d+\]\['(\w*)' seq:\d+, type:\d+ .. '(\w*)' seq:\d+, type:\d+\] at level \d+").unwrap();
-            let matches = match r.captures(&output) {
+            let matches = match sst_stat_r.captures(&output) {
                 None => {
                     println!("sst start key format is not correct: {}", output);
                     continue;
@@ -1300,13 +1490,28 @@ fn read_cluster_id(config: &TikvConfig) -> Result<u64, String> {
             .map(Arc::new);
     let env = get_env(key_manager.clone(), None /* io_rate_limiter */).unwrap();
     let cache = config.storage.block_cache.build_shared_cache();
-    let kv_engine = KvEngineFactoryBuilder::new(env, config, cache, key_manager)
-        .build()
-        .create_shared_db(&config.storage.data_dir)
-        .map_err(|e| format!("create_shared_db fail: {}", e))?;
+    let kv_engine =
+        KvEngineFactoryBuilder::new(env, config, cache, key_manager, Default::default())
+            .build()
+            .create_shared_db(&config.storage.data_dir)
+            .map_err(|e| format!("create_shared_db fail: {}", e))?;
     let ident = kv_engine
         .get_msg::<StoreIdent>(keys::STORE_IDENT_KEY)
         .unwrap()
         .unwrap();
     Ok(ident.cluster_id)
+}
+
+fn validate_storage_data_dir(config: &mut TikvConfig, data_dir: Option<String>) -> bool {
+    if let Some(data_dir) = data_dir {
+        if !Path::new(&data_dir).exists() {
+            eprintln!("--data-dir {:?} not exists", data_dir);
+            return false;
+        }
+        config.storage.data_dir = data_dir;
+    } else if config.storage.data_dir.is_empty() {
+        eprintln!("--data-dir or data-dir in the config file should not be empty");
+        return false;
+    }
+    true
 }

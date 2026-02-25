@@ -28,14 +28,14 @@ use std::{
     fs::{self, File},
     io::{self, BorrowedBuf, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
 use collections::HashMap;
 use crc64fast::Digest;
 use encryption_export::{DataKeyImporter, DataKeyManager};
-use engine_traits::{Checkpointer, EncryptionKeyManager, KvEngine, TabletRegistry};
+use engine_traits::{Checkpointer, KvEngine, TabletRegistry};
 use file_system::{IoType, OpenOptions, WithIoType};
 use futures::{
     future::FutureExt,
@@ -55,23 +55,24 @@ use kvproto::{
 };
 use protobuf::Message;
 use raftstore::store::{
-    snap::{ReceivingGuard, TabletSnapKey, TabletSnapManager},
     SnapManager,
+    snap::{ReceivingGuard, TabletSnapKey, TabletSnapManager},
 };
 use security::SecurityManager;
 use tikv_kv::RaftExtension;
 use tikv_util::{
+    DeferContext, Either,
     config::{ReadableSize, Tracker, VersionTrack},
+    thread_name_prefix::TABLET_SNAP_SENDER_THREAD,
     time::Instant,
     worker::Runnable,
-    DeferContext, Either,
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use super::{
-    metrics::*,
-    snap::{Task, DEFAULT_POOL_SIZE},
     Config, Error, Result,
+    metrics::*,
+    snap::{DEFAULT_POOL_SIZE, Task},
 };
 use crate::tikv_util::{sys::thread::ThreadBuildWrapper, time::Limiter};
 
@@ -154,14 +155,17 @@ pub trait SnapCacheBuilder: Send + Sync {
 
 impl<EK: KvEngine> SnapCacheBuilder for TabletRegistry<EK> {
     fn build(&self, region_id: u64, path: &Path) -> Result<()> {
-        if let Some(mut c) = self.get(region_id) && let Some(db) = c.latest() {
-            let mut checkpointer = db.new_checkpointer()?;
-            // Avoid flush.
-            checkpointer.create_at(path, None, u64::MAX)?;
-            Ok(())
-        } else {
-            Err(Error::Other(format!("region {} not found", region_id).into()))
+        if let Some(mut c) = self.get(region_id) {
+            if let Some(db) = c.latest() {
+                let mut checkpointer = db.new_checkpointer()?;
+                // Avoid flush.
+                checkpointer.create_at(path, None, u64::MAX)?;
+                return Ok(());
+            }
         }
+        Err(Error::Other(
+            format!("region {} not found", region_id).into(),
+        ))
     }
 }
 
@@ -242,9 +246,9 @@ fn protocol_error(exp: &str, act: impl Debug) -> Error {
 /// It's considered matched when:
 /// 1. Have the same file size;
 /// 2. The first `PREVIEW_CHUNK_LEN` bytes are the same, this contains the
-/// actual data of an SST;
+///    actual data of an SST;
 /// 3. The last `PREVIEW_CHUNK_LEN` bytes are the same, this contains checksum,
-/// properties and other medata of an SST.
+///    properties and other medata of an SST.
 async fn is_sst_match_preview(
     preview_meta: &TabletSnapshotFileMeta,
     target: &Path,
@@ -326,15 +330,17 @@ async fn cleanup_cache(
         };
         let mut buffer = Vec::with_capacity(PREVIEW_CHUNK_LEN);
         for meta in preview.take_metas().into_vec() {
-            if is_sst(&meta.file_name) && let Some(p) = exists.remove(&meta.file_name) {
-                if is_sst_match_preview(&meta, &p, &mut buffer, limiter, key_manager).await? {
-                    reused += meta.file_size;
-                    continue;
-                }
-                // We should not write to the file directly as it's hard linked.
-                fs::remove_file(&p)?;
-                if let Some(m) = key_manager {
-                    m.delete_file(p.to_str().unwrap(), None)?;
+            if is_sst(&meta.file_name) {
+                if let Some(p) = exists.remove(&meta.file_name) {
+                    if is_sst_match_preview(&meta, &p, &mut buffer, limiter, key_manager).await? {
+                        reused += meta.file_size;
+                        continue;
+                    }
+                    // We should not write to the file directly as it's hard linked.
+                    fs::remove_file(&p)?;
+                    if let Some(m) = key_manager {
+                        m.delete_file(p.to_str().unwrap(), None)?;
+                    }
                 }
             }
             missing.push(meta.file_name);
@@ -425,7 +431,7 @@ async fn accept_missing(
 ) -> Result<u64> {
     let mut digest = Digest::default();
     let mut received_bytes: u64 = 0;
-    let mut key_importer = key_manager.as_deref().map(|m| DataKeyImporter::new(m));
+    let mut key_importer = key_manager.as_deref().map(DataKeyImporter::new);
     for name in missing_ssts {
         let chunk = match stream.next().await {
             Some(Ok(mut req)) if req.has_chunk() => req.take_chunk(),
@@ -532,7 +538,7 @@ async fn recv_snap_imp<'a>(
     if let Some(m) = snap_mgr.key_manager() {
         m.link_file(path.to_str().unwrap(), final_path.to_str().unwrap())?;
     }
-    fs::rename(&path, &final_path).map_err(|e| {
+    fs::rename(&path, &final_path).inspect_err(|_e| {
         if let Some(m) = snap_mgr.key_manager() {
             if let Err(e) = m.remove_dir(&final_path, Some(&path)) {
                 error!(
@@ -543,7 +549,6 @@ async fn recv_snap_imp<'a>(
                 );
             }
         }
-        e
     })?;
     if let Some(m) = snap_mgr.key_manager() {
         m.remove_dir(&path, Some(&final_path))?;
@@ -697,11 +702,11 @@ async fn send_missing(
         digest.write(chunk.file_name.as_bytes());
         chunk.file_size = file_size;
         total_sent += file_size;
-        if let Some(m) = key_manager
-            && let Some((iv, key)) = m.get_file_internal(file_path.to_str().unwrap())?
-        {
-            chunk.iv = iv;
-            chunk.set_key(key);
+        if let Some(m) = key_manager {
+            if let Some((iv, key)) = m.get_file_internal(file_path.to_str().unwrap())? {
+                chunk.iv = iv;
+                chunk.set_key(key);
+            }
         }
         if file_size == 0 {
             let mut req = TabletSnapshotRequest::default();
@@ -837,7 +842,7 @@ impl<B, R: RaftExtension> TabletRunner<B, R> {
             env,
             snap_mgr,
             pool: RuntimeBuilder::new_multi_thread()
-                .thread_name(thd_name!("tablet-snap-sender"))
+                .thread_name(thd_name!(TABLET_SNAP_SENDER_THREAD))
                 .with_sys_hooks()
                 .worker_threads(DEFAULT_POOL_SIZE)
                 .build()
@@ -926,7 +931,7 @@ where
                     .await;
                     recving_count.fetch_sub(1, Ordering::SeqCst);
                     if let Err(e) = result {
-                        error!("failed to recv snapshot"; "err" => %e);
+                        warn!("failed to recv snapshot"; "err" => %e);
                     }
                 });
             }
@@ -981,7 +986,7 @@ where
                             cb(Ok(()));
                         }
                         Err(e) => {
-                            error!("failed to send snap"; "to_addr" => addr, "region_id" => region_id, "err" => ?e);
+                            warn!("failed to send snap"; "to_addr" => addr, "region_id" => region_id, "err" => ?e);
                             cb(Err(e));
                         }
                     };
@@ -1022,14 +1027,18 @@ pub fn copy_tablet_snapshot(
     let mut key_importer = recver_snap_mgr
         .key_manager()
         .as_deref()
-        .map(|m| DataKeyImporter::new(m));
+        .map(DataKeyImporter::new);
     for path in files {
         let recv = recv_path.join(path.file_name().unwrap());
         std::fs::copy(&path, &recv)?;
-        if let Some(m) = sender_snap_mgr.key_manager()
-            && let Some((iv, key)) = m.get_file_internal(path.to_str().unwrap())?
-        {
-            key_importer.as_mut().unwrap().add(recv.to_str().unwrap(), iv, key).unwrap();
+        if let Some(m) = sender_snap_mgr.key_manager() {
+            if let Some((iv, key)) = m.get_file_internal(path.to_str().unwrap())? {
+                key_importer
+                    .as_mut()
+                    .unwrap()
+                    .add(recv.to_str().unwrap(), iv, key)
+                    .unwrap();
+            }
         }
     }
     if let Some(i) = key_importer {
@@ -1046,11 +1055,10 @@ pub fn copy_tablet_snapshot(
             let _ = m.remove_dir(&final_path, None);
         }
     }
-    fs::rename(&recv_path, &final_path).map_err(|e| {
+    fs::rename(&recv_path, &final_path).inspect_err(|_e| {
         if let Some(m) = recver_snap_mgr.key_manager() {
             let _ = m.remove_dir(&final_path, Some(&recv_path));
         }
-        e
     })?;
     if let Some(m) = recver_snap_mgr.key_manager() {
         m.remove_dir(&recv_path, Some(&final_path))?;

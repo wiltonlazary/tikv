@@ -1,7 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    borrow::ToOwned, cmp::Ordering, path::Path, pin::Pin, result, str, string::ToString, sync::Arc,
+    borrow::ToOwned, cmp::Ordering, path::Path, result, str, string::ToString, sync::Arc,
     time::Duration,
 };
 
@@ -9,11 +9,16 @@ use api_version::{ApiV1, KvFormat};
 use encryption_export::data_key_manager_from_config;
 use engine_rocks::util::{db_exist, new_engine_opt};
 use engine_traits::{
-    Engines, Error as EngineError, RaftEngine, TabletRegistry, ALL_CFS, CF_DEFAULT, CF_LOCK,
-    CF_WRITE, DATA_CFS,
+    ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_CFS, Engines, Error as EngineError, RaftEngine,
+    TabletRegistry,
 };
 use file_system::read_dir;
-use futures::{executor::block_on, future, stream, Stream, StreamExt, TryStreamExt};
+use futures::{
+    StreamExt, TryStreamExt,
+    executor::block_on,
+    future,
+    stream::{self, BoxStream},
+};
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::{
     debugpb::{Db as DbType, *},
@@ -26,7 +31,7 @@ use pd_client::{Config as PdConfig, PdClient, RpcClient};
 use protobuf::Message;
 use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType};
 use raft_log_engine::RaftLogEngine;
-use raftstore::store::{util::build_key_range, INIT_EPOCH_CONF_VER};
+use raftstore::store::{INIT_EPOCH_CONF_VER, util::build_key_range};
 use security::SecurityManager;
 use serde_json::json;
 use server::fatal;
@@ -34,15 +39,15 @@ use slog_global::crit;
 use tikv::{
     config::{ConfigController, TikvConfig},
     server::{
+        KvEngineFactoryBuilder,
         debug::{BottommostLevelCompaction, Debugger, DebuggerImpl, RegionInfo},
         debug2::DebuggerImplV2,
-        KvEngineFactoryBuilder,
     },
     storage::{
+        Engine,
         config::EngineType,
         kv::MockEngine,
         lock_manager::{LockManager, MockLockManager},
-        Engine,
     },
 };
 use tikv_util::escape;
@@ -55,14 +60,16 @@ pub const METRICS_ROCKSDB_RAFT: &str = "rocksdb_raft";
 pub const METRICS_JEMALLOC: &str = "jemalloc";
 pub const LOCK_FILE_ERROR: &str = "IO error: While lock file";
 
-type MvccInfoStream = Pin<Box<dyn Stream<Item = result::Result<(Vec<u8>, MvccInfo), String>>>>;
+type MvccInfoStream = BoxStream<'static, result::Result<(Vec<u8>, MvccInfo), String>>;
 
 fn get_engine_type(dir: &str) -> EngineType {
     let mut entries = read_dir(dir).unwrap();
     let mut engine1 = false;
     let mut engine2 = false;
     while let Some(Ok(e)) = entries.next() {
-        if let Ok(ty) = e.file_type() && ty.is_dir() {
+        if let Ok(ty) = e.file_type()
+            && ty.is_dir()
+        {
             if e.file_name() == "tablets" {
                 engine2 = true;
             } else if e.file_name() == "db" {
@@ -101,9 +108,15 @@ pub fn new_debug_executor(
         .build_shared_rocks_env(key_manager.clone(), None /* io_rate_limiter */)
         .unwrap();
 
-    let factory = KvEngineFactoryBuilder::new(env.clone(), cfg, cache, key_manager.clone())
-        .lite(true)
-        .build();
+    let factory = KvEngineFactoryBuilder::new(
+        env.clone(),
+        cfg,
+        cache,
+        key_manager.clone(),
+        Default::default(),
+    )
+    .lite(true)
+    .build();
 
     let cfg_controller = ConfigController::default();
     if !cfg.raft_engine.enable {
@@ -216,7 +229,7 @@ pub trait DebugExecutor {
             let r = self.get_region_info(region_id);
             if skip_tombstone {
                 let region_state = r.region_local_state.as_ref();
-                if region_state.map_or(false, |s| s.get_state() == PeerState::Tombstone) {
+                if region_state.is_some_and(|s| s.get_state() == PeerState::Tombstone) {
                     continue;
                 }
             }
@@ -240,6 +253,7 @@ pub trait DebugExecutor {
                     json!({
                         "region": json!({
                             "id": r.get_id(),
+                            "state": format!("{:?}", s.get_state()),
                             "start_key": hex::encode_upper(r.get_start_key()),
                             "end_key": hex::encode_upper(r.get_end_key()),
                             "region_epoch": json!({
@@ -378,21 +392,21 @@ pub trait DebugExecutor {
                     println!("key: {}", escape(&key));
                     if cfs.contains(&CF_LOCK) && mvcc.has_lock() {
                         let lock_info = mvcc.get_lock();
-                        if start_ts.map_or(true, |ts| lock_info.get_start_ts() == ts) {
+                        if start_ts.is_none_or(|ts| lock_info.get_start_ts() == ts) {
                             println!("\tlock cf value: {:?}", lock_info);
                         }
                     }
                     if cfs.contains(&CF_DEFAULT) {
                         for value_info in mvcc.get_values() {
-                            if commit_ts.map_or(true, |ts| value_info.get_start_ts() == ts) {
+                            if commit_ts.is_none_or(|ts| value_info.get_start_ts() == ts) {
                                 println!("\tdefault cf value: {:?}", value_info);
                             }
                         }
                     }
                     if cfs.contains(&CF_WRITE) {
                         for write_info in mvcc.get_writes() {
-                            if start_ts.map_or(true, |ts| write_info.get_start_ts() == ts)
-                                && commit_ts.map_or(true, |ts| write_info.get_commit_ts() == ts)
+                            if start_ts.is_none_or(|ts| write_info.get_start_ts() == ts)
+                                && commit_ts.is_none_or(|ts| write_info.get_commit_ts() == ts)
                             {
                                 println!("\t write cf value: {:?}", write_info);
                             }
@@ -715,7 +729,7 @@ pub trait DebugExecutor {
         _key_range: KeyRange,
         _start_ts: u64,
         _commit_ts: u64,
-    ) -> Result<(), KeyRange>;
+    ) -> Result<(), (KeyRange, grpcio::Error)>;
 
     fn get_region_read_progress(&self, region_id: u64, log: bool, min_start_ts: u64);
 }
@@ -948,7 +962,7 @@ impl DebugExecutor for DebugClient {
         key_range: KeyRange,
         start_ts: u64,
         commit_ts: u64,
-    ) -> Result<(), KeyRange> {
+    ) -> Result<(), (KeyRange, grpcio::Error)> {
         let mut req = FlashbackToVersionRequest::default();
         req.set_version(version);
         req.set_region_id(region_id);
@@ -963,7 +977,7 @@ impl DebugExecutor for DebugClient {
                     "flashback key_range {:?} with start_ts {:?}, commit_ts {:?} need to retry, err is {:?}",
                     key_range, start_ts, commit_ts, err
                 );
-                Err(key_range)
+                Err((key_range, err))
             }
         }
     }
@@ -1293,7 +1307,7 @@ where
         _key_range: KeyRange,
         _start_ts: u64,
         _commit_ts: u64,
-    ) -> Result<(), KeyRange> {
+    ) -> Result<(), (KeyRange, grpcio::Error)> {
         unimplemented!("only available for remote mode");
     }
 
@@ -1305,14 +1319,14 @@ where
 
 fn handle_engine_error(err: EngineError) -> ! {
     error!("error while open kvdb: {}", err);
-    if let EngineError::Engine(s) = err {
-        if s.state().contains(LOCK_FILE_ERROR) {
-            error!(
-                "LOCK file conflict indicates TiKV process is running. \
+    if let EngineError::Engine(s) = err
+        && s.state().contains(LOCK_FILE_ERROR)
+    {
+        error!(
+            "LOCK file conflict indicates TiKV process is running. \
                 Do NOT delete the LOCK file and force the command to run. \
                 Doing so could cause data corruption."
-            );
-        }
+        );
     }
 
     tikv_util::logger::exit_process_gracefully(-1);
@@ -1332,11 +1346,16 @@ impl<ER: RaftEngine> DebugExecutor for DebuggerImplV2<ER> {
     }
 
     fn get_region_size(&self, region: u64, cfs: Vec<&str>) -> Vec<(String, usize)> {
-        self.region_size(region, cfs)
-            .unwrap_or_else(|e| perror_and_exit("Debugger::region_size", e))
-            .into_iter()
-            .map(|(cf, size)| (cf.to_owned(), size))
-            .collect()
+        match self.region_size(region, cfs) {
+            Ok(v) => v
+                .into_iter()
+                .map(|(cf, size)| (cf.to_owned(), size))
+                .collect(),
+            Err(e) => {
+                println!("Debugger::region_size: {}", e);
+                vec![]
+            }
+        }
     }
 
     fn get_region_info(&self, region: u64) -> RegionInfo {
@@ -1510,7 +1529,7 @@ impl<ER: RaftEngine> DebugExecutor for DebuggerImplV2<ER> {
         _key_range: KeyRange,
         _start_ts: u64,
         _commit_ts: u64,
-    ) -> Result<(), KeyRange> {
+    ) -> Result<(), (KeyRange, grpcio::Error)> {
         unimplemented!("only available for remote mode");
     }
 

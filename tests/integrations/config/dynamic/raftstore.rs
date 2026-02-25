@@ -2,22 +2,23 @@
 
 use std::{
     iter::FromIterator,
-    sync::{atomic::AtomicU64, mpsc, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU64, mpsc},
     time::Duration,
 };
 
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::RocksEngine;
-use engine_traits::{Engines, ALL_CFS, CF_DEFAULT};
+use engine_traits::{ALL_CFS, CF_DEFAULT, Engines};
+use health_controller::HealthController;
 use kvproto::raft_serverpb::RaftMessage;
 use raftstore::{
+    Result,
     coprocessor::CoprocessorHost,
     store::{
+        AutoSplitController, DiskCheckRunner, SnapManager, StoreMsg, Transport,
         config::{Config, RaftstoreConfigManager},
         fsm::{StoreMeta, *},
-        AutoSplitController, SnapManager, StoreMsg, Transport,
     },
-    Result,
 };
 use resource_metering::CollectorRegHandle;
 use service::service_manager::GrpcServiceManager;
@@ -29,7 +30,7 @@ use tikv::{
 };
 use tikv_util::{
     config::{ReadableDuration, ReadableSize, VersionTrack},
-    worker::{dummy_scheduler, LazyWorker, Worker},
+    worker::{LazyWorker, Worker, dummy_scheduler},
 };
 
 #[derive(Clone)]
@@ -109,10 +110,11 @@ fn start_raftstore(
             Worker::new("split"),
             AutoSplitController::default(),
             Arc::default(),
-            ConcurrencyManager::new(1.into()),
+            ConcurrencyManager::new_for_test(1.into()),
             CollectorRegHandle::new_for_test(),
+            HealthController::new(),
             None,
-            None,
+            DiskCheckRunner::dummy(),
             GrpcServiceManager::dummy(),
             Arc::new(AtomicU64::new(0)),
         )
@@ -236,6 +238,7 @@ fn test_update_raftstore_io_config() {
     // Start from SYNC mode.
     {
         let (mut resize_config, _dir) = TikvConfig::with_tmp().unwrap();
+        resize_config.raft_store.store_io_pool_size = 0; // SYNC mode
         resize_config.validate().unwrap();
         let (cfg_controller, _, _, mut system) = start_raftstore(resize_config, &_dir);
 

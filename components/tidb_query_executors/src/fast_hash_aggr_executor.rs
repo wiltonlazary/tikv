@@ -5,15 +5,16 @@ use std::{convert::TryFrom, hash::Hash, sync::Arc};
 use async_trait::async_trait;
 use collections::HashMap;
 use tidb_query_aggr::*;
-use tidb_query_common::{storage::IntervalRange, Result};
+use tidb_query_common::{Result, storage::IntervalRange};
 use tidb_query_datatype::{
+    Collation, EvalType, FieldTypeAccessor,
     codec::{
         batch::{LazyBatchColumn, LazyBatchColumnVec},
         collation::SortKey,
         data_type::*,
     },
     expr::{EvalConfig, EvalContext},
-    match_template_collator, Collation, EvalType, FieldTypeAccessor,
+    match_template_collator,
 };
 use tidb_query_expr::{RpnExpression, RpnExpressionBuilder, RpnStackNode};
 use tikv_util::box_try;
@@ -27,7 +28,7 @@ use crate::{
 macro_rules! match_template_hashable {
     ($t:tt, $($tail:tt)*) => {{
         match_template::match_template! {
-            $t = [Int, Real, Bytes, Duration, Decimal, DateTime, Enum],
+            $t = [Int, Real, Bytes, Duration, Decimal, DateTime, Enum, VectorFloat32],
             $($tail)*
         }
     }}
@@ -46,6 +47,19 @@ impl<Src: BatchExecutor> BatchExecutor for BatchFastHashAggregationExecutor<Src>
     #[inline]
     fn schema(&self) -> &[FieldType] {
         self.0.schema()
+    }
+
+    #[inline]
+    fn intermediate_schema(&self, index: usize) -> Result<&[FieldType]> {
+        self.0.intermediate_schema(index)
+    }
+
+    #[inline]
+    fn consume_and_fill_intermediate_results(
+        &mut self,
+        results: &mut [Vec<BatchExecuteResult>],
+    ) -> Result<()> {
+        self.0.consume_and_fill_intermediate_results(results)
     }
 
     #[inline]
@@ -96,7 +110,8 @@ impl BatchFastHashAggregationExecutor<Box<dyn BatchExecutor<StorageStats = ()>>>
             | EvalType::Bytes
             | EvalType::Duration
             | EvalType::Decimal
-            | EvalType::DateTime => {}
+            | EvalType::DateTime
+            | EvalType::VectorFloat32 => {}
             _ => return Err(other_err!("Eval type {} is not supported", eval_type)),
         }
 
@@ -209,6 +224,7 @@ enum Groups {
     Decimal(HashMap<Option<Decimal>, usize>),
     DateTime(HashMap<Option<DateTime>, usize>),
     Enum(HashMap<Option<Enum>, usize>),
+    VectorFloat32(HashMap<Option<VectorFloat32>, usize>),
 }
 
 impl Groups {
@@ -267,7 +283,7 @@ impl<Src: BatchExecutor> AggregationExecutorImpl<Src> for FastHashAggregationImp
         match group_by_result {
             RpnStackNode::Scalar { value, .. } => {
                 match_template::match_template! {
-                    TT = [Int, Bytes, Real, Duration, Decimal, DateTime, Enum],
+                    TT = [Int, Bytes, Real, Duration, Decimal, DateTime, Enum, VectorFloat32],
                     match value {
                         ScalarValue::TT(v) => {
                             if let Groups::TT(group) = &mut self.groups {
@@ -292,7 +308,7 @@ impl<Src: BatchExecutor> AggregationExecutorImpl<Src> for FastHashAggregationImp
                 let group_by_logical_rows = value.logical_rows_struct();
 
                 match_template::match_template! {
-                    TT = [Int, Real, Duration, Decimal, DateTime, Enum],
+                    TT = [Int, Real, Duration, Decimal, DateTime, Enum, VectorFloat32],
                     match group_by_physical_vec {
                         VectorValue::TT(v) => {
                             if let Groups::TT(group) = &mut self.groups {
@@ -467,18 +483,18 @@ where
 #[cfg(test)]
 mod tests {
     use futures::executor::block_on;
-    use tidb_query_datatype::{expr::EvalWarnings, FieldTypeTp};
+    use tidb_query_datatype::{FieldTypeTp, expr::EvalWarnings};
     use tidb_query_expr::{
-        impl_arithmetic::{arithmetic_fn_meta, RealPlus},
         RpnExpression, RpnExpressionBuilder,
+        impl_arithmetic::{RealPlus, arithmetic_fn_meta},
     };
     use tipb::{ExprType, ScalarFuncSig};
     use tipb_helper::ExprDefBuilder;
 
     use super::*;
     use crate::{
-        util::{aggr_executor::tests::*, mock_executor::MockExecutor},
         BatchSlowHashAggregationExecutor,
+        util::{aggr_executor::tests::*, mock_executor::MockExecutor},
     };
 
     // Test cases also cover BatchSlowHashAggregationExecutor.

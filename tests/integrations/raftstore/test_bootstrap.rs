@@ -1,30 +1,34 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 use std::{
     path::Path,
-    sync::{atomic::AtomicU64, mpsc::sync_channel, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU64, mpsc::sync_channel},
     time::Duration,
 };
 
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{
-    DbOptionsExt, Engines, MiscExt, Peekable, RaftEngine, RaftEngineReadOnly, ALL_CFS, CF_DEFAULT,
-    CF_LOCK, CF_RAFT, CF_WRITE,
+    ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, DbOptionsExt, Engines, MiscExt, Peekable,
+    RaftEngine, RaftEngineReadOnly,
 };
+use health_controller::HealthController;
 use kvproto::{kvrpcpb::ApiVersion, metapb, raft_serverpb::RegionLocalState};
 use raftstore::{
     coprocessor::CoprocessorHost,
-    store::{bootstrap_store, fsm, fsm::store::StoreMeta, AutoSplitController, SnapManager},
+    store::{
+        AutoSplitController, DiskCheckRunner, SnapManager, bootstrap_store, fsm,
+        fsm::store::StoreMeta,
+    },
 };
 use raftstore_v2::router::PeerMsg;
 use resource_metering::CollectorRegHandle;
 use service::service_manager::GrpcServiceManager;
 use tempfile::Builder;
-use test_pd_client::{bootstrap_with_first_region, TestPdClient};
+use test_pd_client::{TestPdClient, bootstrap_with_first_region};
 use test_raftstore::*;
-use tikv::{import::SstImporter, server::Node};
+use tikv::{import::SstImporter, server::MultiRaftServer};
 use tikv_util::{
     config::VersionTrack,
-    worker::{dummy_scheduler, Builder as WorkerBuilder, LazyWorker},
+    worker::{Builder as WorkerBuilder, LazyWorker, dummy_scheduler},
 };
 
 fn test_bootstrap_idempotent<T: Simulator>(cluster: &mut Cluster<T>) {
@@ -59,7 +63,7 @@ fn test_node_bootstrap_with_prepared_data() {
     let engines = Engines::new(engine.clone(), raft_engine);
     let tmp_mgr = Builder::new().prefix("test_cluster").tempdir().unwrap();
     let bg_worker = WorkerBuilder::new("background").thread_count(2).create();
-    let mut node = Node::new(
+    let mut node = MultiRaftServer::new(
         system,
         &cfg.server,
         Arc::new(VersionTrack::new(cfg.raft_store.clone())),
@@ -67,7 +71,7 @@ fn test_node_bootstrap_with_prepared_data() {
         Arc::clone(&pd_client),
         Arc::default(),
         bg_worker,
-        None,
+        HealthController::new(),
         None,
     );
     let snap_mgr = SnapManager::new(tmp_mgr.path().to_str().unwrap());
@@ -118,9 +122,10 @@ fn test_node_bootstrap_with_prepared_data() {
         importer,
         split_check_scheduler,
         AutoSplitController::default(),
-        ConcurrencyManager::new(1.into()),
+        ConcurrencyManager::new_for_test(1.into()),
         CollectorRegHandle::new_for_test(),
         None,
+        DiskCheckRunner::dummy(),
         GrpcServiceManager::dummy(),
         Arc::new(AtomicU64::new(0)),
     )
@@ -216,7 +221,7 @@ fn test_flush_before_stop() {
     let region = cluster.get_region(b"k60");
     cluster.must_split(&region, b"k070");
 
-    fail::cfg("flush_before_cluse_threshold", "return(10)").unwrap();
+    fail::cfg("flush_before_close_threshold", "return(10)").unwrap();
 
     for i in 0..100 {
         let key = format!("k{:03}", i);
@@ -260,7 +265,7 @@ fn test_flush_before_stop2() {
     let mut cluster = new_server_cluster(0, 3);
     cluster.run();
 
-    fail::cfg("flush_before_cluse_threshold", "return(10)").unwrap();
+    fail::cfg("flush_before_close_threshold", "return(10)").unwrap();
     fail::cfg("on_flush_completed", "return").unwrap();
 
     for i in 0..20 {
@@ -331,7 +336,7 @@ fn test_flush_index_exceed_last_modified() {
         )
         .unwrap();
 
-    fail::cfg("flush_before_cluse_threshold", "return(1)").unwrap();
+    fail::cfg("flush_before_close_threshold", "return(1)").unwrap();
     let router = cluster.get_router(1).unwrap();
     let (tx, rx) = sync_channel(1);
     let msg = PeerMsg::FlushBeforeClose { tx };

@@ -7,20 +7,26 @@ use std::{
 };
 
 use collections::HashMap;
-use file_system::{set_io_type, IoType};
+use file_system::{IoType, set_io_type};
 use kvproto::{kvrpcpb::CommandPri, pdpb::QueryKind};
 use pd_client::{Feature, FeatureGate};
 use prometheus::local::*;
 use raftstore::store::WriteStats;
-use resource_control::{ControlledFuture, ResourceController, TaskMetadata};
+use resource_control::{
+    ControlledFuture, ResourceController, ResourceGroupManager, TaskMetadata, with_resource_limiter,
+};
 use tikv_util::{
     sys::SysQuota,
+    thread_name_prefix::{
+        SCHEDULE_WORKER_HIGH_PRI_THREAD, SCHEDULE_WORKER_POOL_THREAD,
+        SCHEDULE_WORKER_PRIORITY_THREAD,
+    },
     yatp_pool::{Full, FuturePool, PoolTicker, YatpPoolBuilder},
 };
 use yatp::queue::Extras;
 
 use crate::storage::{
-    kv::{destroy_tls_engine, set_tls_engine, Engine, FlowStatsReporter, Statistics},
+    kv::{Engine, FlowStatsReporter, Statistics, destroy_tls_engine, set_tls_engine},
     metrics::*,
     test_util::latest_feature_gate,
 };
@@ -101,11 +107,13 @@ impl VanillaQueue {
 struct PriorityQueue {
     worker_pool: FuturePool,
     resource_ctl: Arc<ResourceController>,
+    resource_mgr: Arc<ResourceGroupManager>,
 }
 
 impl PriorityQueue {
     fn spawn(
         &self,
+        request_source: &str,
         metadata: TaskMetadata<'_>,
         priority_level: CommandPri,
         f: impl futures::Future<Output = ()> + Send + 'static,
@@ -118,15 +126,17 @@ impl PriorityQueue {
         // TODO: maybe use a better way to generate task_id
         let task_id = rand::random::<u64>();
         let group_name = metadata.group_name().to_owned();
+        let resource_limiter = self.resource_mgr.get_resource_limiter(
+            unsafe { std::str::from_utf8_unchecked(&group_name) },
+            request_source,
+            metadata.override_priority() as u64,
+        );
         let mut extras = Extras::new_multilevel(task_id, fixed_level);
         extras.set_metadata(metadata.to_vec());
         self.worker_pool.spawn_with_extras(
-            ControlledFuture::new(
-                async move {
-                    f.await;
-                },
-                self.resource_ctl.clone(),
-                group_name,
+            with_resource_limiter(
+                ControlledFuture::new(f, self.resource_ctl.clone(), group_name),
+                resource_limiter,
             ),
             extras,
         )
@@ -155,6 +165,7 @@ impl SchedPool {
         reporter: R,
         feature_gate: FeatureGate,
         resource_ctl: Option<Arc<ResourceController>>,
+        resource_mgr: Option<Arc<ResourceGroupManager>>,
     ) -> Self {
         let builder = |pool_size: usize, name_prefix: &str| {
             let engine = Arc::new(Mutex::new(engine.clone()));
@@ -181,16 +192,22 @@ impl SchedPool {
                     destroy_tls_engine::<E>();
                     tls_flush(&reporter);
                 })
+                .enable_task_wait_metrics(true)
+                .enable_task_exec_metrics(true)
         };
         let vanilla = VanillaQueue {
-            worker_pool: builder(pool_size, "sched-worker-pool").build_future_pool(),
-            high_worker_pool: builder(std::cmp::max(1, pool_size / 2), "sched-worker-high")
-                .build_future_pool(),
+            worker_pool: builder(pool_size, SCHEDULE_WORKER_POOL_THREAD).build_future_pool(),
+            high_worker_pool: builder(
+                std::cmp::max(1, pool_size / 2),
+                SCHEDULE_WORKER_HIGH_PRI_THREAD,
+            )
+            .build_future_pool(),
         };
         let priority = resource_ctl.as_ref().map(|r| PriorityQueue {
-            worker_pool: builder(pool_size, "sched-worker-priority")
+            worker_pool: builder(pool_size, SCHEDULE_WORKER_PRIORITY_THREAD)
                 .build_priority_future_pool(r.clone()),
             resource_ctl: r.clone(),
+            resource_mgr: resource_mgr.unwrap(),
         });
         let queue_type = if resource_ctl.is_some() {
             QueueType::Dynamic
@@ -207,6 +224,7 @@ impl SchedPool {
 
     pub fn spawn(
         &self,
+        request_source: &str,
         metadata: TaskMetadata<'_>,
         priority_level: CommandPri,
         f: impl futures::Future<Output = ()> + Send + 'static,
@@ -216,10 +234,12 @@ impl SchedPool {
             QueueType::Dynamic => {
                 if self.can_use_priority() {
                     fail_point!("priority_pool_task");
-                    self.priority
-                        .as_ref()
-                        .unwrap()
-                        .spawn(metadata, priority_level, f)
+                    self.priority.as_ref().unwrap().spawn(
+                        request_source,
+                        metadata,
+                        priority_level,
+                        f,
+                    )
                 } else {
                     fail_point!("single_queue_pool_task");
                     self.vanilla.spawn(priority_level, f)

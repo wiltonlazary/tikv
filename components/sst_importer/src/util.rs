@@ -3,8 +3,7 @@
 use std::path::Path;
 
 use encryption::DataKeyManager;
-use engine_traits::EncryptionKeyManager;
-use external_storage_export::ExternalStorage;
+use external_storage::ExternalStorage;
 use file_system::File;
 
 use super::Result;
@@ -97,8 +96,8 @@ pub fn copy_sst_for_ingestion<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let mut pmts = file_system::metadata(clone)?.permissions();
     if pmts.readonly() {
-        use std::os::unix::fs::PermissionsExt;
-        pmts.set_mode(0o644);
+        #[allow(clippy::permissions_set_readonly_false)]
+        pmts.set_readonly(false);
         file_system::set_permissions(clone, pmts)?;
     }
 
@@ -124,12 +123,12 @@ mod tests {
 
     use encryption::DataKeyManager;
     use engine_rocks::{
-        util::new_engine_opt, RocksCfOptions, RocksDbOptions, RocksEngine, RocksSstWriterBuilder,
-        RocksTitanDbOptions,
+        RocksCfOptions, RocksDbOptions, RocksEngine, RocksSstWriterBuilder, RocksTitanDbOptions,
+        util::new_engine_opt,
     };
     use engine_traits::{
-        CfName, CfOptions, DbOptions, EncryptionKeyManager, ImportExt, Peekable, SstWriter,
-        SstWriterBuilder, TitanCfOptions, CF_DEFAULT,
+        CF_DEFAULT, CfName, CfOptions, DbOptions, ImportExt, Peekable, SstWriter, SstWriterBuilder,
+        TitanCfOptions,
     };
     use tempfile::Builder;
     use test_util::encryption::new_test_key_manager;
@@ -211,8 +210,13 @@ mod tests {
         prepare_sst_for_ingestion(&sst_path, &sst_clone, key_manager).unwrap();
         check_hard_link(&sst_path, 2);
         check_hard_link(&sst_clone, 2);
-        db.ingest_external_file_cf(CF_DEFAULT, &[sst_clone.to_str().unwrap()])
-            .unwrap();
+        db.ingest_external_file_cf(
+            CF_DEFAULT,
+            &[sst_clone.to_str().unwrap()],
+            None,
+            false, // force_allow_write
+        )
+        .unwrap();
         check_db_with_kvs(&db, CF_DEFAULT, &kvs);
         assert!(!sst_clone.exists());
         // Since we are not using key_manager in db, simulate the db deleting the file
@@ -228,8 +232,13 @@ mod tests {
         prepare_sst_for_ingestion(&sst_path, &sst_clone, key_manager).unwrap();
         check_hard_link(&sst_path, 2);
         check_hard_link(&sst_clone, 1);
-        db.ingest_external_file_cf(CF_DEFAULT, &[sst_clone.to_str().unwrap()])
-            .unwrap();
+        db.ingest_external_file_cf(
+            CF_DEFAULT,
+            &[sst_clone.to_str().unwrap()],
+            None,
+            false, // force_allow_write
+        )
+        .unwrap();
         check_db_with_kvs(&db, CF_DEFAULT, &kvs);
         assert!(!sst_clone.exists());
     }
@@ -306,8 +315,13 @@ mod tests {
         check_hard_link(&sst_path, 1);
         check_hard_link(&sst_clone, 1);
 
-        db.ingest_external_file_cf(CF_DEFAULT, &[sst_clone.to_str().unwrap()])
-            .unwrap();
+        db.ingest_external_file_cf(
+            CF_DEFAULT,
+            &[sst_clone.to_str().unwrap()],
+            None,
+            false, // force_allow_write
+        )
+        .unwrap();
         check_db_with_kvs(&db, CF_DEFAULT, &kvs);
         assert!(!sst_clone.exists());
     }

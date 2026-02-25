@@ -58,10 +58,12 @@ impl CmSketch {
     pub fn push_to_top_n(&mut self, b: Vec<u8>, cnt: u64) {
         self.top_n.push((b, cnt))
     }
+}
 
-    pub fn into_proto(self) -> tipb::CmSketch {
+impl From<CmSketch> for tipb::CmSketch {
+    fn from(cm: CmSketch) -> tipb::CmSketch {
         let mut proto = tipb::CmSketch::default();
-        let rows = self
+        let rows = cm
             .table
             .into_iter()
             .map(|row| {
@@ -71,7 +73,7 @@ impl CmSketch {
             })
             .collect();
         proto.set_rows(rows);
-        let top_n_data = self
+        let top_n_data = cm
             .top_n
             .into_iter()
             .map(|(item, cnt)| {
@@ -91,7 +93,7 @@ mod tests {
     use std::{cmp::min, slice::from_ref};
 
     use collections::HashMap;
-    use rand::{distributions::Distribution, rngs::StdRng, SeedableRng};
+    use rand::{SeedableRng, distributions::Distribution, rngs::StdRng};
     use tidb_query_datatype::{
         codec::{datum, datum::Datum},
         expr::EvalContext,
@@ -104,7 +106,7 @@ mod tests {
         fn query(&self, bytes: &[u8]) -> u32 {
             let (h1, h2) = CmSketch::hash(bytes);
             let mut vals = vec![0u32; self.depth];
-            let mut min_counter = u32::max_value();
+            let mut min_counter = u32::MAX;
             for (i, row) in self.table.iter().enumerate() {
                 let j = (h1.wrapping_add(h2.wrapping_mul(i as u64)) % self.width as u64) as usize;
                 let noise = (self.count - row[j]) / (self.width as u32 - 1);
@@ -144,11 +146,7 @@ mod tests {
                 datum::encode_value(&mut EvalContext::default(), from_ref(&Datum::U64(*val)))
                     .unwrap();
             let estimate = c.query(&bytes);
-            let err = if *num > estimate {
-                *num - estimate
-            } else {
-                estimate - *num
-            };
+            let err = (*num).abs_diff(estimate);
             total += u64::from(err)
         }
         total / map.len() as u64

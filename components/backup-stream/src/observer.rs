@@ -6,7 +6,7 @@ use engine_traits::KvEngine;
 use kvproto::metapb::Region;
 use raft::StateRole;
 use raftstore::coprocessor::*;
-use tikv_util::{worker::Scheduler, HandyRwLock};
+use tikv_util::{HandyRwLock, worker::Scheduler};
 
 use crate::{
     debug,
@@ -185,10 +185,10 @@ impl RegionChangeObserver for BackupStreamObserver {
 }
 
 #[cfg(test)]
-
 mod tests {
-    use std::{assert_matches::assert_matches, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
+    use dashmap::DashMap;
     use engine_panic::PanicEngine;
     use kvproto::metapb::Region;
     use raft::StateRole;
@@ -196,7 +196,8 @@ mod tests {
         Cmd, CmdBatch, CmdObserveInfo, CmdObserver, ObserveHandle, ObserveLevel, ObserverContext,
         RegionChangeEvent, RegionChangeObserver, RegionChangeReason, RoleChange, RoleObserver,
     };
-    use tikv_util::{worker::dummy_scheduler, HandyRwLock};
+    use tikv::storage::txn::txn_status_cache::TxnStatusCache;
+    use tikv_util::{HandyRwLock, worker::dummy_scheduler};
 
     use super::BackupStreamObserver;
     use crate::{
@@ -218,7 +219,10 @@ mod tests {
 
         // Prepare: assuming a task wants the range of [0001, 0010].
         let o = BackupStreamObserver::new(sched);
-        let subs = SubscriptionTracer::default();
+        let subs = SubscriptionTracer(
+            Arc::new(DashMap::new()),
+            Arc::new(TxnStatusCache::new_for_test()),
+        );
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
         // Test regions can be registered.
@@ -226,7 +230,7 @@ mod tests {
         o.register_region(&r);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
         let handle = ObserveHandle::new();
-        if let Task::ModifyObserve(ObserveOp::Start { ref region, .. }) = task {
+        if let Task::ModifyObserve(ObserveOp::Start { ref region }) = task {
             subs.register_region(region, handle.clone(), None);
         } else {
             panic!("unexpected message received: it is {}", task);
@@ -243,7 +247,10 @@ mod tests {
 
         // Prepare: assuming a task wants the range of [0001, 0010].
         let o = BackupStreamObserver::new(sched);
-        let subs = SubscriptionTracer::default();
+        let subs = SubscriptionTracer(
+            Arc::new(DashMap::new()),
+            Arc::new(TxnStatusCache::new_for_test()),
+        );
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
         // Test regions can be registered.
@@ -251,7 +258,7 @@ mod tests {
         o.register_region(&r);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
         let handle = ObserveHandle::new();
-        if let Task::ModifyObserve(ObserveOp::Start { ref region, .. }) = task {
+        if let Task::ModifyObserve(ObserveOp::Start { ref region }) = task {
             subs.register_region(region, handle.clone(), None);
         } else {
             panic!("not match, it is {:?}", task);
@@ -265,9 +272,9 @@ mod tests {
         let mut cmd_batches = vec![cb];
         o.on_flush_applied_cmd_batch(ObserveLevel::All, &mut cmd_batches, &mock_engine);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
-        assert_matches!(task, Task::BatchEvent(batches) if
+        assert!(matches!(task, Task::BatchEvent(batches) if
             batches.len() == 1 && batches[0].region_id == 42 && batches[0].cdc_id == handle.id
-        );
+        ));
 
         // Test event from other region should not be send.
         let observe_info = CmdObserveInfo::from_handle(
@@ -286,7 +293,7 @@ mod tests {
         // Test region out of range won't be added to observe list.
         let r = fake_region(43, b"0010", b"0042");
         let mut ctx = ObserverContext::new(&r);
-        o.on_role_change(&mut ctx, &RoleChange::new(StateRole::Leader));
+        o.on_role_change(&mut ctx, &RoleChange::new_for_test(StateRole::Leader));
         let task = rx.recv_timeout(Duration::from_millis(20));
         assert!(task.is_err(), "it is {:?}", task);
         assert!(!subs.is_observing(43));
@@ -301,12 +308,12 @@ mod tests {
         // Test give up subscripting when become follower.
         let r = fake_region(42, b"0008", b"0009");
         let mut ctx = ObserverContext::new(&r);
-        o.on_role_change(&mut ctx, &RoleChange::new(StateRole::Follower));
+        o.on_role_change(&mut ctx, &RoleChange::new_for_test(StateRole::Follower));
         let task = rx.recv_timeout(Duration::from_millis(20));
-        assert_matches!(
+        assert!(matches!(
             task,
             Ok(Some(Task::ModifyObserve(ObserveOp::Stop { region, .. }))) if region.id == 42
-        );
+        ));
     }
 
     #[test]
@@ -323,7 +330,7 @@ mod tests {
             RegionChangeEvent::Update(RegionChangeReason::Split),
             StateRole::Leader,
         );
-        o.on_role_change(&mut ctx, &RoleChange::new(StateRole::Leader));
+        o.on_role_change(&mut ctx, &RoleChange::new_for_test(StateRole::Leader));
         let task = rx.recv_timeout(Duration::from_millis(20));
         assert!(task.is_err(), "it is {:?}", task);
     }

@@ -3,7 +3,7 @@
 use std::{sync::mpsc, time::Duration};
 
 use collections::HashSet;
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use engine_test::{kv::KvTestEngine, new_temp_engine, raft::RaftTestEngine};
 use engine_traits::{Engines, Mutable, Peekable, RaftEngineReadOnly, WriteBatchExt};
 use kvproto::{
@@ -16,11 +16,11 @@ use tempfile::Builder;
 
 use super::*;
 use crate::{
-    store::{
-        async_io::write_router::tests::TestContext, local_metrics::RaftMetrics,
-        peer_storage::tests::new_entry, Config, Transport, WriteRouter,
-    },
     Result,
+    store::{
+        Config, Transport, WriteRouter, async_io::write_router::tests::TestContext,
+        local_metrics::RaftMetrics, peer_storage::tests::new_entry,
+    },
 };
 type TestKvWriteBatch = <KvTestEngine as WriteBatchExt>::WriteBatch;
 type TestRaftLogBatch = <RaftTestEngine as RaftEngine>::LogBatch;
@@ -275,6 +275,37 @@ impl TestWriters {
     ) -> resource_control::channel::Sender<WriteMsg<KvTestEngine, RaftTestEngine>> {
         self.writers.senders()[id].clone()
     }
+}
+
+#[test]
+fn test_write_task_batch_recorder() {
+    let mut recorder = WriteTaskBatchRecorder::new(1024, Duration::from_nanos(50)); // 1kb, 50 nanoseconds
+    assert_eq!(recorder.get_avg(), 0);
+    assert_eq!(recorder.get_trend(), 1.0);
+    assert!(!recorder.should_wait(4096));
+    assert!(recorder.should_wait(512));
+    // [512 ...]
+    for _ in 0..30 {
+        recorder.record(512);
+    }
+    assert_eq!(recorder.get_avg(), 512);
+    assert_eq!(recorder.get_trend(), 0.5);
+    assert!(recorder.should_wait(128));
+    let start = Instant::now();
+    recorder.wait_for_a_while();
+    assert!(start.saturating_elapsed() >= Duration::from_nanos(100));
+    // [4096 ...]
+    for _ in 0..30 {
+        recorder.record(4096);
+    }
+    assert_eq!(recorder.get_avg(), 4096);
+    assert_eq!(recorder.get_trend(), 2.0);
+    assert!(!recorder.should_wait(128));
+    recorder.reset_wait_count();
+    assert!(recorder.should_wait(128));
+    let start = Instant::now();
+    recorder.wait_for_a_while();
+    assert!(start.saturating_elapsed() >= Duration::from_nanos(20));
 }
 
 #[test]

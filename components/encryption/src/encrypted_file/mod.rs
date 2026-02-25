@@ -5,14 +5,14 @@ use std::{
     path::Path,
 };
 
-use file_system::{rename, File, OpenOptions};
+use crypto::rand;
+use file_system::{File, OpenOptions, rename};
 use kvproto::encryptionpb::EncryptedContent;
 use protobuf::Message;
-use rand::{thread_rng, RngCore};
 use slog_global::error;
 use tikv_util::time::Instant;
 
-use crate::{master_key::*, metrics::*, Result};
+use crate::{Result, master_key::*, metrics::*};
 
 mod header;
 pub use header::*;
@@ -66,7 +66,7 @@ impl<'a> EncryptedFile<'a> {
         // TODO what if a tmp file already exists?
         let origin_path = self.base.join(self.name);
         let mut tmp_path = origin_path.clone();
-        tmp_path.set_extension(format!("{}.{}", thread_rng().next_u64(), TMP_FILE_SUFFIX));
+        tmp_path.set_extension(format!("{}.{}", rand::rand_u64()?, TMP_FILE_SUFFIX));
         let mut tmp_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -108,8 +108,6 @@ impl<'a> EncryptedFile<'a> {
 mod tests {
     use std::io::ErrorKind;
 
-    use matches::assert_matches;
-
     use super::*;
     use crate::Error;
 
@@ -120,7 +118,7 @@ mod tests {
         assert_eq!(file.base, tmp.path());
         assert_eq!(file.name, "encrypted");
         let ret = file.read(&PlaintextBackend::default());
-        assert_matches!(ret, Err(Error::Io(_)));
+        assert!(matches!(ret, Err(Error::Io(_))));
         if let Err(Error::Io(e)) = file.read(&PlaintextBackend::default()) {
             assert_eq!(ErrorKind::NotFound, e.kind());
         }

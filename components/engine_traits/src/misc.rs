@@ -6,8 +6,8 @@
 //! FIXME: Things here need to be moved elsewhere.
 
 use crate::{
-    cf_names::CfNamesExt, errors::Result, flow_control_factors::FlowControlFactorsExt,
-    range::Range, WriteBatchExt, WriteOptions,
+    KvEngine, WriteBatchExt, WriteOptions, cf_names::CfNamesExt, errors::Result,
+    flow_control_factors::FlowControlFactorsExt, range::Range,
 };
 
 #[derive(Clone, Debug)]
@@ -35,7 +35,13 @@ pub enum DeleteStrategy {
     DeleteByRange,
     /// Delete by ingesting a SST file with deletions. Useful when the number of
     /// ranges is too many.
-    DeleteByWriter { sst_path: String },
+    /// Set `allow_write_during_ingestion` to true to minimize the impact on
+    /// foreground performance, but you must ensure that no concurrent
+    /// writes overlap with the data being ingested.
+    DeleteByWriter {
+        sst_path: String,
+        allow_write_during_ingestion: bool,
+    },
 }
 
 /// `StatisticsReporter` can be used to report engine's private statistics to
@@ -55,14 +61,40 @@ pub trait StatisticsReporter<T: ?Sized> {
     fn flush(&mut self);
 }
 
-#[derive(Default)]
+/// RocksDB example:
+/// lv0: f5: [{k1_t6, delete: () /* RocksDB tombstone */}]
+/// lv1: f4: [{k1_t10, put: v13}, {k2_t11, put: tombstone /* MVCC delete */},
+/// {k3_t12, put: v32}]
+/// ...
+/// lv5: f3: [{k2_t8, put: v21}], f2: [{k3_t9, put: v31}]
+/// lv6: f1: [{k1_t6, put: v11}, {k1_t7, put: v12}]
+/// The range stats for the range [k1, k3] will be:
+/// num_entries: 8
+/// num_versions: 7 (all entries except k1_t6 RocksDB delete entry)
+/// num_rows: 6 (f4: 3 + f3: 1 + f2: 1 + f1: 1, k1_t6 is masked by k1_t7)
+/// num_deletes: 1 (k2 in f4)
+
+#[derive(Default, Debug, Clone)]
 pub struct RangeStats {
-    // The number of entries
+    // The number of entries in write cf.
     pub num_entries: u64,
     // The number of MVCC versions of all rows (num_entries - tombstones).
     pub num_versions: u64,
     // The number of rows.
     pub num_rows: u64,
+    // The number of MVCC deletes of all rows.
+    pub num_deletes: u64,
+}
+
+impl RangeStats {
+    /// The number of redundant keys in the range.
+    /// It's calculated by `num_entries - num_versions + num_deleted`.
+    pub fn redundant_keys(&self) -> u64 {
+        // Consider the number of `mvcc_deletes` as the number of redundant keys.
+        self.num_entries
+            .saturating_sub(self.num_rows)
+            .saturating_add(self.num_deletes)
+    }
 }
 
 pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
@@ -106,9 +138,7 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
     /// memtables of the cf.
     fn get_approximate_memtable_stats_cf(&self, cf: &str, range: &Range<'_>) -> Result<(u64, u64)>;
 
-    fn ingest_maybe_slowdown_writes(&self, cf: &str) -> Result<bool>;
-
-    fn get_sst_key_ranges(&self, cf: &str, level: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    fn ingest_maybe_slowdown_writes(&self, cf: &str, inflight_ingest_cnt: u64) -> Result<bool>;
 
     /// Gets total used size of rocksdb engine, including:
     /// * total size (bytes) of all SST files.
@@ -120,6 +150,12 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
     fn path(&self) -> &str;
 
     fn sync_wal(&self) -> Result<()>;
+
+    /// Disable manual compactions, some on-going manual compactions may be
+    /// aborted.
+    fn disable_manual_compaction(&self) -> Result<()>;
+
+    fn enable_manual_compaction(&self) -> Result<()>;
 
     /// Depending on the implementation, some on-going manual compactions may be
     /// aborted.
@@ -178,4 +214,7 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
         }
         Ok(n)
     }
+
+    type DiskEngine: KvEngine;
+    fn get_disk_engine(&self) -> &Self::DiskEngine;
 }

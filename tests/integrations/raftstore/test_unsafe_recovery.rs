@@ -8,7 +8,7 @@ use pd_client::PdClient;
 use raft::eraftpb::{ConfChangeType, MessageType};
 use test_raftstore::*;
 use test_raftstore_macro::test_case;
-use tikv_util::{config::ReadableDuration, store::find_peer, HandyRwLock};
+use tikv_util::{HandyRwLock, config::ReadableDuration, store::find_peer};
 
 macro_rules! confirm_quorum_is_lost {
     ($cluster:expr, $region:expr) => {{
@@ -28,7 +28,7 @@ macro_rules! confirm_quorum_is_lost {
 
 #[test_case(test_raftstore::new_node_cluster)]
 #[test_case(test_raftstore_v2::new_node_cluster)]
-fn test_unsafe_recovery_demote_failed_voters() {
+fn test_unsafe_recovery_demote_failed_peers() {
     let mut cluster = new_cluster(0, 3);
     cluster.run();
     let nodes = Vec::from_iter(cluster.get_node_ids());
@@ -40,6 +40,18 @@ fn test_unsafe_recovery_demote_failed_voters() {
 
     let region = block_on(pd_client.get_region_by_id(1)).unwrap().unwrap();
 
+    // Replace peer on node1 with a learner
+    let peer_on_store1 = find_peer(&region, nodes[1]).unwrap();
+    cluster
+        .pd_client
+        .must_remove_peer(region.get_id(), peer_on_store1.clone());
+    cluster.pd_client.must_add_peer(
+        region.get_id(),
+        new_learner_peer(nodes[1], cluster.pd_client.alloc_id().unwrap()),
+    );
+    // Sleep 100 ms to wait for the new learner to be initialized.
+    sleep_ms(100);
+
     let peer_on_store2 = find_peer(&region, nodes[2]).unwrap();
     cluster.must_transfer_leader(region.get_id(), peer_on_store2.clone());
     cluster.stop_node(nodes[1]);
@@ -49,36 +61,104 @@ fn test_unsafe_recovery_demote_failed_voters() {
 
     cluster.must_enter_force_leader(region.get_id(), nodes[0], vec![nodes[1], nodes[2]]);
 
-    let to_be_removed: Vec<metapb::Peer> = region
+    // Get the updated region info after setup
+    let updated_region = block_on(pd_client.get_region_by_id(1)).unwrap().unwrap();
+    let failed_peers: Vec<metapb::Peer> = updated_region
         .get_peers()
         .iter()
         .filter(|&peer| peer.get_store_id() != nodes[0])
         .cloned()
         .collect();
+
     let mut plan = pdpb::RecoveryPlan::default();
     let mut demote = pdpb::DemoteFailedVoters::default();
-    demote.set_region_id(region.get_id());
-    demote.set_failed_voters(to_be_removed.into());
+    demote.set_region_id(updated_region.get_id());
+    demote.set_failed_voters(failed_peers.into());
     plan.mut_demotes().push(demote);
     pd_client.must_set_unsafe_recovery_plan(nodes[0], plan);
     cluster.must_send_store_heartbeat(nodes[0]);
 
-    let mut demoted = true;
+    let mut recovery_complete = false;
     for _ in 0..10 {
         let region = block_on(pd_client.get_region_by_id(1)).unwrap().unwrap();
 
-        demoted = true;
+        let mut has_failed_learner = false;
+        let mut has_non_demoted_voter = false;
+
         for peer in region.get_peers() {
-            if peer.get_id() != nodes[0] && peer.get_role() == metapb::PeerRole::Voter {
-                demoted = false;
+            if peer.get_store_id() == nodes[1] {
+                // The failed learner should be removed
+                has_failed_learner = true;
+            } else if peer.get_store_id() != nodes[0] && peer.get_role() == metapb::PeerRole::Voter
+            {
+                // Failed voters should be demoted to learners
+                has_non_demoted_voter = true;
             }
         }
-        if demoted {
+
+        // Recovery is complete when failed learner is removed and failed voters are
+        // demoted
+        recovery_complete = !has_failed_learner && !has_non_demoted_voter;
+
+        if recovery_complete {
             break;
         }
         sleep_ms(200);
     }
-    assert!(demoted);
+    assert!(
+        recovery_complete,
+        "Failed learners should be removed and failed voters should be demoted"
+    );
+
+    // Verify final state
+    let final_region = block_on(pd_client.get_region_by_id(1)).unwrap().unwrap();
+
+    // Should have 2 peers now: 1 survivor (voter) + 1 demoted failed voter
+    // (learner)
+    assert_eq!(
+        final_region.get_peers().len(),
+        2,
+        "Should have 2 peers: 1 voter + 1 demoted learner"
+    );
+
+    // Verify roles
+    let mut voter_count = 0;
+    let mut learner_count = 0;
+    let mut survivor_found = false;
+    let mut failed_learner_removed = true;
+
+    for peer in final_region.get_peers() {
+        match peer.get_role() {
+            metapb::PeerRole::Voter => {
+                voter_count += 1;
+                if peer.get_store_id() == nodes[0] {
+                    survivor_found = true;
+                }
+            }
+            metapb::PeerRole::Learner => {
+                learner_count += 1;
+                // Should be the demoted failed voter on node2, not the failed learner on node1
+                assert_ne!(
+                    peer.get_store_id(),
+                    nodes[1],
+                    "Failed learner should be removed"
+                );
+            }
+            _ => {}
+        }
+
+        if peer.get_store_id() == nodes[1] {
+            failed_learner_removed = false;
+        }
+    }
+
+    assert_eq!(voter_count, 1, "Should have exactly 1 voter (the survivor)");
+    assert_eq!(
+        learner_count, 1,
+        "Should have exactly 1 learner (the demoted failed voter)"
+    );
+    assert!(survivor_found, "Survivor node should remain as voter");
+    assert!(failed_learner_removed, "Failed learner should be removed");
 }
 
 // Demote non-exist voters will not work, but TiKV should still report to PD.
@@ -1461,4 +1541,85 @@ fn test_unsafe_recovery_during_merge() {
         sleep_ms(200);
     }
     assert!(demoted);
+}
+
+#[test_case(test_raftstore::new_node_cluster)]
+fn test_force_leader_forward_commit_idx_ignoring_learners() {
+    let mut cluster = new_cluster(0, 4);
+    cluster.cfg.raft_store.raft_base_tick_interval = ReadableDuration::millis(10);
+    cluster.run();
+    let nodes = Vec::from_iter(cluster.get_node_ids());
+    assert_eq!(nodes.len(), 4);
+
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+    let region = block_on(pd_client.get_region_by_id(1)).unwrap().unwrap();
+
+    // Make peer on node 4 a learner.
+    let peer_on_store4 = find_peer(&region, nodes[3]).unwrap().to_owned();
+    // Remove the peer on node 4.
+    pd_client.must_remove_peer(region.get_id(), peer_on_store4.clone());
+    // Add the peer on node 4 as a learner.
+    let mut learner_on_store4 = new_peer(nodes[3], pd_client.alloc_id().unwrap());
+    learner_on_store4.set_role(metapb::PeerRole::Learner);
+    pd_client.must_add_peer(region.get_id(), learner_on_store4.clone());
+
+    // Makes the leadership definite.
+    let store2_peer = find_peer(&region, nodes[2]).unwrap().to_owned();
+    cluster.must_transfer_leader(region.get_id(), store2_peer);
+    let region = block_on(pd_client.get_region_by_id(1)).unwrap().unwrap();
+
+    cluster.must_put(b"k1", b"v1");
+    assert_eq!(cluster.must_get(b"k1"), Some(b"v1".to_vec()));
+
+    // Get the current commit index and last index.
+    let commit_index = cluster
+        .raft_local_state(region.get_id(), nodes[2])
+        .get_hard_state()
+        .commit;
+    let last_index = cluster
+        .raft_local_state(region.get_id(), nodes[2])
+        .last_index;
+    assert_eq!(commit_index, last_index);
+
+    // Makes the group lose its quorum.
+    cluster.stop_node(nodes[0]);
+    cluster.stop_node(nodes[1]);
+    // Stop the learner to prevent the force leader to replicate logs to it.
+    cluster.stop_node(nodes[3]);
+
+    let put = new_put_cmd(b"k2", b"v2");
+    let req = new_request(
+        region.get_id(),
+        region.get_region_epoch().clone(),
+        vec![put],
+        true,
+    );
+    // marjority is lost, can't propose command successfully.
+    cluster
+        .call_command_on_leader(req, Duration::from_millis(10))
+        .unwrap_err();
+
+    let commit_index = cluster
+        .raft_local_state(region.get_id(), nodes[2])
+        .get_hard_state()
+        .commit;
+    let last_index = cluster
+        .raft_local_state(region.get_id(), nodes[2])
+        .last_index;
+    more_asserts::assert_gt!(last_index, commit_index);
+
+    // restart to clean lease
+    cluster.stop_node(nodes[2]);
+    cluster.run_node(nodes[2]).unwrap();
+    // Does not mark the learner as failed, while the leader can still forward the
+    // commit index.
+    cluster.must_enter_force_leader(region.get_id(), nodes[2], vec![nodes[1], nodes[0]]);
+
+    // The commit index should be forwarded.
+    let new_commit_index = cluster
+        .raft_local_state(region.get_id(), nodes[2])
+        .get_hard_state()
+        .commit;
+    more_asserts::assert_gt!(new_commit_index, last_index);
 }

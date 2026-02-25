@@ -183,9 +183,9 @@ impl RowSlice<'_> {
     #[inline]
     fn id_valid(&self, id: i64) -> bool {
         let upper: i64 = if self.is_big() {
-            i64::from(u32::max_value())
+            i64::from(u32::MAX)
         } else {
-            i64::from(u8::max_value())
+            i64::from(u8::MAX)
         };
         id > 0 && id <= upper
     }
@@ -233,7 +233,11 @@ impl RowSlice<'_> {
             RowSlice::Big {
                 offsets, values, ..
             } => {
-                let last_slice_idx = offsets.get(non_null_col_num - 1).unwrap() as usize;
+                let last_slice_idx = if non_null_col_num == 0 {
+                    0
+                } else {
+                    offsets.get(non_null_col_num - 1).unwrap() as usize
+                };
                 let slice = values.slice;
                 *values = LeBytes::new(&slice[..last_slice_idx]);
                 &slice[last_slice_idx..]
@@ -241,7 +245,11 @@ impl RowSlice<'_> {
             RowSlice::Small {
                 offsets, values, ..
             } => {
-                let last_slice_idx = offsets.get(non_null_col_num - 1).unwrap() as usize;
+                let last_slice_idx = if non_null_col_num == 0 {
+                    0
+                } else {
+                    offsets.get(non_null_col_num - 1).unwrap() as usize
+                };
                 let slice = values.slice;
                 *values = LeBytes::new(&slice[..last_slice_idx]);
                 &slice[last_slice_idx..]
@@ -351,19 +359,17 @@ impl<'a, T: PrimInt> LeBytes<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::u16;
-
     use codec::prelude::NumberEncoder;
     use tipb::FieldType;
 
     use super::{
         super::encoder_for_test::{Column, RowEncoder},
-        read_le_bytes, RowSlice,
+        RowSlice, read_le_bytes,
     };
     use crate::{
+        FieldTypeTp,
         codec::data_type::{Duration, ScalarValue},
         expr::EvalContext,
-        FieldTypeTp,
     };
 
     #[test]
@@ -415,7 +421,7 @@ mod tests {
         assert_eq!(big_row.search_in_non_null_ids(333).unwrap(), None);
         assert_eq!(
             big_row
-                .search_in_non_null_ids(i64::from(u32::max_value()) + 2)
+                .search_in_non_null_ids(i64::from(u32::MAX) + 2)
                 .unwrap(),
             None
         );
@@ -430,8 +436,7 @@ mod tests {
         assert_eq!(row.search_in_non_null_ids(33).unwrap(), None);
         assert_eq!(row.search_in_non_null_ids(35).unwrap(), None);
         assert_eq!(
-            row.search_in_non_null_ids(i64::from(u8::max_value()) + 2)
-                .unwrap(),
+            row.search_in_non_null_ids(i64::from(u8::MAX) + 2).unwrap(),
             None
         );
         assert_eq!(Some((0, 2)), row.search_in_non_null_ids(1).unwrap());

@@ -11,7 +11,8 @@ use std::{
 
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
-use futures::channel::oneshot::{channel, Receiver, Sender};
+use fail::fail_point;
+use futures::channel::oneshot::{Receiver, Sender, channel};
 use grpcio::Environment;
 use kvproto::{kvrpcpb::LeaderInfo, metapb::Region, raft_cmdpb::AdminCmdType};
 use online_config::{self, ConfigChange, ConfigManager, OnlineConfig};
@@ -26,8 +27,9 @@ use raftstore::{
         },
     },
 };
+use rand::Rng;
 use security::SecurityManager;
-use tikv::config::ResolvedTsConfig;
+use tikv::{config::ResolvedTsConfig, storage::txn::txn_status_cache::TxnStatusCache};
 use tikv_util::{
     memory::{HeapSize, MemoryQuota},
     warn,
@@ -37,17 +39,16 @@ use tokio::sync::{Notify, Semaphore};
 use txn_types::{Key, TimeStamp};
 
 use crate::{
-    advance::{AdvanceTsWorker, LeadershipResolver, DEFAULT_CHECK_LEADER_TIMEOUT_DURATION},
+    Error, ON_DROP_WARN_HEAP_SIZE, Result, TsSource, TxnLocks,
+    advance::{AdvanceTsWorker, DEFAULT_CHECK_LEADER_TIMEOUT_DURATION, LeadershipResolver},
     cmd::{ChangeLog, ChangeRow},
     metrics::*,
     resolver::{LastAttempt, Resolver},
     scanner::{ScanEntries, ScanTask, ScannerPool},
-    Error, Result, TsSource, ON_DROP_WARN_HEAP_SIZE,
 };
 
-/// grace period for identifying identifying slow resolved-ts and safe-ts.
+/// grace period for identifying slow resolved-ts and safe-ts.
 const SLOW_LOG_GRACE_PERIOD_MS: u64 = 1000;
-const MEMORY_QUOTA_EXCEEDED_BACKOFF: Duration = Duration::from_secs(30);
 
 enum ResolverStatus {
     Pending {
@@ -77,7 +78,7 @@ impl Drop for ResolverStatus {
         let mut bytes = 0;
         let num_locks = locks.len();
         for lock in locks {
-            bytes += lock.heap_size();
+            bytes += lock.approximate_heap_size();
         }
         if bytes > ON_DROP_WARN_HEAP_SIZE {
             warn!("drop huge ResolverStatus";
@@ -103,10 +104,12 @@ impl ResolverStatus {
         };
         // Check if adding a new lock or unlock will exceed the memory
         // quota.
-        memory_quota.alloc(lock.heap_size()).map_err(|e| {
-            fail::fail_point!("resolved_ts_on_pending_locks_memory_quota_exceeded");
-            Error::MemoryQuotaExceeded(e)
-        })?;
+        memory_quota
+            .alloc(lock.approximate_heap_size())
+            .map_err(|e| {
+                fail::fail_point!("resolved_ts_on_pending_locks_memory_quota_exceeded");
+                Error::MemoryQuotaExceeded(e)
+            })?;
         locks.push(lock);
         Ok(())
     }
@@ -142,9 +145,8 @@ impl ResolverStatus {
         let locks = std::mem::take(locks);
         (
             *tracked_index,
-            locks.into_iter().map(|lock| {
-                memory_quota.free(lock.heap_size());
-                lock
+            locks.into_iter().inspect(|lock| {
+                memory_quota.free(lock.approximate_heap_size());
             }),
         )
     }
@@ -155,6 +157,7 @@ enum PendingLock {
     Track {
         key: Key,
         start_ts: TimeStamp,
+        generation: u64,
     },
     Untrack {
         key: Key,
@@ -164,10 +167,10 @@ enum PendingLock {
 }
 
 impl HeapSize for PendingLock {
-    fn heap_size(&self) -> usize {
+    fn approximate_heap_size(&self) -> usize {
         match self {
             PendingLock::Track { key, .. } | PendingLock::Untrack { key, .. } => {
-                key.as_encoded().heap_size()
+                key.as_encoded().approximate_heap_size()
             }
         }
     }
@@ -191,9 +194,15 @@ impl ObserveRegion {
         rrp: Arc<RegionReadProgress>,
         memory_quota: Arc<MemoryQuota>,
         cancelled: Sender<()>,
+        txn_status_cache: Arc<TxnStatusCache>,
     ) -> Self {
         ObserveRegion {
-            resolver: Resolver::with_read_progress(meta.id, Some(rrp), memory_quota.clone()),
+            resolver: Resolver::with_read_progress(
+                meta.id,
+                Some(rrp),
+                memory_quota.clone(),
+                txn_status_cache,
+            ),
             meta,
             handle: ObserveHandle::new(),
             resolver_status: ResolverStatus::Pending {
@@ -233,9 +242,15 @@ impl ObserveRegion {
                     ChangeLog::Rows { rows, index } => {
                         for row in rows {
                             let lock = match row {
-                                ChangeRow::Prewrite { key, start_ts, .. } => PendingLock::Track {
+                                ChangeRow::Prewrite {
+                                    key,
+                                    start_ts,
+                                    generation,
+                                    ..
+                                } => PendingLock::Track {
                                     key: key.clone(),
                                     start_ts: *start_ts,
+                                    generation: *generation,
                                 },
                                 ChangeRow::Commit {
                                     key,
@@ -294,17 +309,23 @@ impl ObserveRegion {
                     ChangeLog::Rows { rows, index } => {
                         for row in rows {
                             match row {
-                                ChangeRow::Prewrite { key, start_ts, .. } => {
+                                ChangeRow::Prewrite {
+                                    key,
+                                    start_ts,
+                                    generation,
+                                    ..
+                                } => {
                                     self.resolver.track_lock(
                                         *start_ts,
                                         key.to_raw().unwrap(),
                                         Some(*index),
+                                        *generation,
                                     )?;
                                 }
                                 ChangeRow::Commit { key, .. } => self
                                     .resolver
                                     .untrack_lock(&key.to_raw().unwrap(), Some(*index)),
-                                // One pc command do not contains any lock, so just skip it
+                                // One pc command do not contain any lock, so just skip it
                                 ChangeRow::OnePc { .. } => {
                                     self.resolver.update_tracked_index(*index);
                                 }
@@ -328,8 +349,12 @@ impl ObserveRegion {
                     panic!("region {:?} resolver has ready", self.meta.id)
                 }
                 for (key, lock) in locks {
-                    self.resolver
-                        .track_lock(lock.ts, key.to_raw().unwrap(), Some(apply_index))?;
+                    self.resolver.track_lock(
+                        lock.ts,
+                        key.to_raw().unwrap(),
+                        Some(apply_index),
+                        lock.generation,
+                    )?;
                 }
             }
             ScanEntries::None => {
@@ -341,11 +366,16 @@ impl ObserveRegion {
                     resolver_status.drain_pending_locks(self.meta.id);
                 for lock in pending_locks {
                     match lock {
-                        PendingLock::Track { key, start_ts } => {
+                        PendingLock::Track {
+                            key,
+                            start_ts,
+                            generation,
+                        } => {
                             self.resolver.track_lock(
                                 start_ts,
                                 key.to_raw().unwrap(),
                                 Some(pending_tracked_index),
+                                generation,
                             )?;
                         }
                         PendingLock::Untrack { key, .. } => self
@@ -378,6 +408,8 @@ pub struct Endpoint<T, E: KvEngine, S> {
     scan_concurrency_semaphore: Arc<Semaphore>,
     scheduler: Scheduler<Task>,
     advance_worker: AdvanceTsWorker,
+    txn_status_cache: Arc<TxnStatusCache>,
+    last_active_memory_quota_check: std::time::Instant,
     _phantom: PhantomData<(T, E)>,
 }
 
@@ -388,13 +420,14 @@ where
     E: KvEngine,
     S: StoreRegionMeta,
 {
-    fn is_leader(&self, store_id: Option<u64>, leader_store_id: Option<u64>) -> bool {
-        store_id.is_some() && store_id == leader_store_id
-    }
-
     fn collect_stats(&mut self) -> Stats {
+        fn is_leader(store_id: Option<u64>, leader_store_id: Option<u64>) -> bool {
+            store_id.is_some() && store_id == leader_store_id
+        }
+
         let store_id = self.get_or_init_store_id();
         let mut stats = Stats::default();
+        let now = self.approximate_now_tso();
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
                 let (leader_info, leader_store_id) = read_progress.dump_leader_info();
@@ -407,16 +440,19 @@ where
                     continue;
                 }
 
-                if self.is_leader(store_id, leader_store_id) {
+                if is_leader(store_id, leader_store_id) {
                     // leader resolved-ts
                     if resolved_ts < stats.min_leader_resolved_ts.resolved_ts {
-                        let resolver = self.regions.get(region_id).map(|x| &x.resolver);
+                        let resolver = self.regions.get_mut(region_id).map(|x| &mut x.resolver);
                         stats
                             .min_leader_resolved_ts
                             .set(*region_id, resolver, &core, &leader_info);
                     }
                 } else {
                     // follower safe-ts
+                    RTS_MIN_FOLLOWER_SAFE_TS_GAP_HISTOGRAM
+                        .observe(now.saturating_sub(TimeStamp::from(safe_ts).physical()) as f64);
+
                     if safe_ts > 0 && safe_ts < stats.min_follower_safe_ts.safe_ts {
                         stats.min_follower_safe_ts.set(*region_id, &core);
                     }
@@ -440,11 +476,11 @@ where
             match &observed_region.resolver_status {
                 ResolverStatus::Pending { locks, .. } => {
                     for l in locks {
-                        stats.heap_size += l.heap_size() as i64;
+                        stats.heap_size += l.approximate_heap_size() as i64;
                     }
                     stats.unresolved_count += 1;
                 }
-                ResolverStatus::Ready { .. } => {
+                ResolverStatus::Ready => {
                     stats.heap_size += observed_region.resolver.approximate_heap_bytes() as i64;
                     stats.resolved_count += 1;
                 }
@@ -653,17 +689,15 @@ where
         concurrency_manager: ConcurrencyManager,
         env: Arc<Environment>,
         security_mgr: Arc<SecurityManager>,
+        txn_status_cache: Arc<TxnStatusCache>,
+        memory_quota: Arc<MemoryQuota>,
     ) -> Self {
         let (region_read_progress, store_id) = {
             let meta = store_meta.lock().unwrap();
             (meta.region_read_progress().clone(), meta.store_id())
         };
-        let advance_worker = AdvanceTsWorker::new(
-            cfg.advance_ts_interval.0,
-            pd_client.clone(),
-            scheduler.clone(),
-            concurrency_manager,
-        );
+        let advance_worker =
+            AdvanceTsWorker::new(pd_client.clone(), scheduler.clone(), concurrency_manager);
         let scanner_pool = ScannerPool::new(cfg.scan_lock_pool_size, cdc_handle);
         let store_resolver_gc_interval = Duration::from_secs(60);
         let leader_resolver = LeadershipResolver::new(
@@ -678,7 +712,7 @@ where
         let ep = Self {
             store_id: Some(store_id),
             cfg: cfg.clone(),
-            memory_quota: Arc::new(MemoryQuota::new(cfg.memory_quota.0 as usize)),
+            memory_quota,
             advance_notify: Arc::new(Notify::new()),
             scheduler,
             store_meta,
@@ -687,6 +721,8 @@ where
             scanner_pool,
             scan_concurrency_semaphore,
             regions: HashMap::default(),
+            txn_status_cache,
+            last_active_memory_quota_check: std::time::Instant::now(),
             _phantom: PhantomData,
         };
         ep.handle_advance_resolved_ts(leader_resolver);
@@ -695,18 +731,19 @@ where
 
     fn register_region(&mut self, region: Region, backoff: Option<Duration>) {
         let region_id = region.get_id();
-        assert!(self.regions.get(&region_id).is_none());
+        assert!(!self.regions.contains_key(&region_id));
         let Some(read_progress) = self.region_read_progress.get(&region_id) else {
             warn!("try register nonexistent region"; "region" => ?region);
             return;
         };
-        info!("register observe region"; "region" => ?region);
+        info!("register observe region"; "region" => ?region, "backoff" => ?backoff);
         let (cancelled_tx, cancelled_rx) = channel();
         let observe_region = ObserveRegion::new(
             region.clone(),
             read_progress,
             self.memory_quota.clone(),
             cancelled_tx,
+            self.txn_status_cache.clone(),
         );
         let observe_handle = observe_region.handle.clone();
         observe_region
@@ -817,7 +854,7 @@ where
         &mut self,
         region_id: u64,
         observe_id: ObserveId,
-        cause: Error,
+        cause: Option<&str>,
         backoff: Option<Duration>,
     ) {
         if let Some(observe_region) = self.regions.get(&region_id) {
@@ -830,7 +867,7 @@ where
                 "register region again";
                 "region_id" => region_id,
                 "observe_id" => ?observe_id,
-                "cause" => ?cause
+                "cause" => ?cause,
             );
             self.deregister_region(region_id);
             let region;
@@ -842,6 +879,38 @@ where
                 }
             }
             self.register_region(region, backoff);
+        }
+    }
+
+    // Deregister all regions and try to register them again.
+    //
+    // This is useful when memory quota is exceeded, it means the endpoint is
+    // too busy to handle incoming change logs, or incoming change logs are too
+    // large to be handled, so we re-register all regions to drop all pending
+    // locks and change logs to free memory.
+    fn re_register_all_regions(&mut self, cause: Option<&str>) {
+        let region_ids: Vec<u64> = self.regions.keys().copied().collect();
+        warn!(
+            "resolved ts re-register all regions";
+            "region_count" => region_ids.len(),
+            "cause" => ?cause,
+        );
+        for region_id in region_ids {
+            if let Some(observe_region) = self.regions.get_mut(&region_id) {
+                // Random backoff to avoid all regions re-registering at the same time.
+                let backoff = self.cfg.memory_quota_exceeded_backoff_duration.0
+                    + Duration::from_millis(
+                        rand::thread_rng().gen_range(
+                            0..self
+                                .cfg
+                                .memory_quota_exceeded_backoff_duration
+                                .0
+                                .as_millis() as u64,
+                        ),
+                    );
+                let observe_id = observe_region.handle.id;
+                self.re_register_region(region_id, observe_id, cause, Some(backoff));
+            }
         }
     }
 
@@ -870,8 +939,10 @@ where
 
     // Tracking or untracking locks with incoming commands that corresponding
     // observe id is valid.
+    #[allow(dropping_references)]
     fn handle_change_log(&mut self, cmd_batch: Vec<CmdBatch>) {
         let size = cmd_batch.iter().map(|b| b.size()).sum::<usize>();
+        self.memory_quota.free(size);
         RTS_CHANNEL_PENDING_CMD_BYTES.sub(size as i64);
         for batch in cmd_batch {
             if batch.is_empty() {
@@ -883,11 +954,20 @@ where
                 if observe_region.handle.id == observe_id {
                     let logs = ChangeLog::encode_change_log(region_id, batch);
                     if let Err(e) = observe_region.track_change_log(&logs) {
-                        let backoff = match e {
-                            Error::MemoryQuotaExceeded(_) => Some(MEMORY_QUOTA_EXCEEDED_BACKOFF),
-                            Error::Other(_) => None,
+                        drop(observe_region);
+                        match e {
+                            cause @ Error::MemoryQuotaExceeded(_) => {
+                                self.re_register_all_regions(Some(&cause.to_string()));
+                            }
+                            cause @ Error::Other(_) => {
+                                self.re_register_region(
+                                    region_id,
+                                    observe_id,
+                                    Some(&cause.to_string()),
+                                    None,
+                                );
+                            }
                         };
-                        self.re_register_region(region_id, observe_id, e, backoff);
                     }
                 } else {
                     debug!("resolved ts CmdBatch discarded";
@@ -898,6 +978,7 @@ where
                 }
             }
         }
+        fail_point!("resolved_ts_after_handle_change_log");
     }
 
     fn handle_scan_locks(
@@ -922,8 +1003,7 @@ where
                 "observe_id" => ?observe_id);
         }
         if let Some(e) = memory_quota_exceeded {
-            let backoff = Some(MEMORY_QUOTA_EXCEEDED_BACKOFF);
-            self.re_register_region(region_id, observe_id, e, backoff);
+            self.re_register_all_regions(Some(&e.to_string()));
         }
     }
 
@@ -1111,6 +1191,16 @@ where
 
     fn run(&mut self, task: Task) {
         debug!("run resolved-ts task"; "task" => ?task);
+        if self.last_active_memory_quota_check.elapsed()
+            >= self.cfg.memory_quota_active_check_interval.0
+        {
+            self.last_active_memory_quota_check = std::time::Instant::now();
+            // Check whether memory quota is exceeded actively.
+            if let Err(e) = self.memory_quota.alloc(0) {
+                self.re_register_all_regions(Some(&e.to_string()));
+            }
+        }
+
         match task {
             Task::RegionDestroyed(region) => self.region_destroyed(region),
             Task::RegionUpdated(region) => self.region_updated(region),
@@ -1120,7 +1210,7 @@ where
                 region_id,
                 observe_id,
                 cause,
-            } => self.re_register_region(region_id, observe_id, cause, None),
+            } => self.re_register_region(region_id, observe_id, Some(&cause.to_string()), None),
             Task::AdvanceResolvedTs { leader_resolver } => {
                 self.handle_advance_resolved_ts(leader_resolver)
             }
@@ -1129,7 +1219,9 @@ where
                 ts,
                 ts_source,
             } => self.handle_resolved_ts_advanced(regions, ts, ts_source),
-            Task::ChangeLog { cmd_batch } => self.handle_change_log(cmd_batch),
+            Task::ChangeLog { cmd_batch } => {
+                self.handle_change_log(cmd_batch);
+            }
             Task::ScanLocks {
                 region_id,
                 observe_id,
@@ -1186,7 +1278,7 @@ struct LeaderStats {
     last_resolve_attempt: Option<LastAttempt>,
     applied_index: u64,
     // min lock in LOCK CF
-    min_lock: Option<(TimeStamp, Key)>,
+    min_lock: Option<(TimeStamp, TxnLocks)>,
     lock_num: Option<u64>,
     txn_num: Option<u64>,
 }
@@ -1211,7 +1303,7 @@ impl LeaderStats {
     fn set(
         &mut self,
         region_id: u64,
-        resolver: Option<&Resolver>,
+        mut resolver: Option<&mut Resolver>,
         region_read_progress: &MutexGuard<'_, RegionReadProgressCore>,
         leader_info: &LeaderInfo,
     ) {
@@ -1222,21 +1314,13 @@ impl LeaderStats {
             duration_to_last_update_ms: region_read_progress
                 .last_instant_of_update_ts()
                 .map(|i| i.saturating_elapsed().as_millis() as u64),
-            last_resolve_attempt: resolver.and_then(|r| r.last_attempt.clone()),
-            min_lock: resolver.and_then(|r| {
-                r.oldest_transaction().map(|(ts, keys)| {
-                    (
-                        *ts,
-                        keys.iter()
-                            .next()
-                            .map(|k| Key::from_encoded_slice(k.as_ref()))
-                            .unwrap_or_else(|| Key::from_encoded_slice("no_keys_found".as_ref())),
-                    )
-                })
-            }),
+            last_resolve_attempt: resolver.as_mut().and_then(|r| r.take_last_attempt()),
+            min_lock: resolver
+                .as_ref()
+                .and_then(|r| r.oldest_transaction().map(|(t, tk)| (t, tk.clone()))),
             applied_index: region_read_progress.applied_index(),
-            lock_num: resolver.map(|r| r.num_locks()),
-            txn_num: resolver.map(|r| r.num_transactions()),
+            lock_num: resolver.as_ref().map(|r| r.num_locks()),
+            txn_num: resolver.as_ref().map(|r| r.num_transactions()),
         };
     }
 }

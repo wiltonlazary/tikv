@@ -4,8 +4,10 @@ use std::mem;
 
 use collections::HashSet;
 use engine_traits::{KvEngine, RaftEngine};
-use raft::{eraftpb::MessageType, StateRole, Storage};
-use raftstore::store::{util::LeaseState, ForceLeaderState, UnsafeRecoveryForceLeaderSyncer};
+use raft::{StateRole, Storage, eraftpb::MessageType};
+use raftstore::store::{
+    ForceLeaderState, UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryState, util::LeaseState,
+};
 use slog::{info, warn};
 use tikv_util::time::Instant as TiInstant;
 
@@ -30,6 +32,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 *self.force_leader_mut() = None;
             }
             None => {}
+            Some(ForceLeaderState::WaitForceCompact { .. }) => unreachable!(),
         }
 
         if !self.storage().is_initialized() {
@@ -182,9 +185,19 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         self.set_has_ready();
     }
 
-    pub fn on_exit_force_leader<T>(&mut self, ctx: &StoreContext<EK, ER, T>) {
+    // TODO: add exit force leader check tick for raftstore v2
+    pub fn on_exit_force_leader<T>(&mut self, ctx: &StoreContext<EK, ER, T>, force: bool) {
         if !self.has_force_leader() {
             return;
+        }
+
+        if !force {
+            if let Some(UnsafeRecoveryState::Failed) = self.unsafe_recovery_state() {
+                // Skip force leader if the plan failed, so wait for the next retry of plan with
+                // force leader state holding
+                info!(self.logger, "skip exiting force leader state");
+                return;
+            }
         }
 
         info!(self.logger, "exit force leader state");
@@ -255,7 +268,8 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 return;
             }
             Some(ForceLeaderState::PreForceLeader { failed_stores, .. }) => failed_stores,
-            Some(ForceLeaderState::WaitTicks { .. }) => unreachable!(),
+            Some(ForceLeaderState::WaitTicks { .. })
+            | Some(ForceLeaderState::WaitForceCompact { .. }) => unreachable!(),
         };
 
         if self.raft_group().raft.election_elapsed + 1 < ctx.cfg.raft_election_timeout_ticks {

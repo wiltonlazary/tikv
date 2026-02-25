@@ -1,56 +1,67 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     convert::identity,
-    future::Future,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use engine_traits::{CompactExt, MiscExt, CF_DEFAULT, CF_WRITE};
-use file_system::{set_io_type, IoType};
-use futures::{sink::SinkExt, stream::TryStreamExt, FutureExt, TryFutureExt};
+use engine_traits::{CF_DEFAULT, CF_WRITE, CompactExt, ManualCompactionOptions};
+use file_system::{IoType, set_io_type};
+use futures::{FutureExt, TryFutureExt, sink::SinkExt, stream::TryStreamExt};
 use grpcio::{
-    ClientStreamingSink, RequestStream, RpcContext, ServerStreamingSink, UnarySink, WriteFlags,
+    ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink,
+    UnarySink, WriteFlags,
 };
 use kvproto::{
     encryptionpb::EncryptionMethod,
-    errorpb,
     import_sstpb::{
-        Error as ImportPbError, ImportSst, Range, RawWriteRequest_oneof_chunk as RawChunk, SstMeta,
-        SwitchMode, WriteRequest_oneof_chunk as Chunk, *,
+        Error as ImportPbError, ImportSst, Range, RawWriteRequest_oneof_chunk as RawChunk,
+        SuspendImportRpcRequest, SuspendImportRpcResponse, SwitchMode,
+        WriteRequest_oneof_chunk as Chunk, *,
     },
-    kvrpcpb::Context,
+    metapb::RegionEpoch,
+};
+use raftstore::{
+    RegionInfoAccessor,
+    coprocessor::{RegionInfo, RegionInfoProvider},
+    store::{ForcePartitionRangeManager, util::is_epoch_stale},
 };
 use raftstore_v2::StoreMeta;
-use resource_control::{with_resource_limiter, ResourceGroupManager};
+use rand::Rng;
+use resource_control::{ResourceGroupManager, with_resource_limiter};
 use sst_importer::{
-    error_inc, metrics::*, sst_importer::DownloadExt, sst_meta_to_path, Config, ConfigManager,
-    Error, Result, SstImporter,
+    Config, ConfigManager, Error, Result, SstImporter, error_inc, metrics::*,
+    sst_importer::DownloadExt,
 };
-use tikv_kv::{
-    Engine, LocalTablets, Modify, SnapContext, Snapshot, SnapshotExt, WriteData, WriteEvent,
-};
+use tikv_kv::{Engine, LocalTablets, Modify, WriteData};
 use tikv_util::{
-    config::ReadableSize,
-    future::create_stream_with_buffer,
-    sys::thread::ThreadBuildWrapper,
-    time::{Instant, Limiter},
     HandyRwLock,
+    config::ReadableSize,
+    future::{create_stream_with_buffer, paired_future_callback},
+    resizable_threadpool::{DeamonRuntimeHandle, ResizableRuntime},
+    sys::{
+        SysQuota,
+        disk::{DiskUsage, get_disk_status},
+        get_global_memory_usage,
+    },
+    thread_name_prefix::IMPORT_SST_WORKER_THREAD,
+    time::{Instant, Limiter},
 };
-use tokio::{runtime::Runtime, time::sleep};
+use tokio::time::sleep;
 use txn_types::{Key, WriteRef, WriteType};
 
 use super::{
-    make_rpc_error,
-    raft_writer::{self, wait_write},
+    ingest::{IngestLatch, SuspendDeadline, async_snapshot, ingest},
+    make_rpc_error, pb_error_inc, raft_writer,
 };
 use crate::{
     import::duplicate_detect::DuplicateDetector,
-    server::CONFIG_ROCKSDB_GAUGE,
+    send_rpc_response,
+    server::CONFIG_ROCKSDB_CF_GAUGE,
     storage::{self, errors::extract_region_error_from_error},
+    tikv_util::sys::thread::ThreadBuildWrapper,
 };
 
 /// The concurrency of sending raft request for every `apply` requests.
@@ -65,13 +76,12 @@ const REQUEST_WRITE_CONCURRENCY: usize = 16;
 /// Generally, a field (and a embedded message) would introduce some extra
 /// bytes. In detail, they are:
 /// - 2 bytes for the request type (Tag+Value).
-/// - 2 bytes for every string or bytes field (Tag+Length), they are:
-/// . + the key field
-/// . + the value field
-/// . + the CF field (None for CF_DEFAULT)
+/// - 2 bytes for every string or bytes field (Tag+Length), they are: .  + the
+///   key field .  + the value field .  + the CF field (None for CF_DEFAULT)
 /// - 2 bytes for the embedded message field `PutRequest` (Tag+Length).
 /// - 2 bytes for the request itself (which would be embedded into a
 ///   [`RaftCmdRequest`].)
+///
 /// In fact, the length field is encoded by varint, which may grow when the
 /// content length is greater than 128, however when the length is greater than
 /// 128, the extra 1~4 bytes can be ignored.
@@ -80,6 +90,72 @@ const WIRE_EXTRA_BYTES: usize = 12;
 /// [`raft_writer::ThrottledTlsEngineWriter`]. There aren't too many items held
 /// in the writer. So we can run the GC less frequently.
 const WRITER_GC_INTERVAL: Duration = Duration::from_secs(300);
+/// The max time of suspending requests.
+/// This may save us from some client sending insane value to the server.
+const SUSPEND_REQUEST_MAX_SECS: u64 = // 6h
+    6 * 60 * 60;
+
+const REJECT_SERVE_MEMORY_USAGE: u64 = 1024 * 1024 * 1024; //1G
+// consider block cache and raft store. the memory usage will be
+const HIGH_IMPORT_MEMORY_WATER_RATIO: f64 = 0.95;
+
+// the default TTL seconds of force partition range.
+// the TTL is to ensure all force partition ranges can be
+// cleaned up eventually.
+const DEFAULT_FORCE_PARTITION_RANGE_TTL_SECONDS: u64 = 3600;
+
+/// Check if the system has enough resources for import tasks
+async fn check_import_resources(mem_limit: u64) -> Result<()> {
+    #[cfg(feature = "failpoints")]
+    let mem_limit = (|| {
+        fail_point!("mock_memory_limit", |t| {
+            t.unwrap().parse::<u64>().unwrap()
+        });
+        mem_limit
+    })();
+    #[cfg(not(feature = "failpoints"))]
+    let mem_limit = mem_limit;
+
+    // these error(memory or disk) cannot be recover at a short time,
+    // in case client retry immediately, sleep for a while
+    async fn sleep_with_jitter() {
+        let jitter = rand::thread_rng().gen_range(1000, 2000);
+        tokio::time::sleep(Duration::from_millis(jitter)).await;
+    }
+    // Check disk space first
+    if get_disk_status(0) != DiskUsage::Normal {
+        sleep_with_jitter().await;
+        return Err(Error::DiskSpaceNotEnough);
+    }
+
+    let usage = get_global_memory_usage();
+    if mem_limit == 0 || mem_limit < usage {
+        // make it through when cannot get correct memory
+        warn!(
+            "Memory limit isn't correct. skip next check, limit is {} bytes, usage is {} bytes",
+            mem_limit, usage
+        );
+        return Ok(());
+    }
+
+    let available_memory = mem_limit - usage;
+    let min_required_memory = std::cmp::min(
+        REJECT_SERVE_MEMORY_USAGE,
+        ((1.0 - HIGH_IMPORT_MEMORY_WATER_RATIO) * mem_limit as f64) as u64,
+    );
+
+    // Reject ONLY if BOTH:
+    // - Available memory is below REJECT_SERVE_MEMORY_USAGE
+    // - Memory usage ratio is 95%+
+    if available_memory < min_required_memory {
+        sleep_with_jitter().await;
+        return Err(Error::ResourceNotEnough(format!(
+            "Memory usage too high, usage: {} bytes, mem limit {} bytes",
+            usage, mem_limit
+        )));
+    }
+    Ok(())
+}
 
 fn transfer_error(err: storage::Error) -> ImportPbError {
     let mut e = ImportPbError::default();
@@ -110,17 +186,28 @@ pub struct ImportSstService<E: Engine> {
     cfg: ConfigManager,
     tablets: LocalTablets<E::Local>,
     engine: E,
-    threads: Arc<Runtime>,
-    importer: Arc<SstImporter>,
+    threads: DeamonRuntimeHandle,
+    // threads_ref is for safely cleanning
+    #[allow(dead_code)]
+    threads_ref: Arc<Mutex<ResizableRuntime>>,
+    importer: Arc<SstImporter<E::Local>>,
     limiter: Limiter,
-    task_slots: Arc<Mutex<HashSet<PathBuf>>>,
+    ingest_latch: Arc<IngestLatch>,
+    ingest_admission_guard: Arc<Mutex<()>>,
     raft_entry_max_size: ReadableSize,
+    region_info_accessor: Arc<RegionInfoAccessor>,
 
     writer: raft_writer::ThrottledTlsEngineWriter,
 
     // it's some iff multi-rocksdb is enabled
     store_meta: Option<Arc<Mutex<StoreMeta<E::Local>>>>,
     resource_manager: Option<Arc<ResourceGroupManager>>,
+
+    // When less than now, don't accept any requests.
+    suspend: Arc<SuspendDeadline>,
+
+    mem_limit: u64,
+    force_partition_range_mgr: ForcePartitionRangeManager,
 }
 
 struct RequestCollector {
@@ -165,8 +252,8 @@ impl RequestCollector {
     }
 
     fn accept_kv(&mut self, cf: &str, is_delete: bool, k: Vec<u8>, v: Vec<u8>) {
-        debug!("Accepting KV."; "cf" => %cf, 
-            "key" => %log_wrappers::Value::key(&k), 
+        debug!("Accepting KV."; "cf" => %cf,
+            "key" => %log_wrappers::Value::key(&k),
             "value" => %log_wrappers::Value::key(&v));
         // Need to skip the empty key/value that could break the transaction or cause
         // data corruption. see details at https://github.com/pingcap/tiflow/issues/5468.
@@ -303,59 +390,80 @@ impl<E: Engine> ImportSstService<E> {
         raft_entry_max_size: ReadableSize,
         engine: E,
         tablets: LocalTablets<E::Local>,
-        importer: Arc<SstImporter>,
+        importer: Arc<SstImporter<E::Local>>,
         store_meta: Option<Arc<Mutex<StoreMeta<E::Local>>>>,
         resource_manager: Option<Arc<ResourceGroupManager>>,
+        region_info_accessor: Arc<RegionInfoAccessor>,
+        force_partition_range_mgr: ForcePartitionRangeManager,
     ) -> Self {
-        let props = tikv_util::thread_group::current_properties();
-        let eng = Mutex::new(engine.clone());
-        let threads = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(cfg.num_threads)
-            .enable_all()
-            .thread_name("sst-importer")
-            .with_sys_and_custom_hooks(
-                move || {
-                    tikv_util::thread_group::set_properties(props.clone());
+        let eng = Arc::new(Mutex::new(engine.clone()));
+        let create_tokio_runtime = move |thread_count: usize, thread_name: &str| {
+            let props = tikv_util::thread_group::current_properties();
+            let eng = eng.clone();
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(thread_count)
+                .enable_all()
+                .thread_name(thread_name)
+                .with_sys_and_custom_hooks(
+                    move || {
+                        tikv_util::thread_group::set_properties(props.clone());
+                        set_io_type(IoType::Import);
+                        tikv_kv::set_tls_engine(eng.lock().unwrap().clone());
+                    },
+                    move || {
+                        // SAFETY: we have set the engine at some lines above with type `E`.
+                        unsafe { tikv_kv::destroy_tls_engine::<E>() };
+                    },
+                )
+                .build()
+        };
 
-                    set_io_type(IoType::Import);
-                    tikv_kv::set_tls_engine(eng.lock().unwrap().clone());
-                },
-                move || {
-                    // SAFETY: we have set the engine at some lines above with type `E`.
-                    unsafe { tikv_kv::destroy_tls_engine::<E>() };
-                },
-            )
-            .build()
-            .unwrap();
+        let threads = ResizableRuntime::new(
+            4,
+            IMPORT_SST_WORKER_THREAD,
+            Box::new(create_tokio_runtime),
+            Box::new(|_| ()),
+        );
+
+        let handle = threads.handle();
+        let threads_clone = Arc::new(Mutex::new(threads));
         if let LocalTablets::Singleton(tablet) = &tablets {
-            importer.start_switch_mode_check(threads.handle(), Some(tablet.clone()));
+            importer.start_switch_mode_check(&handle.clone(), Some(tablet.clone()));
         } else {
-            importer.start_switch_mode_check::<E::Local>(threads.handle(), None);
+            importer.start_switch_mode_check(&handle.clone(), None);
         }
-
         let writer = raft_writer::ThrottledTlsEngineWriter::default();
         let gc_handle = writer.clone();
-        threads.spawn(async move {
+        handle.spawn(async move {
             while gc_handle.try_gc() {
                 tokio::time::sleep(WRITER_GC_INTERVAL).await;
             }
         });
+        let num_threads = cfg.num_threads;
+        let cfg_mgr = ConfigManager::new(cfg, Arc::downgrade(&threads_clone));
+        handle.spawn(Self::tick(importer.clone(), cfg_mgr.clone()));
+        // Drop the initial pool to accept new tasks
+        threads_clone.lock().unwrap().adjust_with(num_threads);
 
-        let cfg_mgr = ConfigManager::new(cfg);
-        threads.spawn(Self::tick(importer.clone(), cfg_mgr.clone()));
-
+        let mem_limit = SysQuota::memory_limit_in_bytes();
         ImportSstService {
             cfg: cfg_mgr,
             tablets,
-            threads: Arc::new(threads),
+            threads: handle.clone(),
+            threads_ref: threads_clone,
             engine,
             importer,
             limiter: Limiter::new(f64::INFINITY),
-            task_slots: Arc::new(Mutex::new(HashSet::default())),
+            ingest_latch: Arc::default(),
+            ingest_admission_guard: Arc::default(),
             raft_entry_max_size,
+            region_info_accessor,
             writer,
             store_meta,
             resource_manager,
+            suspend: Arc::default(),
+            mem_limit,
+            force_partition_range_mgr,
         }
     }
 
@@ -363,7 +471,7 @@ impl<E: Engine> ImportSstService<E> {
         self.cfg.clone()
     }
 
-    async fn tick(importer: Arc<SstImporter>, cfg: ConfigManager) {
+    async fn tick(importer: Arc<SstImporter<E::Local>>, cfg: ConfigManager) {
         loop {
             sleep(Duration::from_secs(10)).await;
 
@@ -372,176 +480,9 @@ impl<E: Engine> ImportSstService<E> {
         }
     }
 
-    fn acquire_lock(task_slots: &Arc<Mutex<HashSet<PathBuf>>>, meta: &SstMeta) -> Result<bool> {
-        let mut slots = task_slots.lock().unwrap();
-        let p = sst_meta_to_path(meta)?;
-        Ok(slots.insert(p))
-    }
-
-    fn release_lock(task_slots: &Arc<Mutex<HashSet<PathBuf>>>, meta: &SstMeta) -> Result<bool> {
-        let mut slots = task_slots.lock().unwrap();
-        let p = sst_meta_to_path(meta)?;
-        Ok(slots.remove(&p))
-    }
-
-    fn async_snapshot(
-        engine: &mut E,
-        context: &Context,
-    ) -> impl Future<Output = std::result::Result<E::Snap, errorpb::Error>> {
-        let res = engine.async_snapshot(SnapContext {
-            pb_ctx: context,
-            ..Default::default()
-        });
-        async move {
-            res.await.map_err(|e| {
-                let err: storage::Error = e.into();
-                if let Some(e) = extract_region_error_from_error(&err) {
-                    e
-                } else {
-                    let mut e = errorpb::Error::default();
-                    e.set_message(format!("{}", err));
-                    e
-                }
-            })
-        }
-    }
-
-    fn check_write_stall(&self, region_id: u64) -> Option<errorpb::Error> {
-        let tablet = match self.tablets.get(region_id) {
-            Some(tablet) => tablet,
-            None => {
-                let mut errorpb = errorpb::Error::default();
-                errorpb.set_message(format!("region {} not found", region_id));
-                errorpb.mut_region_not_found().set_region_id(region_id);
-                return Some(errorpb);
-            }
-        };
-
-        let reject_error = |region_id: Option<u64>| -> Option<errorpb::Error> {
-            let mut errorpb = errorpb::Error::default();
-            let err = if let Some(id) = region_id {
-                format!("too many sst files are ingesting for region {}", id)
-            } else {
-                "too many sst files are ingesting".to_string()
-            };
-            let mut server_is_busy_err = errorpb::ServerIsBusy::default();
-            server_is_busy_err.set_reason(err.clone());
-            errorpb.set_message(err);
-            errorpb.set_server_is_busy(server_is_busy_err);
-            Some(errorpb)
-        };
-
-        // store_meta being Some means it is v2
-        if let Some(ref store_meta) = self.store_meta {
-            if let Some((region, _)) = store_meta.lock().unwrap().regions.get(&region_id) {
-                if !self.importer.region_in_import_mode(region)
-                    && tablet.ingest_maybe_slowdown_writes(CF_WRITE).expect("cf")
-                {
-                    return reject_error(Some(region_id));
-                }
-            } else {
-                let mut errorpb = errorpb::Error::default();
-                errorpb.set_message(format!("region {} not found", region_id));
-                errorpb.mut_region_not_found().set_region_id(region_id);
-                return Some(errorpb);
-            }
-        } else if self.importer.get_mode() == SwitchMode::Normal
-            && tablet.ingest_maybe_slowdown_writes(CF_WRITE).expect("cf")
-        {
-            match tablet.get_sst_key_ranges(CF_WRITE, 0) {
-                Ok(l0_sst_ranges) => {
-                    warn!(
-                        "sst ingest is too slow";
-                        "sst_ranges" => ?l0_sst_ranges,
-                    );
-                }
-                Err(e) => {
-                    error!("get sst key ranges failed"; "err" => ?e);
-                }
-            }
-            return reject_error(None);
-        }
-
-        None
-    }
-
-    fn ingest_files(
-        &mut self,
-        mut context: Context,
-        label: &'static str,
-        ssts: Vec<SstMeta>,
-    ) -> impl Future<Output = Result<IngestResponse>> {
-        let snapshot_res = Self::async_snapshot(&mut self.engine, &context);
-        let engine = self.engine.clone();
-        let importer = self.importer.clone();
-        async move {
-            // check api version
-            if !importer.as_ref().check_api_version(&ssts)? {
-                return Err(Error::IncompatibleApiVersion);
-            }
-
-            let mut resp = IngestResponse::default();
-            let res = match snapshot_res.await {
-                Ok(snap) => snap,
-                Err(e) => {
-                    pb_error_inc(label, &e);
-                    resp.set_error(e);
-                    return Ok(resp);
-                }
-            };
-
-            fail_point!("import::sst_service::ingest");
-            // Here we shall check whether the file has been ingested before. This operation
-            // must execute after geting a snapshot from raftstore to make sure that the
-            // current leader has applied to current term.
-            for sst in ssts.iter() {
-                if !importer.exist(sst) {
-                    warn!(
-                        "sst [{:?}] not exist. we may retry an operation that has already succeeded",
-                        sst
-                    );
-                    let mut errorpb = errorpb::Error::default();
-                    let err = "The file which would be ingested doest not exist.";
-                    let stale_err = errorpb::StaleCommand::default();
-                    errorpb.set_message(err.to_string());
-                    errorpb.set_stale_command(stale_err);
-                    resp.set_error(errorpb);
-                    return Ok(resp);
-                }
-            }
-            let modifies = ssts
-                .iter()
-                .map(|s| Modify::Ingest(Box::new(s.clone())))
-                .collect();
-            context.set_term(res.ext().get_term().unwrap().into());
-            let region_id = context.get_region_id();
-            let res = engine.async_write(
-                &context,
-                WriteData::from_modifies(modifies),
-                WriteEvent::BASIC_EVENT,
-                None,
-            );
-
-            let mut resp = IngestResponse::default();
-            if let Err(e) = wait_write(res).await {
-                if let Some(e) = extract_region_error_from_error(&e) {
-                    pb_error_inc(label, &e);
-                    resp.set_error(e);
-                } else {
-                    IMPORTER_ERROR_VEC
-                        .with_label_values(&[label, "unknown"])
-                        .inc();
-                    resp.mut_error()
-                        .set_message(format!("[region {}] ingest failed: {:?}", region_id, e));
-                }
-            }
-            Ok(resp)
-        }
-    }
-
-    async fn apply_imp(
+    async fn do_apply(
         mut req: ApplyRequest,
-        importer: Arc<SstImporter>,
+        importer: Arc<SstImporter<E::Local>>,
         writer: raft_writer::ThrottledTlsEngineWriter,
         limiter: Limiter,
         max_raft_size: usize,
@@ -557,10 +498,9 @@ impl<E: Engine> ImportSstService<E> {
             metas.push(req.take_meta());
             rules.push(req.take_rewrite_rule());
         }
-        let ext_storage = importer.wrap_kms(
+        let ext_storage = importer.auto_encrypt_local_file_if_needed(
             importer
                 .external_storage_or_cache(req.get_storage_backend(), req.get_storage_cache_id())?,
-            false,
         );
 
         let mut inflight_futures = VecDeque::new();
@@ -568,11 +508,13 @@ impl<E: Engine> ImportSstService<E> {
         let mut tasks = metas.iter().zip(rules.iter()).peekable();
         while let Some((meta, rule)) = tasks.next() {
             let buff = importer
-                .read_from_kv_file(
+                .download_kv_file(
                     meta,
                     ext_storage.clone(),
                     req.get_storage_backend(),
                     &limiter,
+                    req.cipher_info.clone().take(),
+                    req.master_keys.clone().to_vec(),
                 )
                 .await?;
             if let Some(mut r) = importer.do_apply_kv_file(
@@ -621,6 +563,45 @@ impl<E: Engine> ImportSstService<E> {
     }
 }
 
+fn check_local_region_stale(
+    region_id: u64,
+    epoch: &RegionEpoch,
+    local_region_info: Option<RegionInfo>,
+) -> Result<()> {
+    match local_region_info {
+        Some(local_region_info) => {
+            let local_region_epoch = local_region_info.region.region_epoch.unwrap();
+
+            // when local region epoch is stale, client can retry write later
+            if is_epoch_stale(&local_region_epoch, epoch) {
+                return Err(Error::RequestTooNew(format!(
+                    "request region {} is ahead of local region, local epoch {:?}, request epoch {:?}, please retry write later",
+                    region_id, local_region_epoch, epoch
+                )));
+            }
+            // when local region epoch is ahead, client need to rescan region from PD to get
+            // latest region later
+            if is_epoch_stale(epoch, &local_region_epoch) {
+                return Err(Error::RequestTooOld(format!(
+                    "request region {} is staler than local region, local epoch {:?}, request epoch {:?}",
+                    region_id, local_region_epoch, epoch
+                )));
+            }
+
+            // not match means to rescan
+            Ok(())
+        }
+        None => {
+            // when region not found, we can't tell whether it's stale or ahead, so we just
+            // return the safest case
+            Err(Error::RequestTooOld(format!(
+                "region {} is not found",
+                region_id
+            )))
+        }
+    }
+}
+
 #[macro_export]
 macro_rules! impl_write {
     ($fn:ident, $req_ty:ident, $resp_ty:ident, $chunk_ty:ident, $writer_fn:ident) => {
@@ -632,6 +613,8 @@ macro_rules! impl_write {
         ) {
             let import = self.importer.clone();
             let tablets = self.tablets.clone();
+            let mem_limit = self.mem_limit;
+            let region_info_accessor = self.region_info_accessor.clone();
             let (rx, buf_driver) =
                 create_stream_with_buffer(stream, self.cfg.rl().stream_channel_window);
             let mut rx = rx.map_err(Error::from);
@@ -640,43 +623,82 @@ macro_rules! impl_write {
             let label = stringify!($fn);
             let resource_manager = self.resource_manager.clone();
             let handle_task = async move {
-                let res = async move {
-                    let first_req = rx.try_next().await?;
-                    let (meta, resource_limiter) = match first_req {
+                let (res, rx) = async move {
+                    let first_req = match rx.try_next().await {
+                        Ok(r) => r,
+                        Err(e) => return (Err(e), Some(rx)),
+                    };
+                    let (meta, resource_limiter, txn_source) = match first_req {
                         Some(r) => {
                             let limiter = resource_manager.as_ref().and_then(|m| {
-                                m.get_resource_limiter(
+                                m.get_background_resource_limiter(
                                     r.get_context()
                                         .get_resource_control_context()
                                         .get_resource_group_name(),
                                     r.get_context().get_request_source(),
                                 )
                             });
+                            let txn_source = r.get_context().get_txn_source();
                             match r.chunk {
-                                Some($chunk_ty::Meta(m)) => (m, limiter),
-                                _ => return Err(Error::InvalidChunk),
+                                Some($chunk_ty::Meta(m)) => (m, limiter, txn_source),
+                                _ => return (Err(Error::InvalidChunk), Some(rx)),
                             }
                         }
-                        _ => return Err(Error::InvalidChunk),
+                        _ => return (Err(Error::InvalidChunk), Some(rx)),
                     };
+                    // wait the region epoch on this TiKV to catch up with the epoch
+                    // in request, which comes from PD and represents the majority
+                    // peers' status.
                     let region_id = meta.get_region_id();
+                    let (cb, f) = paired_future_callback();
+                    if let Err(e) = region_info_accessor
+                        .find_region_by_id(region_id, cb)
+                        .map_err(|e| {
+                            // when region not found, we can't tell whether it's stale or ahead, so
+                            // we just return the safest case
+                            Error::RequestTooOld(format!(
+                                "failed to find region {} err {:?}",
+                                region_id, e
+                            ))
+                        })
+                    {
+                        return (Err(e), Some(rx));
+                    };
+                    let res = match f.await {
+                        Ok(r) => r,
+                        Err(e) => return (Err(From::from(e)), Some(rx)),
+                    };
+                    if let Err(e) =
+                        check_local_region_stale(region_id, meta.get_region_epoch(), res)
+                    {
+                        return (Err(e), Some(rx));
+                    };
+
                     let tablet = match tablets.get(region_id) {
                         Some(t) => t,
                         None => {
-                            return Err(Error::Engine(
-                                format!("region {} not found", region_id).into(),
-                            ));
+                            return (
+                                Err(Error::RequestTooOld(format!(
+                                    "region {} not found",
+                                    region_id
+                                ))),
+                                Some(rx),
+                            );
                         }
                     };
+                    if let Err(e) = check_import_resources(mem_limit).await {
+                        warn!("Write failed due to not enough resource {:?}", e);
+                        return (Err(e), Some(rx));
+                    }
 
-                    let writer = match import.$writer_fn(&*tablet, meta) {
+                    let writer = match import.$writer_fn(&*tablet, meta, txn_source) {
                         Ok(w) => w,
                         Err(e) => {
                             error!("build writer failed {:?}", e);
-                            return Err(Error::InvalidChunk);
+                            return (Err(Error::InvalidChunk), Some(rx));
                         }
                     };
-                    let (writer, resource_limiter) = rx
+                    let result = rx
                         .try_fold(
                             (writer, resource_limiter),
                             |(mut writer, limiter), req| async move {
@@ -693,7 +715,11 @@ macro_rules! impl_write {
                                     .map(|w| (w, limiter))
                             },
                         )
-                        .await?;
+                        .await;
+                    let (writer, resource_limiter) = match result {
+                        Ok(r) => r,
+                        Err(e) => return (Err(e), None),
+                    };
 
                     let finish_fn = async {
                         let metas = writer.finish()?;
@@ -702,13 +728,18 @@ macro_rules! impl_write {
                     };
 
                     let metas: Result<_> = with_resource_limiter(finish_fn, resource_limiter).await;
-                    let metas = metas?;
+                    let metas = match metas {
+                        Ok(r) => r,
+                        Err(e) => return (Err(e), None),
+                    };
                     let mut resp = $resp_ty::default();
                     resp.set_metas(metas.into());
-                    Ok(resp)
+                    (Ok(resp), None)
                 }
                 .await;
                 $crate::send_rpc_response!(res, sink, label, timer);
+                // don't drop rx before send response
+                _ = rx;
             };
 
             self.threads.spawn(buf_driver);
@@ -733,60 +764,71 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     // future.
     fn switch_mode(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         mut req: SwitchModeRequest,
         sink: UnarySink<SwitchModeResponse>,
     ) {
         let label = "switch_mode";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
+        let importer = self.importer.clone();
+        let tablets = self.tablets.clone();
 
-        let res = {
-            fn mf(cf: &str, name: &str, v: f64) {
-                CONFIG_ROCKSDB_GAUGE.with_label_values(&[cf, name]).set(v);
-            }
+        let task = async move {
+            let req_mode = req.get_mode();
+            let handle = tokio::task::spawn_blocking(move || {
+                fn mf(cf: &str, name: &str, v: f64) {
+                    CONFIG_ROCKSDB_CF_GAUGE
+                        .with_label_values(&[cf, name])
+                        .set(v);
+                }
 
-            match &self.tablets {
-                LocalTablets::Singleton(tablet) => match req.get_mode() {
-                    SwitchMode::Normal => self.importer.enter_normal_mode(tablet.clone(), mf),
-                    SwitchMode::Import => self.importer.enter_import_mode(tablet.clone(), mf),
-                },
-                LocalTablets::Registry(_) => {
-                    if req.get_mode() == SwitchMode::Import {
-                        if !req.get_ranges().is_empty() {
-                            let ranges = req.take_ranges().to_vec();
-                            self.importer.ranges_enter_import_mode(ranges);
-                            Ok(true)
+                match tablets {
+                    LocalTablets::Singleton(tablet) => match req.get_mode() {
+                        SwitchMode::Normal => importer.enter_normal_mode(tablet, mf),
+                        SwitchMode::Import => importer.enter_import_mode(tablet, mf),
+                    },
+                    LocalTablets::Registry(_) => {
+                        if req.get_mode() == SwitchMode::Import {
+                            if !req.get_ranges().is_empty() {
+                                let ranges = req.take_ranges().to_vec();
+                                importer.ranges_enter_import_mode(ranges);
+                                Ok(true)
+                            } else {
+                                Err(sst_importer::Error::Engine(
+                                    "partitioned-raft-kv only support switch mode with range set"
+                                        .into(),
+                                ))
+                            }
                         } else {
-                            Err(sst_importer::Error::Engine(
-                                "partitioned-raft-kv only support switch mode with range set"
-                                    .into(),
-                            ))
-                        }
-                    } else {
-                        // case SwitchMode::Normal
-                        if !req.get_ranges().is_empty() {
-                            let ranges = req.take_ranges().to_vec();
-                            self.importer.clear_import_mode_regions(ranges);
-                            Ok(true)
-                        } else {
-                            Err(sst_importer::Error::Engine(
-                                "partitioned-raft-kv only support switch mode with range set"
-                                    .into(),
-                            ))
+                            // case SwitchMode::Normal
+                            if !req.get_ranges().is_empty() {
+                                let ranges = req.take_ranges().to_vec();
+                                importer.clear_import_mode_regions(ranges);
+                                Ok(true)
+                            } else {
+                                Err(sst_importer::Error::Engine(
+                                    "partitioned-raft-kv only support switch mode with range set"
+                                        .into(),
+                                ))
+                            }
                         }
                     }
                 }
+            });
+            match handle.await.map_err(|e| Error::Io(e.into())) {
+                Ok(res) => match res {
+                    Ok(_) => info!("switch mode"; "mode" => ?req_mode),
+                    Err(ref e) => error!(%*e; "switch mode failed"; "mode" => ?req_mode,),
+                },
+                Err(ref e) => {
+                    error!(%*e; "joining the background job failed"; "mode" => ?req_mode,)
+                }
             }
-        };
-        match res {
-            Ok(_) => info!("switch mode"; "mode" => ?req.get_mode()),
-            Err(ref e) => error!(%*e; "switch mode failed"; "mode" => ?req.get_mode(),),
-        }
-
-        let task = async move {
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
             crate::send_rpc_response!(Ok(SwitchModeResponse::default()), sink, label, timer);
         };
-        ctx.spawn(task);
+        self.threads.spawn(task);
     }
 
     /// Receive SST from client and save the file for later ingesting.
@@ -799,6 +841,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         let label = "upload";
         let timer = Instant::now_coarse();
         let import = self.importer.clone();
+        let mem_limit = self.mem_limit;
         let (rx, buf_driver) =
             create_stream_with_buffer(stream, self.cfg.rl().stream_channel_window);
         let mut map_rx = rx.map_err(Error::from);
@@ -813,6 +856,10 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                     _ => return Err(Error::InvalidChunk),
                 };
                 let file = import.create(meta)?;
+                if let Err(e) = check_import_resources(mem_limit).await {
+                    warn!("Upload failed due to not enough resource {:?}", e);
+                    return Err(e);
+                }
                 let mut file = rx
                     .try_fold(file, |mut file, chunk| async move {
                         let start = Instant::now_coarse();
@@ -873,28 +920,39 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     // store.
     fn apply(&mut self, _ctx: RpcContext<'_>, req: ApplyRequest, sink: UnarySink<ApplyResponse>) {
         let label = "apply";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let start = Instant::now();
         let importer = self.importer.clone();
         let limiter = self.limiter.clone();
+        let mem_limit = self.mem_limit;
         let max_raft_size = self.raft_entry_max_size.0 as usize;
         let applier = self.writer.clone();
 
         let handle_task = async move {
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
             // Records how long the apply task waits to be scheduled.
             sst_importer::metrics::IMPORTER_APPLY_DURATION
                 .with_label_values(&["queue"])
                 .observe(start.saturating_elapsed().as_secs_f64());
 
             let mut resp = ApplyResponse::default();
+            match check_import_resources(mem_limit).await {
+                Ok(()) => (),
+                Err(e) => {
+                    resp.set_error(e.into());
+                    crate::send_rpc_response!(Ok(resp), sink, label, start);
+                    return;
+                }
+            }
 
-            match Self::apply_imp(req, importer, applier, limiter, max_raft_size).await {
+            match Self::do_apply(req, importer, applier, limiter, max_raft_size).await {
                 Ok(Some(r)) => resp.set_range(r),
                 Err(e) => resp.set_error(e),
                 _ => {}
             }
 
             debug!("finished apply kv file with {:?}", resp);
-            crate::send_rpc_response!(Ok(resp), sink, label, start);
+            send_rpc_response!(Ok(resp), sink, label, start);
         };
         self.threads.spawn(handle_task);
     }
@@ -907,14 +965,30 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         sink: UnarySink<DownloadResponse>,
     ) {
         let label = "download";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
+
+        // download method only handles single file downloads
+        // Check that this is indeed a single-file request
+        if !req.get_ssts().is_empty() {
+            let error = sst_importer::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "download method only accepts single-file requests, use batch_download for multi-file requests",
+            ));
+            let mut resp = DownloadResponse::default();
+            resp.set_error(error.into());
+            let _ = sink
+                .success(resp)
+                .map_err(|e| warn!("send rpc response"; "err" => %e));
+            return;
+        }
         let importer = Arc::clone(&self.importer);
         let limiter = self.limiter.clone();
-        let region_id = req.get_sst().get_region_id();
+        let mem_limit = self.mem_limit;
         let tablets = self.tablets.clone();
         let start = Instant::now();
         let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
-            r.get_resource_limiter(
+            r.get_background_resource_limiter(
                 req.get_context()
                     .get_resource_control_context()
                     .get_resource_group_name(),
@@ -923,10 +997,21 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         });
 
         let handle_task = async move {
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
             // Records how long the download task waits to be scheduled.
             sst_importer::metrics::IMPORTER_DOWNLOAD_DURATION
                 .with_label_values(&["queue"])
                 .observe(start.saturating_elapsed().as_secs_f64());
+
+            let mut resp = DownloadResponse::default();
+            match check_import_resources(mem_limit).await {
+                Ok(()) => (),
+                Err(e) => {
+                    resp.set_error(e.into());
+                    crate::send_rpc_response!(Ok(resp), sink, label, timer);
+                    return;
+                }
+            }
 
             // FIXME: download() should be an async fn, to allow BR to cancel
             // a download task.
@@ -938,6 +1023,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                 .into_option()
                 .filter(|c| c.cipher_type != EncryptionMethod::Plaintext);
 
+            let region_id = req.get_sst().get_region_id();
             let tablet = match tablets.get(region_id) {
                 Some(tablet) => tablet,
                 None => {
@@ -947,12 +1033,13 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                     ));
                     let mut resp = DownloadResponse::default();
                     resp.set_error(error.into());
-                    return crate::send_rpc_response!(Ok(resp), sink, label, timer);
+                    crate::send_rpc_response!(Ok(resp), sink, label, timer);
+                    return;
                 }
             };
 
             let res = with_resource_limiter(
-                importer.download_ext::<E::Local>(
+                importer.download_ext(
                     req.get_sst(),
                     req.get_storage_backend(),
                     req.get_name(),
@@ -965,9 +1052,147 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                         .req_type(req.get_request_type()),
                 ),
                 resource_limiter,
-            );
+            )
+            .await;
             let mut resp = DownloadResponse::default();
-            match res.await {
+            match res {
+                Ok(range) => match range {
+                    Some(r) => resp.set_range(r),
+                    None => resp.set_is_empty(true),
+                },
+                Err(e) => resp.set_error(e.into()),
+            }
+            crate::send_rpc_response!(Ok(resp), sink, label, timer);
+        };
+
+        self.threads.spawn(handle_task);
+    }
+
+    /// Batch downloads multiple files and performs key-rewrite for later
+    /// ingesting. This method is specifically designed for multi-file
+    /// downloads with merging. NOTE: This method will be activated once
+    /// kvproto defines the batch_download RPC.
+    #[allow(dead_code)]
+    fn batch_download(
+        &mut self,
+        _ctx: RpcContext<'_>,
+        req: DownloadRequest,
+        sink: UnarySink<DownloadResponse>,
+    ) {
+        let label = "batch_download";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
+        let timer = Instant::now_coarse();
+
+        // batch_download specifically handles multi-file downloads
+        // Check that this is indeed a multi-file request
+        if req.get_ssts().is_empty() {
+            let error = sst_importer::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch_download method only accepts multi-file requests, use download for single-file requests",
+            ));
+            let mut resp = DownloadResponse::default();
+            resp.set_error(error.into());
+            let _ = sink
+                .success(resp)
+                .map_err(|e| warn!("send rpc response"; "err" => %e));
+            return;
+        }
+        let importer = Arc::clone(&self.importer);
+        let limiter = self.limiter.clone();
+        let mem_limit = self.mem_limit;
+        let tablets = self.tablets.clone();
+        let start = Instant::now();
+        let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
+            r.get_background_resource_limiter(
+                req.get_context()
+                    .get_resource_control_context()
+                    .get_resource_group_name(),
+                req.get_context().get_request_source(),
+            )
+        });
+
+        let handle_task = async move {
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
+            // Records how long the batch download task waits to be scheduled.
+            sst_importer::metrics::IMPORTER_DOWNLOAD_DURATION
+                .with_label_values(&["queue"])
+                .observe(start.saturating_elapsed().as_secs_f64());
+
+            let mut resp = DownloadResponse::default();
+            match check_import_resources(mem_limit).await {
+                Ok(()) => (),
+                Err(e) => {
+                    resp.set_error(e.into());
+                    crate::send_rpc_response!(Ok(resp), sink, label, timer);
+                    return;
+                }
+            }
+
+            // FIXME: batch_download() should be an async fn, to allow BR to cancel
+            // a download task.
+            // Unfortunately, this currently can't happen because the S3Storage
+            // is not Send + Sync. See the documentation of S3Storage for reason.
+            let cipher = req
+                .cipher_info
+                .to_owned()
+                .into_option()
+                .filter(|c| c.cipher_type != EncryptionMethod::Plaintext);
+
+            let basic_meta = match download_request_dispatcher(&req) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
+                    // This should never happen since we've already checked ssts is not empty
+                    let error = sst_importer::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "internal error: download_request_dispatcher returned None despite non-empty ssts",
+                    ));
+                    let mut resp = DownloadResponse::default();
+                    resp.set_error(error.into());
+                    crate::send_rpc_response!(Ok(resp), sink, label, timer);
+                    return;
+                }
+                Err(error) => {
+                    let mut resp = DownloadResponse::default();
+                    resp.set_error(error.into());
+                    crate::send_rpc_response!(Ok(resp), sink, label, timer);
+                    return;
+                }
+            };
+
+            let region_id = basic_meta.get_region_id();
+            let tablet = match tablets.get(region_id) {
+                Some(tablet) => tablet,
+                None => {
+                    let error = sst_importer::Error::Engine(box_err!(
+                        "region {} not found, maybe it's not a replica of this store",
+                        region_id
+                    ));
+                    let mut resp = DownloadResponse::default();
+                    resp.set_error(error.into());
+                    crate::send_rpc_response!(Ok(resp), sink, label, timer);
+                    return;
+                }
+            };
+
+            let res = with_resource_limiter(
+                importer.download_files_ext(
+                    &basic_meta,
+                    req.get_ssts(),
+                    req.get_storage_backend(),
+                    req.get_rewrite_rule(),
+                    cipher,
+                    limiter,
+                    tablet.into_owned(),
+                    DownloadExt::default()
+                        .cache_key(req.get_storage_cache_id())
+                        .req_type(req.get_request_type()),
+                ),
+                resource_limiter,
+            )
+            .await;
+
+            let mut resp = DownloadResponse::default();
+            match res {
                 Ok(range) => match range {
                     Some(r) => resp.set_range(r),
                     None => resp.set_is_empty(true),
@@ -987,41 +1212,38 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     /// CleanupSstWorker.
     fn ingest(
         &mut self,
-        ctx: RpcContext<'_>,
+        _: RpcContext<'_>,
         mut req: IngestRequest,
         sink: UnarySink<IngestResponse>,
     ) {
         let label = "ingest";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
+        let import = self.importer.clone();
+        let engine = self.engine.clone();
+        let suspend = self.suspend.clone();
+        let tablets = self.tablets.clone();
+        let store_meta = self.store_meta.clone();
+        let ingest_latch = self.ingest_latch.clone();
+        let ingest_admission_guard = self.ingest_admission_guard.clone();
 
-        let mut resp = IngestResponse::default();
-        let region_id = req.get_context().get_region_id();
-        if let Some(errorpb) = self.check_write_stall(region_id) {
-            resp.set_error(errorpb);
-            ctx.spawn(
-                sink.success(resp)
-                    .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
-            );
-            return;
-        }
-
-        let mut errorpb = errorpb::Error::default();
-        if !Self::acquire_lock(&self.task_slots, req.get_sst()).unwrap_or(false) {
-            errorpb.set_message(Error::FileConflict.to_string());
-            resp.set_error(errorpb);
-            ctx.spawn(
-                sink.success(resp)
-                    .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
-            );
-            return;
-        }
-
-        let task_slots = self.task_slots.clone();
-        let meta = req.take_sst();
-        let f = self.ingest_files(req.take_context(), label, vec![meta.clone()]);
         let handle_task = async move {
-            let res = f.await;
-            Self::release_lock(&task_slots, &meta).unwrap();
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
+            let mut multi_ingest = MultiIngestRequest::default();
+            multi_ingest.set_context(req.take_context());
+            multi_ingest.mut_ssts().push(req.take_sst());
+            let res = ingest(
+                multi_ingest,
+                engine,
+                &suspend,
+                &tablets,
+                &store_meta,
+                &import,
+                &ingest_latch,
+                &ingest_admission_guard,
+                label,
+            )
+            .await;
             crate::send_rpc_response!(res, sink, label, timer);
         };
         self.threads.spawn(handle_task);
@@ -1030,49 +1252,35 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     /// Ingest multiple files by sending a raft command to raftstore.
     fn multi_ingest(
         &mut self,
-        ctx: RpcContext<'_>,
-        mut req: MultiIngestRequest,
+        _: RpcContext<'_>,
+        req: MultiIngestRequest,
         sink: UnarySink<IngestResponse>,
     ) {
         let label = "multi-ingest";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
+        let import = self.importer.clone();
+        let engine = self.engine.clone();
+        let suspend = self.suspend.clone();
+        let tablets = self.tablets.clone();
+        let store_meta = self.store_meta.clone();
+        let ingest_latch = self.ingest_latch.clone();
+        let ingest_admission_guard = self.ingest_admission_guard.clone();
 
-        let mut resp = IngestResponse::default();
-        if let Some(errorpb) = self.check_write_stall(req.get_context().get_region_id()) {
-            resp.set_error(errorpb);
-            ctx.spawn(
-                sink.success(resp)
-                    .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
-            );
-            return;
-        }
-
-        let mut errorpb = errorpb::Error::default();
-        let mut metas = vec![];
-        for sst in req.get_ssts() {
-            if Self::acquire_lock(&self.task_slots, sst).unwrap_or(false) {
-                metas.push(sst.clone());
-            }
-        }
-        if metas.len() < req.get_ssts().len() {
-            for m in metas {
-                Self::release_lock(&self.task_slots, &m).unwrap();
-            }
-            errorpb.set_message(Error::FileConflict.to_string());
-            resp.set_error(errorpb);
-            ctx.spawn(
-                sink.success(resp)
-                    .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
-            );
-            return;
-        }
-        let task_slots = self.task_slots.clone();
-        let f = self.ingest_files(req.take_context(), label, req.take_ssts().into());
         let handle_task = async move {
-            let res = f.await;
-            for m in metas {
-                Self::release_lock(&task_slots, &m).unwrap();
-            }
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
+            let res = ingest(
+                req,
+                engine,
+                &suspend,
+                &tablets,
+                &store_meta,
+                &import,
+                &ingest_latch,
+                &ingest_admission_guard,
+                label,
+            )
+            .await;
             crate::send_rpc_response!(res, sink, label, timer);
         };
         self.threads.spawn(handle_task);
@@ -1182,7 +1390,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
             Some(request.take_end_key())
         };
         let key_only = request.get_key_only();
-        let snap_res = Self::async_snapshot(&mut self.engine, &context);
+        let snap_res = async_snapshot(&mut self.engine, &context);
         let handle_task = async move {
             let res = snap_res.await;
             let snapshot = match res {
@@ -1199,15 +1407,18 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                             IMPORT_RPC_DURATION
                                 .with_label_values(&[label, "ok"])
                                 .observe(timer.saturating_elapsed_secs());
+                            let _ = sink.close().await;
                         }
                         Err(e) => {
                             warn!(
                                 "connection send message fail";
                                 "err" => %e
                             );
+                            let status =
+                                RpcStatus::with_message(RpcStatusCode::UNKNOWN, format!("{:?}", e));
+                            let _ = sink.fail(status).await;
                         }
                     }
-                    let _ = sink.close().await;
                     return;
                 }
             };
@@ -1223,7 +1434,10 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                         "connection send message fail";
                         "err" => %e
                     );
-                    break;
+                    let status =
+                        RpcStatus::with_message(RpcStatusCode::UNKNOWN, format!("{:?}", e));
+                    let _ = sink.fail(status).await;
+                    return;
                 }
             }
             let _ = sink.close().await;
@@ -1240,31 +1454,142 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         RawChunk,
         new_raw_writer
     );
-}
 
-// add error statistics from pb error response
-fn pb_error_inc(type_: &str, e: &errorpb::Error) {
-    let label = if e.has_not_leader() {
-        "not_leader"
-    } else if e.has_store_not_match() {
-        "store_not_match"
-    } else if e.has_region_not_found() {
-        "region_not_found"
-    } else if e.has_key_not_in_region() {
-        "key_not_in_range"
-    } else if e.has_epoch_not_match() {
-        "epoch_not_match"
-    } else if e.has_server_is_busy() {
-        "server_is_busy"
-    } else if e.has_stale_command() {
-        "stale_command"
-    } else if e.has_raft_entry_too_large() {
-        "raft_entry_too_large"
-    } else {
-        "unknown"
-    };
+    fn suspend_import_rpc(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: SuspendImportRpcRequest,
+        sink: UnarySink<SuspendImportRpcResponse>,
+    ) {
+        let label = "suspend_import_rpc";
+        let timer = Instant::now_coarse();
 
-    IMPORTER_ERROR_VEC.with_label_values(&[type_, label]).inc();
+        if req.should_suspend_imports && req.get_duration_in_secs() > SUSPEND_REQUEST_MAX_SECS {
+            ctx.spawn(async move {
+                send_rpc_response!(Err(Error::Io(
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                        format!("you are going to suspend the import RPCs too long. (for {} seconds, max acceptable duration is {} seconds)",
+                        req.get_duration_in_secs(), SUSPEND_REQUEST_MAX_SECS)))), sink, label, timer);
+            });
+            return;
+        }
+
+        let suspended = if req.should_suspend_imports {
+            info!("suspend incoming import RPCs."; "for_second" => req.get_duration_in_secs(), "caller" => req.get_caller());
+            self.suspend
+                .suspend_requests(Duration::from_secs(req.get_duration_in_secs()))
+        } else {
+            info!("allow incoming import RPCs."; "caller" => req.get_caller());
+            self.suspend.allow_requests()
+        };
+        let mut resp = SuspendImportRpcResponse::default();
+        resp.set_already_suspended(suspended);
+        ctx.spawn(async move { send_rpc_response!(Ok(resp), sink, label, timer) });
+    }
+
+    fn add_force_partition_range(
+        &mut self,
+        _ctx: RpcContext<'_>,
+        req: AddPartitionRangeRequest,
+        sink: UnarySink<AddPartitionRangeResponse>,
+    ) {
+        let label = "add_force_partition_range";
+        let timer = Instant::now_coarse();
+        let kv_engine = self.engine.kv_engine();
+        let force_partition_range_mgr = self.force_partition_range_mgr.clone();
+
+        let handle_task = async move {
+            let resp = AddPartitionRangeResponse::default();
+            let engine = if let Some(eng) = kv_engine {
+                eng
+            } else {
+                info!("ignore add_force_partition_range request on raftstore-v2 cluster");
+                // engine is none means this is raftstore-v2, then we can just return.
+                send_rpc_response!(Ok(resp), sink, label, timer);
+                return;
+            };
+            let start = keys::data_key(Key::from_raw(req.get_range().get_start()).as_encoded());
+            let end = keys::data_end_key(Key::from_raw(req.get_range().get_end()).as_encoded());
+            let mut ttl_seconds = req.get_ttl_seconds();
+            if ttl_seconds == 0 {
+                // default value if the ttl is not set, 1h is big enough for most cases.
+                ttl_seconds = DEFAULT_FORCE_PARTITION_RANGE_TTL_SECONDS;
+            }
+            if start >= end {
+                send_rpc_response!(
+                    Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "start keys must be smaller than end key, start: {:?}, end: {:?}",
+                            req.get_range().get_start(),
+                            req.get_range().get_end()
+                        )
+                    ))),
+                    sink,
+                    label,
+                    timer
+                );
+                return;
+            }
+
+            let added =
+                force_partition_range_mgr.add_range(start.clone(), end.clone(), ttl_seconds);
+
+            // here, we don't compact the whole range directly because it's possible that
+            // the task is restart from a checkpoint, thus, there may be already
+            // many SST files, but there's no need to compact them. Instaed, we
+            // try to compact a range that won't overlap with any real data kv
+            // at both side of the range. These 2 ranges won't overlap with any real
+            // data kv, but can trigger a compact if a SST with huge range overlaps with the
+            // input range.
+            let mut start_next = req.get_range().get_start().to_owned();
+            start_next.push(0);
+            let start_next_data_key = keys::data_key(Key::from_raw(&start_next).as_encoded());
+            let mut end_next = req.get_range().get_end().to_owned();
+            end_next.push(0);
+            let end_next_data_key = keys::data_key(Key::from_raw(&end_next).as_encoded());
+            let mut opts = ManualCompactionOptions::new(false, 1, true);
+            opts.set_check_range_overlap_on_bottom_level(true);
+            for cf in [CF_WRITE, CF_DEFAULT] {
+                for rg in [(&*start, &*start_next_data_key), (&end, &end_next_data_key)] {
+                    let start = Instant::now_coarse();
+                    let start_key = log_wrappers::Value::key(req.get_range().get_start());
+                    let end_key = log_wrappers::Value::key(req.get_range().get_end());
+                    let res = engine.compact_range_cf(cf, Some(rg.0), Some(rg.1), opts.clone());
+                    let dur = start.saturating_elapsed();
+                    if let Err(e) = res {
+                        warn!("manual compact range failed"; "cf" => cf, "start" => ?start_key, "end" => ?end_key, "err" => ?e, "dur" => ?dur);
+                    } else {
+                        info!("manual compact range success"; "cf" => cf, "start" => ?start_key, "end" => ?end_key, "dur" => ?dur);
+                    }
+                }
+            }
+
+            info!("add force_partition range"; "start" => ?log_wrappers::Value::key(req.get_range().get_start()),
+                    "end" => ?log_wrappers::Value::key(req.get_range().get_end()), "ttl" => ttl_seconds, "added" => added);
+            send_rpc_response!(Ok(resp), sink, label, timer);
+        };
+
+        self.threads.spawn(handle_task);
+    }
+    fn remove_force_partition_range(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: RemovePartitionRangeRequest,
+        sink: UnarySink<RemovePartitionRangeResponse>,
+    ) {
+        let label = "remove_force_partition_range";
+        let timer = Instant::now_coarse();
+
+        let start = keys::data_key(Key::from_raw(req.get_range().get_start()).as_encoded());
+        let end = keys::data_end_key(Key::from_raw(req.get_range().get_end()).as_encoded());
+        let removed = self.force_partition_range_mgr.remove_range(&start, &end);
+        info!("remove force_partition range"; "start" => log_wrappers::Value::key(req.get_range().get_start()),
+                "end" => log_wrappers::Value::key(req.get_range().get_end()), "removed" => removed);
+
+        let resp = RemovePartitionRangeResponse::default();
+        ctx.spawn(async move { send_rpc_response!(Ok(resp), sink, label, timer) });
+    }
 }
 
 fn write_needs_restore(write: &[u8]) -> bool {
@@ -1292,6 +1617,72 @@ fn write_needs_restore(write: &[u8]) -> bool {
     }
 }
 
+fn download_request_dispatcher(req: &DownloadRequest) -> Result<Option<SstMeta>> {
+    if req.get_ssts().is_empty() {
+        return Ok(None);
+    }
+    let mut basic_meta = req.get_sst().clone();
+    for meta in req.get_ssts().values() {
+        if basic_meta.get_region_id() != meta.get_region_id() {
+            let error = sst_importer::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "region id mismatch in different sst meta, one is {} and another is {}",
+                    basic_meta.get_region_id(),
+                    meta.get_region_id()
+                ),
+            ));
+            return Err(error);
+        }
+        if basic_meta.get_region_epoch() != meta.get_region_epoch() {
+            let error = sst_importer::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "region epoch mismatch in different sst meta, one is {:?} and another is {:?}",
+                    basic_meta.get_region_epoch(),
+                    meta.get_region_epoch()
+                ),
+            ));
+            return Err(error);
+        }
+        if basic_meta.get_cf_name() != meta.get_cf_name() {
+            let error = sst_importer::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cf mismatch in different sst meta, one is {} and another is {}",
+                    basic_meta.get_cf_name(),
+                    meta.get_cf_name()
+                ),
+            ));
+            return Err(error);
+        }
+        if basic_meta.get_end_key_exclusive() != meta.get_end_key_exclusive() {
+            let error = sst_importer::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "end key exclusive mismatch in different sst meta, one is {} and another is {}",
+                    basic_meta.get_end_key_exclusive(),
+                    meta.get_end_key_exclusive()
+                ),
+            ));
+            return Err(error);
+        }
+        if basic_meta.get_range().get_start() > meta.get_range().get_start() {
+            basic_meta
+                .mut_range()
+                .set_start(meta.get_range().get_start().to_owned());
+        }
+        if !basic_meta.get_range().get_end().is_empty()
+            && basic_meta.get_range().get_end() < meta.get_range().get_end()
+        {
+            basic_meta
+                .mut_range()
+                .set_end(meta.get_range().get_end().to_owned());
+        }
+    }
+    Ok(Some(basic_meta))
+}
+
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
@@ -1299,14 +1690,19 @@ mod test {
     use engine_traits::{CF_DEFAULT, CF_WRITE};
     use kvproto::{
         kvrpcpb::Context,
-        metapb::RegionEpoch,
+        metapb::{Region, RegionEpoch},
         raft_cmdpb::{RaftCmdRequest, Request},
     };
-    use protobuf::Message;
+    use protobuf::{Message, SingularPtrField};
+    use raft::StateRole::Follower;
+    use raftstore::RegionInfo;
     use tikv_kv::{Modify, WriteData};
     use txn_types::{Key, TimeStamp, Write, WriteBatchFlags, WriteType};
 
-    use crate::{import::sst_service::RequestCollector, server::raftkv};
+    use crate::{
+        import::sst_service::{RequestCollector, check_local_region_stale},
+        server::raftkv,
+    };
 
     fn write(key: &[u8], ty: WriteType, commit_ts: u64, start_ts: u64) -> (Vec<u8>, Vec<u8>) {
         let k = Key::from_raw(key).append_ts(TimeStamp::new(commit_ts));
@@ -1490,7 +1886,7 @@ mod test {
     fn convert_write_batch_to_request_raftkv1(ctx: &Context, batch: WriteData) -> RaftCmdRequest {
         let reqs: Vec<Request> = batch.modifies.into_iter().map(Into::into).collect();
         let txn_extra = batch.extra;
-        let mut header = raftkv::new_request_header(ctx);
+        let mut header = raftkv::new_request_header(ctx, None);
         if batch.avoid_batch {
             header.set_uuid(uuid::Uuid::new_v4().as_bytes().to_vec());
         }
@@ -1589,5 +1985,73 @@ mod test {
             assert!(req_size < 1024, "{}", req_size);
         }
         assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn test_write_rpc_check_region_epoch() {
+        let mut req_epoch = RegionEpoch {
+            conf_ver: 10,
+            version: 10,
+            ..Default::default()
+        };
+        // test for region not found
+        let result = check_local_region_stale(1, &req_epoch, None);
+        assert!(result.is_err());
+        // check error message contains "rescan region later", client will match this
+        // string pattern
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("rescan region later")
+        );
+
+        let mut local_region_info = RegionInfo {
+            region: Region {
+                id: 1,
+                region_epoch: SingularPtrField::some(req_epoch.clone()),
+                ..Default::default()
+            },
+            role: Follower,
+            buckets: 1,
+        };
+        // test the local region epoch is same as request
+        let result = check_local_region_stale(1, &req_epoch, Some(local_region_info.clone()));
+        result.unwrap();
+
+        // test the local region epoch is ahead of request
+        local_region_info
+            .region
+            .region_epoch
+            .as_mut()
+            .unwrap()
+            .conf_ver = 11;
+        let result = check_local_region_stale(1, &req_epoch, Some(local_region_info.clone()));
+        assert!(result.is_err());
+        // check error message contains "rescan region later", client will match this
+        // string pattern
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("rescan region later")
+        );
+
+        req_epoch.conf_ver = 11;
+        let result = check_local_region_stale(1, &req_epoch, Some(local_region_info.clone()));
+        result.unwrap();
+
+        // test the local region epoch is staler than request
+        req_epoch.version = 12;
+        let result = check_local_region_stale(1, &req_epoch, Some(local_region_info));
+        assert!(result.is_err());
+        // check error message contains "retry write later", client will match this
+        // string pattern
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("retry write later")
+        );
     }
 }

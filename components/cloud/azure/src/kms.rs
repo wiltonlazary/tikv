@@ -3,13 +3,11 @@
 use std::{ops::Deref, sync::Arc};
 
 use async_trait::async_trait;
-use azure_core::{auth::TokenCredential, new_http_client, Error as AzureError};
-use azure_identity::{
-    AutoRefreshingTokenCredential, ClientSecretCredential, TokenCredentialOptions,
-};
-use azure_security_keyvault::{prelude::*, KeyClient};
+use azure_core::{Error as AzureError, auth::TokenCredential};
+use azure_identity::ClientSecretCredential;
+use azure_security_keyvault::{KeyClient, prelude::*};
 use cloud::{
-    error::{Error as CloudError, KmsError, Result},
+    error::{Error as CloudError, KmsError, OtherError, Result},
     kms::{Config, CryptographyType, DataKeyPair, EncryptedKey, KeyId, KmsProvider, PlainKey},
 };
 use tikv_util::box_err;
@@ -123,24 +121,24 @@ impl AzureKms {
             // Client secret to access KeyVault.
             let (keyvault_credential, hsm_credential) = (
                 ClientSecretCredential::new(
-                    new_http_client(),
-                    azure_cfg.tenant_id.clone(),
+                    azure_core::new_http_client(),
                     azure_cfg.client_id.clone(),
                     client_secret.clone(),
-                    TokenCredentialOptions::default(),
+                    azure_cfg.tenant_id.clone(),
+                    Default::default(),
                 ),
                 ClientSecretCredential::new(
-                    new_http_client(),
-                    azure_cfg.tenant_id.clone(),
+                    azure_core::new_http_client(),
                     azure_cfg.client_id,
                     client_secret,
-                    TokenCredentialOptions::default(),
+                    azure_cfg.tenant_id.clone(),
+                    Default::default(),
                 ),
             );
             Self::new_with_credentials(config, keyvault_credential, hsm_credential)
         } else {
-            Err(CloudError::KmsError(KmsError::Other(box_err!(
-                "invalid configurations for Azure KMS"
+            Err(CloudError::KmsError(KmsError::Other(OtherError::from_box(
+                box_err!("invalid configurations for Azure KMS"),
             ))))
         }
     }
@@ -190,7 +188,7 @@ impl KmsProvider for AzureKms {
             ),
         };
         self.client
-            .encrypt(&self.current_key_id.clone().into_inner(), encrypt_params)
+            .encrypt(self.current_key_id.clone().into_inner(), encrypt_params)
             .await
             .map_err(convert_azure_error)
             .and_then(|response| {
@@ -237,12 +235,9 @@ fn convert_azure_error(err: AzureError) -> CloudError {
     let err_msg = if let Ok(e) = err.into_inner() {
         e
     } else {
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "unknown error",
-        ))
+        Box::new(std::io::Error::other("unknown error"))
     };
-    CloudError::KmsError(KmsError::Other(err_msg))
+    CloudError::KmsError(KmsError::Other(OtherError::from_box(err_msg)))
 }
 
 #[inline]
@@ -250,11 +245,7 @@ fn new_key_client<Creds>(url: &str, credentials: Creds) -> Result<KeyClient>
 where
     Creds: TokenCredential + Send + Sync + 'static,
 {
-    KeyClient::new(
-        url,
-        Arc::new(AutoRefreshingTokenCredential::new(Arc::new(credentials))),
-    )
-    .map_err(|e| CloudError::Other(Box::new(e)))
+    KeyClient::new(url, Arc::new(credentials)).map_err(|e| CloudError::Other(Box::new(e)))
 }
 
 #[cfg(test)]
@@ -281,6 +272,8 @@ mod tests {
                 endpoint: String::new(),
             },
             azure: Some(err_azure_cfg.clone()),
+            gcp: None,
+            aws: None,
         };
         AzureKms::new(err_config.clone()).unwrap_err();
         let azure_cfg = SubConfigAzure {
@@ -324,6 +317,8 @@ mod tests {
                 endpoint: String::new(),
             },
             azure: Some(azure_cfg),
+            gcp: None,
+            aws: None,
         };
         if config.vendor != STORAGE_VENDOR_NAME_AZURE {
             AzureKms::new(config).unwrap();

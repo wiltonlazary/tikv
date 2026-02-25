@@ -10,12 +10,12 @@ use std::{
 use codec::number::NumberCodec;
 use encryption::{DataKeyManager, DecrypterReader, EncrypterWriter};
 use engine_traits::{
-    CacheStats, EncryptionKeyManager, EncryptionMethod, PerfContextExt, PerfContextKind, PerfLevel,
+    CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, CacheStats, PerfContextExt, PerfContextKind, PerfLevel,
     RaftEngine, RaftEngineDebug, RaftEngineReadOnly, RaftLogBatch as RaftLogBatchTrait, Result,
-    CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
 };
 use file_system::{IoOp, IoRateLimiter, IoType, WithIoType};
 use kvproto::{
+    encryptionpb::EncryptionMethod,
     metapb::Region,
     raft_serverpb::{
         RaftApplyState, RaftLocalState, RegionLocalState, StoreIdent, StoreRecoverState,
@@ -23,8 +23,8 @@ use kvproto::{
 };
 use raft::eraftpb::Entry;
 use raft_engine::{
-    env::{DefaultFileSystem, FileSystem, Handle, Permission, WriteExt},
     Command, Engine as RawRaftEngine, Error as RaftEngineError, LogBatch, MessageExt,
+    env::{DefaultFileSystem, FileSystem, Handle, Permission, WriteExt},
 };
 pub use raft_engine::{Config as RaftEngineConfig, ReadableSize, RecoveryMode};
 use tikv_util::Either;
@@ -811,7 +811,6 @@ fn transfer_error(e: RaftEngineError) -> engine_traits::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
 
     use engine_traits::ALL_CFS;
 
@@ -825,10 +824,10 @@ mod tests {
             ..Default::default()
         };
         let engine = RaftLogEngine::new(cfg, None, None).unwrap();
-        assert_matches!(engine.get_region_state(2, u64::MAX), Ok(None));
-        assert_matches!(engine.get_apply_state(2, u64::MAX), Ok(None));
+        assert!(matches!(engine.get_region_state(2, u64::MAX), Ok(None)));
+        assert!(matches!(engine.get_apply_state(2, u64::MAX), Ok(None)));
         for cf in ALL_CFS {
-            assert_matches!(engine.get_flushed_index(2, cf), Ok(None));
+            assert!(matches!(engine.get_flushed_index(2, cf), Ok(None)));
         }
 
         let mut wb = engine.log_batch(10);
@@ -844,10 +843,10 @@ mod tests {
         engine.consume(&mut wb, false).unwrap();
 
         for cf in ALL_CFS.iter().take(2) {
-            assert_matches!(engine.get_flushed_index(2, cf), Ok(Some(4)));
+            assert!(matches!(engine.get_flushed_index(2, cf), Ok(Some(4))));
         }
         for cf in ALL_CFS.iter().skip(2) {
-            assert_matches!(engine.get_flushed_index(2, cf), Ok(None));
+            assert!(matches!(engine.get_flushed_index(2, cf), Ok(None)));
         }
 
         let mut region_state2 = region_state.clone();
@@ -861,14 +860,14 @@ mod tests {
         }
         engine.consume(&mut wb, false).unwrap();
 
-        assert_matches!(engine.get_region_state(2, 0), Ok(None));
-        assert_matches!(engine.get_region_state(2, 1), Ok(Some(s)) if s == region_state);
-        assert_matches!(engine.get_region_state(2, 4), Ok(Some(s)) if s == region_state2);
-        assert_matches!(engine.get_apply_state(2, 0), Ok(None));
-        assert_matches!(engine.get_apply_state(2, 3), Ok(Some(s)) if s == apply_state);
-        assert_matches!(engine.get_apply_state(2, 5), Ok(Some(s)) if s == apply_state2);
+        assert!(matches!(engine.get_region_state(2, 0), Ok(None)));
+        assert!(matches!(engine.get_region_state(2, 1), Ok(Some(s)) if s == region_state));
+        assert!(matches!(engine.get_region_state(2, 4), Ok(Some(s)) if s == region_state2));
+        assert!(matches!(engine.get_apply_state(2, 0), Ok(None)));
+        assert!(matches!(engine.get_apply_state(2, 3), Ok(Some(s)) if s == apply_state));
+        assert!(matches!(engine.get_apply_state(2, 5), Ok(Some(s)) if s == apply_state2));
         for cf in ALL_CFS {
-            assert_matches!(engine.get_flushed_index(2, cf), Ok(Some(5)));
+            assert!(matches!(engine.get_flushed_index(2, cf), Ok(Some(5))));
         }
     }
 }

@@ -3,9 +3,9 @@
 // #[PerformanceCriticalPath]
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
         Arc, RwLock,
+        atomic::{AtomicU32, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
     thread::{Builder, JoinHandle},
     time::Duration,
@@ -13,9 +13,13 @@ use std::{
 
 use collections::{HashMap, HashMapEntry};
 use engine_rocks::FlowInfo;
-use engine_traits::{CfNamesExt, FlowControlFactorsExt, TabletRegistry, DATA_CFS};
+use engine_traits::{CfNamesExt, DATA_CFS, FlowControlFactorsExt, TabletRegistry};
+use online_config::{ConfigChange, OnlineConfig};
 use rand::Rng;
-use tikv_util::{sys::thread::StdThreadBuildWrapper, time::Limiter};
+use tikv_util::{
+    config::VersionTrack, sys::thread::StdThreadBuildWrapper,
+    thread_name_prefix::FLOW_CHECKER_THREAD, time::Limiter,
+};
 
 use super::singleton_flow_controller::{
     FlowChecker, FlowControlFactorStore, Msg, RATIO_SCALE_FACTOR, TICK_DURATION,
@@ -61,11 +65,11 @@ impl<EK: CfNamesExt + FlowControlFactorsExt + Clone> FlowControlFactorStore
 
 type Limiters = Arc<RwLock<HashMap<u64, (Arc<Limiter>, Arc<AtomicU32>)>>>;
 pub struct TabletFlowController {
-    enabled: Arc<AtomicBool>,
     tx: Option<SyncSender<Msg>>,
     handle: Option<std::thread::JoinHandle<()>>,
     limiters: Limiters,
     global_discard_ratio: Arc<AtomicU32>,
+    config_tracker: Arc<VersionTrack<FlowControlConfig>>,
 }
 
 impl Drop for TabletFlowController {
@@ -93,17 +97,11 @@ impl TabletFlowController {
         flow_info_receiver: Receiver<FlowInfo>,
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel(5);
-        tx.send(if config.enable {
-            Msg::Enable
-        } else {
-            Msg::Disable
-        })
-        .unwrap();
+        let config_tracker = Arc::new(VersionTrack::new(config.clone()));
         let flow_checkers = Arc::new(RwLock::new(HashMap::default()));
         let limiters: Limiters = Arc::new(RwLock::new(HashMap::default()));
         let global_discard_ratio = Arc::new(AtomicU32::new(0));
         Self {
-            enabled: Arc::new(AtomicBool::new(config.enable)),
             tx: Some(tx),
             limiters: limiters.clone(),
             handle: Some(FlowInfoDispatcher::start(
@@ -112,10 +110,11 @@ impl TabletFlowController {
                 registry,
                 flow_checkers,
                 limiters,
-                config.clone(),
+                config_tracker.clone(),
                 global_discard_ratio.clone(),
             )),
             global_discard_ratio,
+            config_tracker,
         }
     }
 
@@ -134,14 +133,13 @@ impl FlowInfoDispatcher {
         registry: TabletRegistry<E>,
         flow_checkers: Arc<RwLock<HashMap<u64, FlowChecker<TabletFlowFactorStore<E>>>>>,
         limiters: Limiters,
-        config: FlowControlConfig,
+        config: Arc<VersionTrack<FlowControlConfig>>,
         global_discard_ratio: Arc<AtomicU32>,
     ) -> JoinHandle<()> {
         Builder::new()
-            .name(thd_name!("flow-checker"))
+            .name(thd_name!(FLOW_CHECKER_THREAD))
             .spawn_wrapper(move || {
                 let mut deadline = std::time::Instant::now();
-                let mut enabled = config.enable;
                 let engine = TabletFlowFactorStore::new(registry.clone());
                 let mut pending_compaction_checker = CompactionPendingBytesChecker::new(
                     config.clone(),
@@ -152,15 +150,12 @@ impl FlowInfoDispatcher {
                     match rx.try_recv() {
                         Ok(Msg::Close) => break,
                         Ok(Msg::Disable) => {
-                            enabled = false;
                             let mut checkers = flow_checkers.as_ref().write().unwrap();
                             for checker in (*checkers).values_mut() {
                                 checker.reset_statistics();
                             }
                         }
-                        Ok(Msg::Enable) => {
-                            enabled = true;
-                        }
+                        Ok(Msg::Enable) => {}
                         Err(_) => {}
                     }
 
@@ -171,11 +166,11 @@ impl FlowInfoDispatcher {
                         | Ok(FlowInfo::Flush(_cf, _, region_id)) => {
                             let mut checkers = flow_checkers.as_ref().write().unwrap();
                             if let Some(checker) = checkers.get_mut(&region_id) {
-                                checker.on_flow_info_msg(enabled, msg);
+                                checker.on_flow_info_msg(msg);
                             }
                         }
                         Ok(FlowInfo::Compaction(cf, region_id)) => {
-                            if !enabled {
+                            if !config.value().enable {
                                 continue;
                             }
                             let mut checkers = flow_checkers.as_ref().write().unwrap();
@@ -194,7 +189,7 @@ impl FlowInfoDispatcher {
                         | Ok(FlowInfo::AfterUnsafeDestroyRange(region_id)) => {
                             let mut checkers = flow_checkers.as_ref().write().unwrap();
                             if let Some(checker) = checkers.get_mut(&region_id) {
-                                checker.on_flow_info_msg(enabled, msg);
+                                checker.on_flow_info_msg(msg);
                             }
                         }
                         Ok(FlowInfo::Created(region_id)) => {
@@ -225,7 +220,7 @@ impl FlowInfoDispatcher {
                                     );
                                     e.insert(FlowChecker::new_with_region_id(
                                         region_id,
-                                        &config,
+                                        config.clone(),
                                         engine,
                                         limiter.1.clone(),
                                         limiter.0.clone(),
@@ -340,8 +335,11 @@ impl TabletFlowController {
         0
     }
 
+    pub fn update_config(&self, config_change: ConfigChange) -> online_config::Result<()> {
+        self.config_tracker.update(|cfg| cfg.update(config_change))
+    }
+
     pub fn enable(&self, enable: bool) {
-        self.enabled.store(enable, Ordering::Relaxed);
         if let Some(tx) = &self.tx {
             if enable {
                 tx.send(Msg::Enable).unwrap();
@@ -352,7 +350,7 @@ impl TabletFlowController {
     }
 
     pub fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+        self.config_tracker.value().enable
     }
 
     #[cfg(test)]
@@ -378,12 +376,16 @@ struct CompactionPendingBytesChecker<E: FlowControlFactorStore + Send + 'static>
 }
 
 impl<E: FlowControlFactorStore + Send + 'static> CompactionPendingBytesChecker<E> {
-    pub fn new(config: FlowControlConfig, discard_ratio: Arc<AtomicU32>, engine: E) -> Self {
+    pub fn new(
+        config: Arc<VersionTrack<FlowControlConfig>>,
+        discard_ratio: Arc<AtomicU32>,
+        engine: E,
+    ) -> Self {
         CompactionPendingBytesChecker {
             pending_compaction_bytes: HashMap::default(),
             checker: FlowChecker::new_with_region_id(
                 0, // global checker
-                &config,
+                config,
                 engine,
                 discard_ratio,
                 Arc::new(
@@ -447,7 +449,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        super::{singleton_flow_controller::tests::*, FlowController},
+        super::{FlowController, singleton_flow_controller::tests::*},
         *,
     };
 

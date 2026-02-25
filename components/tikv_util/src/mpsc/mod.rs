@@ -9,8 +9,8 @@ pub mod priority_queue;
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -76,7 +76,7 @@ impl<T> Drop for Sender<T> {
     }
 }
 
-/// The receive end of a channel.
+/// The receiving end of a channel.
 pub struct Receiver<T> {
     receiver: channel::Receiver<T>,
     state: Arc<State>,

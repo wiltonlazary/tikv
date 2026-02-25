@@ -6,15 +6,17 @@ use engine_traits::CF_LOCK;
 use kvproto::{
     coprocessor::{Request, Response, StoreBatchTask, StoreBatchTaskResponse},
     kvrpcpb::{Context, IsolationLevel},
+    metapb::{Peer, Region},
 };
 use protobuf::Message;
-use raftstore::store::Bucket;
+use raftstore::{coprocessor::region_info_accessor::MockRegionInfoProvider, store::Bucket};
 use test_coprocessor::*;
 use test_raftstore::*;
 use test_raftstore_macro::test_case;
 use test_storage::*;
 use tidb_query_datatype::{
-    codec::{datum, Datum},
+    FieldTypeTp,
+    codec::{Datum, datum, table::encode_row_key},
     expr::EvalContext,
 };
 use tikv::{
@@ -22,15 +24,17 @@ use tikv::{
     server::Config,
     storage::TestEngineBuilder,
 };
+use tikv_kv::{RocksEngine, destroy_tls_engine, set_tls_engine, with_tls_engine};
 use tikv_util::{
+    HandyRwLock,
     codec::number::*,
     config::{ReadableDuration, ReadableSize},
-    HandyRwLock,
 };
 use tipb::{
     AnalyzeColumnsReq, AnalyzeReq, AnalyzeType, ChecksumRequest, Chunk, Expr, ExprType,
     ScalarFuncSig, SelectResponse,
 };
+use tipb_helper::ExprDefBuilder;
 use txn_types::{Key, Lock, LockType, TimeStamp};
 
 const FLAG_IGNORE_TRUNCATE: u64 = 1;
@@ -171,7 +175,7 @@ fn test_stream_batch_row_limit() {
 
     let resps = handle_streaming_select(&endpoint, req, check_range);
     assert_eq!(resps.len(), 3);
-    let expected_output_counts = vec![vec![2_i64], vec![2_i64], vec![1_i64]];
+    let expected_output_counts = [vec![2_i64], vec![2_i64], vec![1_i64]];
     for (i, resp) in resps.into_iter().enumerate() {
         let mut chunk = Chunk::default();
         chunk.merge_from_bytes(resp.get_data()).unwrap();
@@ -2086,11 +2090,16 @@ fn test_select_v2_format_with_checksum() {
     for extra_checksum in [None, Some(132423)] {
         // The row value encoded with checksum bytes should have no impact on cop task
         // processing and related result chunk filling.
-        let (_, endpoint) =
+        let (mut store, endpoint) =
             init_data_with_commit_v2_checksum(&product, &data, true, extra_checksum);
+        store.insert_all_null_row(&product, Context::default(), true, extra_checksum);
         let req = DagSelect::from(&product).build();
         let mut resp = handle_select(&endpoint, req);
-        let spliter = DagChunkSpliter::new(resp.take_chunks().into(), 3);
+        let mut spliter = DagChunkSpliter::new(resp.take_chunks().into(), 3);
+        let first_row = spliter.next().unwrap();
+        assert_eq!(first_row[0], Datum::I64(0));
+        assert_eq!(first_row[1], Datum::Null);
+        assert_eq!(first_row[2], Datum::Null);
         for (row, (id, name, cnt)) in spliter.zip(data.clone()) {
             let name_datum = name.map(|s| s.as_bytes()).into();
             let expected_encoded = datum::encode_value(
@@ -2147,7 +2156,7 @@ fn test_batch_request() {
     // 2. The expected output results.
     // 3. Should the coprocessor request contain invalid region epoch.
     // 4. Should the scanned key be locked.
-    let cases = vec![
+    let cases = [
         // Basic valid case.
         (
             vec![
@@ -2210,7 +2219,7 @@ fn test_batch_request() {
     ];
     let prepare_req =
         |cluster: &mut Cluster<ServerCluster>, ranges: &Vec<HandleRange>| -> Request {
-            let original_range = ranges.get(0).unwrap();
+            let original_range = ranges.first().unwrap();
             let key_range = product.get_record_range(original_range.start, original_range.end);
             let region_key = Key::from_raw(&key_range.start);
             let mut req = DagSelect::from(&product)
@@ -2362,6 +2371,244 @@ fn test_batch_request() {
                     Key::from_raw(&product.get_record_range(range.start, range.start).start);
                 cluster.must_delete_cf(CF_LOCK, lock_key.as_encoded());
             }
+        }
+    }
+}
+
+// Make sure the response has process_wall_time_ns. Zero process_wall_time_ns
+// makes the response not be added into the TiDB coprocessor cache, which
+// will downgrade the performance.
+#[test]
+fn test_select_time_details() {
+    let data = vec![
+        (1, Some("name:0"), 2),
+        (2, Some("name:4"), 3),
+        (4, Some("name:3"), 1),
+        (5, Some("name:1"), 4),
+    ];
+
+    let product = ProductTable::new();
+    let (_, endpoint, limiter) = init_with_data_ext(&product, &data);
+    limiter.set_read_bandwidth_limit(ReadableSize::kb(1), true);
+    let req = DagSelect::from(&product).build();
+    let resp = handle_request(&endpoint, req);
+
+    let time_details_v2 = resp.get_exec_details_v2().get_time_detail_v2();
+    assert!(time_details_v2.process_wall_time_ns != 0, "{:?}", resp);
+}
+
+#[test]
+fn test_index_lookup_select() {
+    set_tls_engine(TestEngineBuilder::new().build().unwrap());
+    defer! {
+         unsafe {destroy_tls_engine::<RocksEngine>()}
+    }
+
+    let product = ProductTable::new();
+    let data = vec![
+        (1, Some("name:0"), 2),
+        (2, Some("name:4"), 3),
+        (3, Some("name:2"), 5),
+        (4, Some("name:3"), 1),
+        (5, Some("name:7"), 6),
+        (15, Some("name:1"), 4),
+    ];
+    let index_scan_peer = {
+        let mut peer = Peer::default();
+        peer.set_id(1);
+        peer.set_store_id(1);
+        peer
+    };
+
+    let region = {
+        let mut peer = index_scan_peer.clone();
+        peer.set_id(10);
+        let mut r = Region::default();
+        r.set_id(10);
+        // only handle [2, 4] can be found in the local region.
+        r.set_start_key(Key::from_raw(&encode_row_key(product.table_id(), 2)).into_encoded());
+        r.set_end_key(Key::from_raw(&encode_row_key(product.table_id(), 15)).into_encoded());
+        r.set_peers(vec![peer].into());
+        r
+    };
+
+    let (_, endpoint, _) = unsafe {
+        with_tls_engine(|e: &mut RocksEngine| {
+            e.set_region_info_provider(MockRegionInfoProvider::new(vec![region]));
+            init_data_with_details(
+                Context::default(),
+                e.clone(),
+                &product,
+                &data,
+                true,
+                &Config::default(),
+            )
+        })
+    };
+    let mut ctx = Context::default();
+    ctx.set_peer(index_scan_peer);
+    let req = DagSelect::from_index(&product, &product["name"])
+        .index_lookup(&product, vec![2])
+        // id < 5
+        .where_expr({
+            let mut cond =
+                ExprDefBuilder::scalar_func(ScalarFuncSig::LtInt, FieldTypeTp::LongLong).build();
+            cond.mut_children().push(
+                ExprDefBuilder::column_ref(
+                    offset_for_column(&product.columns_info(), product["id"].id) as usize,
+                    FieldTypeTp::Long,
+                )
+                .build(),
+            );
+            cond.mut_children()
+                .push(ExprDefBuilder::constant_int(5).build());
+            cond
+        }).projection(vec![
+            ExprDefBuilder::column_ref(
+                offset_for_column(&product.columns_info(), product["id"].id) as usize,
+                FieldTypeTp::Long,
+            ).build(),
+            ExprDefBuilder::column_ref(
+                offset_for_column(&product.columns_info(), product["name"].id) as usize,
+                FieldTypeTp::Long,
+            ).build(),
+            {
+                let mut expr =
+                ExprDefBuilder::scalar_func(ScalarFuncSig::MultiplyInt, FieldTypeTp::LongLong).build();
+                expr.mut_children().push(
+                    ExprDefBuilder::column_ref(
+                        offset_for_column(&product.columns_info(), product["count"].id) as usize,
+                        FieldTypeTp::Long,
+                    )
+                    .build(),
+                );
+                expr.mut_children().push(
+                    ExprDefBuilder::constant_int(100).build(),
+                );
+                expr
+            },
+        ])
+        .build_with(ctx, &[0]);
+    let mut resp = handle_select(&endpoint, req);
+    // check the primary row results that can be found locally.
+    let chunks = resp.take_chunks().to_vec();
+    let rows: Vec<_> = DagChunkSpliter::new(chunks, 3).collect();
+    assert_eq!(
+        vec![
+            vec![
+                Datum::I64(2),
+                Datum::Bytes(b"name:4".to_vec()),
+                Datum::I64(300),
+            ],
+            vec![
+                Datum::I64(3),
+                Datum::Bytes(b"name:2".to_vec()),
+                Datum::I64(500),
+            ],
+            vec![
+                Datum::I64(4),
+                Datum::Bytes(b"name:3".to_vec()),
+                Datum::I64(100),
+            ]
+        ],
+        rows
+    );
+
+    // check the index results that cannot perform index-lookup locally.
+    let mut intermediate_outputs = resp.take_intermediate_outputs();
+    assert_eq!(1, intermediate_outputs.len());
+    let intermediate_chunks = intermediate_outputs[0].take_chunks().to_vec();
+    let intermediate_rows: Vec<_> = DagChunkSpliter::new(intermediate_chunks, 3).collect();
+    assert_eq!(
+        vec![
+            vec![
+                Datum::Bytes(b"name:0".to_vec()),
+                Datum::I64(2),
+                Datum::I64(1)
+            ],
+            vec![
+                Datum::Bytes(b"name:1".to_vec()),
+                Datum::I64(4),
+                Datum::I64(15)
+            ],
+        ],
+        intermediate_rows
+    );
+}
+
+#[test]
+fn test_select_with_commit_ts() {
+    use futures::executor::block_on;
+    use tidb_query_datatype::{FieldTypeAccessor, FieldTypeTp};
+
+    let data = vec![
+        (1, Some("name:0"), 2),
+        (2, Some("name:4"), 3),
+        (4, Some("name:3"), 1),
+        (5, Some("name:1"), 4),
+    ];
+
+    let product = ProductTable::new();
+    let (store, endpoint, _) = init_with_data_ext(&product, &data);
+    let storage = store.get_storage().get_storage();
+
+    for commit_ts_at_first in [true, false] {
+        let mut commit_ts_col = tipb::ColumnInfo::default();
+        commit_ts_col.set_column_id(tidb_query_datatype::codec::table::EXTRA_COMMIT_TS_COL_ID);
+        commit_ts_col
+            .as_mut_accessor()
+            .set_tp(FieldTypeTp::LongLong);
+
+        let mut select = DagSelect::from(&product);
+        let columns = select
+            .execs
+            .get_mut(0)
+            .unwrap()
+            .mut_tbl_scan()
+            .mut_columns();
+        if commit_ts_at_first {
+            // To test the issue https://github.com/tikv/tikv/issues/19299
+            // when _tidb_commit_ts column is placed before PK handle should not panic.
+            columns.insert(0, commit_ts_col);
+        } else {
+            columns.push(commit_ts_col);
+        }
+        select.output_offsets = Some(vec![0, 1, 2, 3]);
+
+        let req = select.build();
+        let mut resp = handle_select(&endpoint, req);
+        let spliter = DagChunkSpliter::new(resp.take_chunks().into(), 4);
+        for (row, (id, name, cnt)) in spliter.zip(data.iter().copied()) {
+            let key = encode_row_key(product.table_id(), id);
+            let (entry, _) = block_on(storage.get_entry(
+                Context::default(),
+                Key::from_raw(&key),
+                TimeStamp::max(),
+                true,
+            ))
+            .unwrap();
+            let commit_ts = entry.unwrap().commit_ts.unwrap().into_inner() as i64;
+
+            let name_datum = name.map(|s| s.as_bytes()).into();
+            let expected = if commit_ts_at_first {
+                vec![
+                    Datum::I64(commit_ts),
+                    Datum::I64(id),
+                    name_datum,
+                    cnt.into(),
+                ]
+            } else {
+                vec![
+                    Datum::I64(id),
+                    name_datum,
+                    cnt.into(),
+                    Datum::I64(commit_ts),
+                ]
+            };
+            let expected_encoded =
+                datum::encode_value(&mut EvalContext::default(), &expected).unwrap();
+            let result_encoded = datum::encode_value(&mut EvalContext::default(), &row).unwrap();
+            assert_eq!(result_encoded, &*expected_encoded);
         }
     }
 }

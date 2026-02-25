@@ -2,19 +2,27 @@
 
 //! This file contains tests and testing tools which affects multiple actions
 
+use std::sync::Arc;
+
 use concurrency_manager::ConcurrencyManager;
 use kvproto::kvrpcpb::{
-    Assertion, AssertionLevel, Context,
+    Assertion, AssertionLevel, Context, ExtraOp,
     PrewriteRequestPessimisticAction::{self, *},
 };
-use prewrite::{prewrite, CommitKind, TransactionKind, TransactionProperties};
-use tikv_kv::SnapContext;
+use prewrite::{CommitKind, TransactionKind, TransactionProperties, prewrite};
+use tikv_kv::{SnapContext, Statistics};
 
 use super::*;
 use crate::storage::{
+    Engine,
     kv::WriteData,
-    mvcc::{tests::write, Error, Key, Mutation, MvccTxn, SnapshotReader, TimeStamp},
-    txn, Engine,
+    lock_manager::MockLockManager,
+    mvcc::{Error, Key, Mutation, MvccTxn, SnapshotReader, TimeStamp, tests::write},
+    txn,
+    txn::{
+        commands::{Flush, WriteContext, WriteResult},
+        txn_status_cache::TxnStatusCache,
+    },
 };
 
 pub fn must_prewrite_put_impl<E: Engine>(
@@ -128,7 +136,7 @@ pub fn must_prewrite_put_impl_with_should_not_exist<E: Engine>(
         ..Default::default()
     };
     let snapshot = engine.snapshot(snap_ctx).unwrap();
-    let cm = ConcurrencyManager::new(ts);
+    let cm = ConcurrencyManager::new_for_test(ts);
     let mut txn = MvccTxn::new(ts, cm);
     let mut reader = SnapshotReader::new(ts, snapshot, true);
 
@@ -197,6 +205,87 @@ pub fn must_prewrite_put<E: Engine>(
         Assertion::None,
         AssertionLevel::Off,
     );
+}
+
+pub fn flush_put_impl<E: Engine>(
+    engine: &mut E,
+    key: &[u8],
+    value: impl Into<Vec<u8>>,
+    pk: impl Into<Vec<u8>>,
+    start_ts: impl Into<TimeStamp>,
+    generation: u64,
+    should_not_exist: bool,
+) -> txn::Result<WriteResult> {
+    flush_put_impl_with_assertion(
+        engine,
+        key,
+        value,
+        pk,
+        start_ts,
+        generation,
+        should_not_exist,
+        Assertion::None,
+    )
+}
+
+pub fn flush_put_impl_with_assertion<E: Engine>(
+    engine: &mut E,
+    key: &[u8],
+    value: impl Into<Vec<u8>>,
+    pk: impl Into<Vec<u8>>,
+    start_ts: impl Into<TimeStamp>,
+    generation: u64,
+    should_not_exist: bool,
+    assertion: Assertion,
+) -> txn::Result<WriteResult> {
+    let key = Key::from_raw(key);
+    let start_ts = start_ts.into();
+    let mut m = if should_not_exist {
+        Mutation::make_insert(key, value.into())
+    } else {
+        Mutation::make_put(key, value.into())
+    };
+    m.set_assertion(assertion);
+    let cmd = Flush::new(
+        start_ts,
+        pk.into(),
+        vec![m],
+        generation,
+        3000,
+        AssertionLevel::Strict,
+        Context::new(),
+    );
+    let mut statistics = Statistics::default();
+    let cm = ConcurrencyManager::new_for_test(start_ts);
+    let context = WriteContext {
+        lock_mgr: &MockLockManager::new(),
+        concurrency_manager: cm.clone(),
+        extra_op: ExtraOp::Noop,
+        statistics: &mut statistics,
+        async_apply_prewrite: false,
+        raw_ext: None,
+        txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+    };
+    let snapshot = engine.snapshot(Default::default()).unwrap();
+    cmd.cmd.process_write(snapshot.clone(), context)
+}
+
+pub fn must_flush_put<E: Engine>(
+    engine: &mut E,
+    key: &[u8],
+    value: impl Into<Vec<u8>>,
+    pk: impl Into<Vec<u8>>,
+    start_ts: impl Into<TimeStamp>,
+    generation: u64,
+) {
+    let res = flush_put_impl(engine, key, value, pk, start_ts, generation, false);
+    assert!(res.is_ok());
+    let res = res.unwrap();
+    let to_be_write = res.to_be_write;
+    if to_be_write.modifies.is_empty() {
+        return;
+    }
+    engine.write(&Context::new(), to_be_write).unwrap();
 }
 
 pub fn must_prewrite_put_on_region<E: Engine>(
@@ -586,7 +675,7 @@ pub fn must_prewrite_put_err_impl_with_should_not_exist<E: Engine>(
 ) -> Error {
     let snapshot = engine.snapshot(Default::default()).unwrap();
     let for_update_ts = for_update_ts.into();
-    let cm = ConcurrencyManager::new(for_update_ts);
+    let cm = ConcurrencyManager::new_for_test(for_update_ts);
     let ts = ts.into();
     let mut txn = MvccTxn::new(ts, cm);
     let mut reader = SnapshotReader::new(ts, snapshot, true);
@@ -765,7 +854,7 @@ fn must_prewrite_delete_impl<E: Engine>(
     };
     let snapshot = engine.snapshot(snap_ctx).unwrap();
     let for_update_ts = for_update_ts.into();
-    let cm = ConcurrencyManager::new(for_update_ts);
+    let cm = ConcurrencyManager::new_for_test(for_update_ts);
     let ts = ts.into();
     let mut txn = MvccTxn::new(ts, cm);
     let mut reader = SnapshotReader::new(ts, snapshot, true);
@@ -844,7 +933,7 @@ fn must_prewrite_lock_impl<E: Engine>(
     let ctx = Context::default();
     let snapshot = engine.snapshot(Default::default()).unwrap();
     let for_update_ts = for_update_ts.into();
-    let cm = ConcurrencyManager::new(for_update_ts);
+    let cm = ConcurrencyManager::new_for_test(for_update_ts);
     let ts = ts.into();
     let mut txn = MvccTxn::new(ts, cm);
     let mut reader = SnapshotReader::new(ts, snapshot, true);
@@ -883,7 +972,7 @@ pub fn must_prewrite_lock_err<E: Engine>(
 ) {
     let snapshot = engine.snapshot(Default::default()).unwrap();
     let ts = ts.into();
-    let cm = ConcurrencyManager::new(ts);
+    let cm = ConcurrencyManager::new_for_test(ts);
     let mut txn = MvccTxn::new(ts, cm);
     let mut reader = SnapshotReader::new(ts, snapshot, true);
 
@@ -897,6 +986,38 @@ pub fn must_prewrite_lock_err<E: Engine>(
         None,
     )
     .unwrap_err();
+}
+
+pub fn must_shared_prewrite_lock<E: Engine>(
+    engine: &mut E,
+    key: &[u8],
+    pk: &[u8],
+    ts: impl Into<TimeStamp>,
+    for_update_ts: impl Into<TimeStamp>,
+) {
+    let ctx = Context::default();
+    let snapshot = engine.snapshot(Default::default()).unwrap();
+    let for_update_ts = for_update_ts.into();
+    let cm = ConcurrencyManager::new_for_test(for_update_ts);
+    let ts = ts.into();
+    let mut txn = MvccTxn::new(ts, cm);
+    let mut reader = SnapshotReader::new(ts, snapshot, true);
+
+    let mutation = Mutation::make_shared_lock(Key::from_raw(key));
+    prewrite(
+        &mut txn,
+        &mut reader,
+        &default_txn_props(ts, pk, for_update_ts),
+        mutation,
+        &None,
+        DoPessimisticCheck,
+        None,
+    )
+    .unwrap();
+
+    engine
+        .write(&ctx, WriteData::from_modifies(txn.into_modifies()))
+        .unwrap();
 }
 
 pub fn must_pessimistic_prewrite_lock<E: Engine>(
@@ -919,7 +1040,7 @@ pub fn must_rollback<E: Engine>(
     let ctx = Context::default();
     let snapshot = engine.snapshot(Default::default()).unwrap();
     let start_ts = start_ts.into();
-    let cm = ConcurrencyManager::new(start_ts);
+    let cm = ConcurrencyManager::new_for_test(start_ts);
     let mut txn = MvccTxn::new(start_ts, cm);
     let mut reader = SnapshotReader::new(start_ts, snapshot, true);
     txn::cleanup(
@@ -936,7 +1057,7 @@ pub fn must_rollback<E: Engine>(
 pub fn must_rollback_err<E: Engine>(engine: &mut E, key: &[u8], start_ts: impl Into<TimeStamp>) {
     let snapshot = engine.snapshot(Default::default()).unwrap();
     let start_ts = start_ts.into();
-    let cm = ConcurrencyManager::new(start_ts);
+    let cm = ConcurrencyManager::new_for_test(start_ts);
     let mut txn = MvccTxn::new(start_ts, cm);
     let mut reader = SnapshotReader::new(start_ts, snapshot, true);
     txn::cleanup(

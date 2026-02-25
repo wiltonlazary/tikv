@@ -1,15 +1,15 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{assert_matches::assert_matches, time::Duration};
+use std::time::Duration;
 
-use engine_traits::{Peekable, CF_DEFAULT};
+use engine_traits::{CF_DEFAULT, Peekable};
 use futures::executor::block_on;
 use kvproto::raft_serverpb::RaftMessage;
 use raftstore::store::{INIT_EPOCH_CONF_VER, INIT_EPOCH_VER};
-use raftstore_v2::{router::PeerMsg, SimpleWriteEncoder};
+use raftstore_v2::{SimpleWriteEncoder, router::PeerMsg};
 use tikv_util::store::new_peer;
 
-use crate::cluster::{check_skip_wal, Cluster};
+use crate::cluster::{Cluster, check_skip_wal};
 
 /// Test basic write flow.
 #[test]
@@ -123,7 +123,7 @@ fn test_put_delete() {
     let resp = block_on(sub.result()).unwrap();
     assert!(!resp.get_header().has_error(), "{:?}", resp);
     let snap = router.stale_snapshot(2);
-    assert_matches!(snap.get_value(b"key"), Ok(None));
+    assert!(matches!(snap.get_value(b"key"), Ok(None)));
 
     // Check if WAL is skipped for basic writes.
     let mut cached = cluster.node(0).tablet_registry().get(2).unwrap();

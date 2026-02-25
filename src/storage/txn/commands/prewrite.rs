@@ -15,28 +15,30 @@ use kvproto::kvrpcpb::{
 };
 use tikv_kv::SnapshotExt;
 use txn_types::{
-    insert_old_value_if_resolved, Key, Mutation, OldValue, OldValues, TimeStamp, TxnExtra, Write,
-    WriteType,
+    Key, Mutation, OldValues, TimeStamp, TxnExtra, Write, WriteType, insert_old_value_if_resolved,
 };
 
 use super::ReaderWithStats;
 use crate::storage::{
+    Context, Error as StorageError, ProcessResult, Snapshot,
     kv::WriteData,
     lock_manager::LockManager,
     mvcc::{
-        has_data_in_range, Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn,
-        Result as MvccResult, SnapshotReader, TxnCommitRecord,
+        Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader,
+        has_data_in_range, metrics::*,
     },
     txn::{
-        actions::prewrite::{prewrite, CommitKind, TransactionKind, TransactionProperties},
+        Error, ErrorInner, Result,
+        actions::{
+            common::check_committed_record_on_err,
+            prewrite::{CommitKind, TransactionKind, TransactionProperties, prewrite},
+        },
         commands::{
             Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand,
             WriteContext, WriteResult,
         },
-        Error, ErrorInner, Result,
     },
     types::PrewriteResult,
-    Context, Error as StorageError, ProcessResult, Snapshot,
 };
 
 pub(crate) const FORWARD_MIN_MUTATIONS_NUM: usize = 12;
@@ -73,6 +75,9 @@ command! {
             /// Assertions is a mechanism to check the constraint on the previous version of data
             /// that must be satisfied as long as data is consistent.
             assertion_level: AssertionLevel,
+        }
+        in_heap => {
+            primary, mutations,
         }
 }
 
@@ -233,7 +238,9 @@ impl CommandExt for Prewrite {
                     bytes += key.as_encoded().len();
                     bytes += value.len();
                 }
-                Mutation::Delete(ref key, _) | Mutation::Lock(ref key, _) => {
+                Mutation::Delete(ref key, _)
+                | Mutation::Lock(ref key, _)
+                | Mutation::SharedLock(ref key, _) => {
                     bytes += key.as_encoded().len();
                 }
                 Mutation::CheckNotExists(..) => (),
@@ -285,6 +292,11 @@ command! {
             assertion_level: AssertionLevel,
             /// Constraints on the pessimistic locks that have to be checked when prewriting.
             for_update_ts_constraints: Vec<PrewriteRequestForUpdateTsConstraint>,
+        }
+        in_heap => {
+            primary,
+            secondary_keys,
+            // TODO: for_update_ts_constraints, mutations
         }
 }
 
@@ -445,7 +457,9 @@ impl CommandExt for PrewritePessimistic {
                     bytes += key.as_encoded().len();
                     bytes += value.len();
                 }
-                Mutation::Delete(ref key, _) | Mutation::Lock(ref key, _) => {
+                Mutation::Delete(ref key, _)
+                | Mutation::Lock(ref key, _)
+                | Mutation::SharedLock(ref key, _) => {
                     bytes += key.as_encoded().len();
                 }
                 Mutation::CheckNotExists(..) => (),
@@ -489,6 +503,39 @@ impl<K: PrewriteKind> Prewriter<K> {
         snapshot: impl Snapshot,
         mut context: WriteContext<'_, impl LockManager>,
     ) -> Result<WriteResult> {
+        // Handle special cases about retried prewrite requests for pessimistic
+        // transactions.
+        if let TransactionKind::Pessimistic(_) = self.kind.txn_kind() {
+            if let Some(commit_ts) = context
+                .txn_status_cache
+                .get_committed_no_promote(self.start_ts)
+            {
+                fail_point!("before_prewrite_txn_status_cache_hit");
+                if self.ctx.is_retry_request {
+                    MVCC_PREWRITE_REQUEST_AFTER_COMMIT_COUNTER_VEC
+                        .retry_req
+                        .inc();
+                } else {
+                    MVCC_PREWRITE_REQUEST_AFTER_COMMIT_COUNTER_VEC
+                        .non_retry_req
+                        .inc();
+                }
+                warn!("prewrite request received due to transaction is known to be already committed"; "start_ts" => %self.start_ts, "commit_ts" => %commit_ts);
+                // In normal cases if the transaction is committed, then the key should have
+                // been already prewritten successfully. But in order to
+                // simplify code as well as prevent possible corner cases or
+                // special cases in the future, we disallow skipping constraint
+                // check in this case.
+                // We regard this request as a retried request no matter if it really is (the
+                // original request may arrive later than retried request due to
+                // network latency, in which case we'd better handle it like a
+                // retried request).
+                self.ctx.is_retry_request = true;
+            } else {
+                fail_point!("before_prewrite_txn_status_cache_miss");
+            }
+        }
+
         self.kind
             .can_skip_constraint_check(&mut self.mutations, &snapshot, &mut context)?;
         self.check_max_ts_synced(&snapshot)?;
@@ -570,33 +617,6 @@ impl<K: PrewriteKind> Prewriter<K> {
 
         let mut final_min_commit_ts = TimeStamp::zero();
         let mut locks = Vec::new();
-
-        // Further check whether the prewritten transaction has been committed
-        // when encountering a WriteConflict or PessimisticLockNotFound error.
-        // This extra check manages to make prewrite idempotent after the transaction
-        // was committed.
-        // Note that this check cannot fully guarantee idempotence because an MVCC
-        // GC can remove the old committed records, then we cannot determine
-        // whether the transaction has been committed, so the error is still returned.
-        fn check_committed_record_on_err(
-            prewrite_result: MvccResult<(TimeStamp, OldValue)>,
-            txn: &mut MvccTxn,
-            reader: &mut SnapshotReader<impl Snapshot>,
-            key: &Key,
-        ) -> Result<(Vec<std::result::Result<(), StorageError>>, TimeStamp)> {
-            match reader.get_txn_commit_record(key)? {
-                TxnCommitRecord::SingleRecord { commit_ts, write }
-                    if write.write_type != WriteType::Rollback =>
-                {
-                    info!("prewritten transaction has been committed";
-                        "start_ts" => reader.start_ts, "commit_ts" => commit_ts,
-                        "key" => ?key, "write_type" => ?write.write_type);
-                    txn.clear();
-                    Ok((vec![], commit_ts))
-                }
-                _ => Err(prewrite_result.unwrap_err().into()),
-            }
-        }
 
         // If there are other errors, return other error prior to `AssertionFailed`.
         let mut assertion_failure = None;
@@ -748,6 +768,11 @@ impl<K: PrewriteKind> Prewriter<K> {
                 new_acquired_locks,
                 lock_guards,
                 response_policy: ResponsePolicy::OnApplied,
+                known_txn_status: if !one_pc_commit_ts.is_zero() {
+                    vec![(self.start_ts, one_pc_commit_ts)]
+                } else {
+                    vec![]
+                },
             }
         } else {
             // Skip write stage if some keys are locked.
@@ -768,6 +793,7 @@ impl<K: PrewriteKind> Prewriter<K> {
                 new_acquired_locks: vec![],
                 lock_guards: vec![],
                 response_policy: ResponsePolicy::OnApplied,
+                known_txn_status: vec![],
             }
         };
 
@@ -966,7 +992,8 @@ fn handle_1pc_locks(txn: &mut MvccTxn, commit_ts: TimeStamp) -> ReleasedLocks {
 
 /// Change all 1pc locks in txn to 2pc locks.
 pub(in crate::storage::txn) fn fallback_1pc_locks(txn: &mut MvccTxn) {
-    for (key, lock, remove_pessimistic_lock) in std::mem::take(&mut txn.locks_for_1pc) {
+    for (key, mut lock, remove_pessimistic_lock) in std::mem::take(&mut txn.locks_for_1pc) {
+        lock.use_one_pc = false;
         let is_new_lock = !remove_pessimistic_lock;
         txn.put_lock(key, &lock, is_new_lock);
     }
@@ -974,6 +1001,8 @@ pub(in crate::storage::txn) fn fallback_1pc_locks(txn: &mut MvccTxn) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use concurrency_manager::ConcurrencyManager;
     use engine_rocks::ReadPerfInstant;
     use engine_traits::CF_WRITE;
@@ -982,10 +1011,14 @@ mod tests {
 
     use super::*;
     use crate::storage::{
-        mvcc::{tests::*, Error as MvccError, ErrorInner as MvccErrorInner},
+        Engine, MockLockManager, Snapshot, Statistics, TestEngineBuilder,
+        mvcc::{Error as MvccError, ErrorInner as MvccErrorInner, tests::*},
         txn::{
+            Error, ErrorInner,
             actions::{
-                acquire_pessimistic_lock::tests::must_pessimistic_locked,
+                acquire_pessimistic_lock::tests::{
+                    must_acquire_shared_pessimistic_lock, must_pessimistic_locked,
+                },
                 tests::{
                     must_pessimistic_prewrite_put_async_commit, must_prewrite_delete,
                     must_prewrite_put, must_prewrite_put_async_commit,
@@ -1002,10 +1035,9 @@ mod tests {
                 must_acquire_pessimistic_lock, must_acquire_pessimistic_lock_err, must_commit,
                 must_prewrite_put_err_impl, must_prewrite_put_impl, must_rollback,
             },
-            Error, ErrorInner,
+            txn_status_cache::TxnStatusCache,
         },
         types::TxnStatus,
-        Engine, MockLockManager, Snapshot, Statistics, TestEngineBuilder,
     };
 
     fn inner_test_prewrite_skip_constraint_check(pri_key_number: u8, write_num: usize) {
@@ -1128,7 +1160,7 @@ mod tests {
 
     #[test]
     fn test_prewrite_skip_too_many_tombstone() {
-        use engine_rocks::{set_perf_level, PerfLevel};
+        use engine_rocks::{PerfLevel, set_perf_level};
 
         use crate::server::gc_worker::gc_by_compact;
         let mut mutations = Vec::default();
@@ -1182,7 +1214,7 @@ mod tests {
         use crate::storage::mvcc::tests::{must_get, must_get_commit_ts, must_unlocked};
 
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = concurrency_manager::ConcurrencyManager::new(1.into());
+        let cm = concurrency_manager::ConcurrencyManager::new_for_test(1.into());
 
         let key = b"k";
         let value = b"v";
@@ -1218,7 +1250,7 @@ mod tests {
         use crate::storage::mvcc::tests::{must_get, must_get_commit_ts, must_unlocked};
 
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = concurrency_manager::ConcurrencyManager::new(1.into());
+        let cm = concurrency_manager::ConcurrencyManager::new_for_test(1.into());
 
         let key = b"k";
         let value = b"v";
@@ -1239,7 +1271,7 @@ mod tests {
         must_get(&mut engine, key, 12, value);
         must_get_commit_ts(&mut engine, key, 10, 11);
 
-        cm.update_max_ts(50.into());
+        cm.update_max_ts(50.into(), "").unwrap();
 
         let mutations = vec![Mutation::make_put(Key::from_raw(key), value.to_vec())];
 
@@ -1319,7 +1351,7 @@ mod tests {
     #[test]
     fn test_prewrite_pessimsitic_1pc() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = concurrency_manager::ConcurrencyManager::new(1.into());
+        let cm = concurrency_manager::ConcurrencyManager::new_for_test(1.into());
         let key = b"k";
         let value = b"v";
 
@@ -1381,7 +1413,7 @@ mod tests {
         must_get_commit_ts(&mut engine, k1, 8, 13);
         must_get_commit_ts(&mut engine, k2, 8, 13);
 
-        cm.update_max_ts(50.into());
+        cm.update_max_ts(50.into(), "").unwrap();
         must_acquire_pessimistic_lock(&mut engine, k1, k1, 20, 20);
 
         let mutations = vec![(
@@ -1454,7 +1486,7 @@ mod tests {
     #[test]
     fn test_prewrite_async_commit() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = concurrency_manager::ConcurrencyManager::new(1.into());
+        let cm = concurrency_manager::ConcurrencyManager::new_for_test(1.into());
 
         let key = b"k";
         let value = b"v";
@@ -1481,7 +1513,7 @@ mod tests {
         assert_eq!(res.one_pc_commit_ts, TimeStamp::zero());
         must_locked(&mut engine, key, 10);
 
-        cm.update_max_ts(50.into());
+        cm.update_max_ts(50.into(), "").unwrap();
 
         let (k1, v1) = (b"k1", b"v1");
         let (k2, v2) = (b"k2", b"v2");
@@ -1520,7 +1552,7 @@ mod tests {
     #[test]
     fn test_prewrite_pessimsitic_async_commit() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = concurrency_manager::ConcurrencyManager::new(1.into());
+        let cm = concurrency_manager::ConcurrencyManager::new_for_test(1.into());
 
         let key = b"k";
         let value = b"v";
@@ -1553,7 +1585,7 @@ mod tests {
         assert_eq!(res.one_pc_commit_ts, TimeStamp::zero());
         must_locked(&mut engine, key, 10);
 
-        cm.update_max_ts(50.into());
+        cm.update_max_ts(50.into(), "").unwrap();
 
         let (k1, v1) = (b"k1", b"v1");
         let (k2, v2) = (b"k2", b"v2");
@@ -1605,7 +1637,7 @@ mod tests {
         use engine_traits::{IterOptions, ReadOptions};
         use kvproto::kvrpcpb::ExtraOp;
 
-        use crate::storage::{kv::Result, CfName, ConcurrencyManager, MockLockManager, Value};
+        use crate::storage::{CfName, ConcurrencyManager, MockLockManager, Value, kv::Result};
         #[derive(Clone)]
         struct MockSnapshot;
 
@@ -1642,11 +1674,12 @@ mod tests {
             () => {
                 WriteContext {
                     lock_mgr: &MockLockManager::new(),
-                    concurrency_manager: ConcurrencyManager::new(10.into()),
+                    concurrency_manager: ConcurrencyManager::new_for_test(10.into()),
                     extra_op: ExtraOp::Noop,
                     statistics: &mut Statistics::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
+                    txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
                 }
             };
         }
@@ -1690,7 +1723,7 @@ mod tests {
     // this test shows which stage in raft can we return the response
     #[test]
     fn test_response_stage() {
-        let cm = ConcurrencyManager::new(42.into());
+        let cm = ConcurrencyManager::new_for_test(42.into());
         let start_ts = TimeStamp::new(10);
         let keys = [b"k1", b"k2"];
         let values = [b"v1", b"v2"];
@@ -1715,7 +1748,7 @@ mod tests {
             async_apply_prewrite: bool,
         }
 
-        let cases = vec![
+        let cases = [
             Case {
                 // basic case
                 expected: ResponsePolicy::OnApplied,
@@ -1818,6 +1851,7 @@ mod tests {
                 statistics: &mut statistics,
                 async_apply_prewrite: case.async_apply_prewrite,
                 raw_ext: None,
+                txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
             };
             let mut engine = TestEngineBuilder::new().build().unwrap();
             let snap = engine.snapshot(Default::default()).unwrap();
@@ -1831,7 +1865,7 @@ mod tests {
     fn test_prewrite_should_not_exist() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
         // concurency_manager.max_tx = 5
-        let cm = ConcurrencyManager::new(5.into());
+        let cm = ConcurrencyManager::new_for_test(5.into());
         let mut statistics = Statistics::default();
 
         let (key, value) = (b"k", b"val");
@@ -1883,7 +1917,7 @@ mod tests {
     #[test]
     fn test_optimistic_prewrite_committed_transaction() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = ConcurrencyManager::new(1.into());
+        let cm = ConcurrencyManager::new_for_test(1.into());
         let mut statistics = Statistics::default();
 
         let key = b"k";
@@ -1928,6 +1962,7 @@ mod tests {
             statistics: &mut statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let result = cmd.cmd.process_write(snap, context).unwrap();
@@ -1956,6 +1991,7 @@ mod tests {
             statistics: &mut statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let result = cmd.cmd.process_write(snap, context).unwrap();
@@ -1974,7 +2010,7 @@ mod tests {
     #[test]
     fn test_pessimistic_prewrite_committed_transaction() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = ConcurrencyManager::new(1.into());
+        let cm = ConcurrencyManager::new_for_test(1.into());
         let mut statistics = Statistics::default();
 
         let key = b"k";
@@ -2039,6 +2075,7 @@ mod tests {
             statistics: &mut statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let result = cmd.cmd.process_write(snap, context).unwrap();
@@ -2071,6 +2108,7 @@ mod tests {
             statistics: &mut statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let result = cmd.cmd.process_write(snap, context).unwrap();
@@ -2089,7 +2127,7 @@ mod tests {
     #[test]
     fn test_repeated_pessimistic_prewrite_1pc() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = ConcurrencyManager::new(1.into());
+        let cm = ConcurrencyManager::new_for_test(1.into());
         let mut statistics = Statistics::default();
 
         must_acquire_pessimistic_lock(&mut engine, b"k2", b"k2", 5, 5);
@@ -2116,7 +2154,7 @@ mod tests {
         )
         .unwrap();
         let commit_ts = res.one_pc_commit_ts;
-        cm.update_max_ts(commit_ts.next());
+        cm.update_max_ts(commit_ts.next(), "").unwrap();
         // repeate the prewrite
         let res = pessimistic_prewrite_with_cm(
             &mut engine,
@@ -2138,7 +2176,7 @@ mod tests {
     #[test]
     fn test_repeated_prewrite_non_pessimistic_lock() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = ConcurrencyManager::new(1.into());
+        let cm = ConcurrencyManager::new_for_test(1.into());
         let mut statistics = Statistics::default();
 
         let cm = &cm;
@@ -2308,7 +2346,7 @@ mod tests {
     #[test]
     fn test_prewrite_rolledback_transaction() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = ConcurrencyManager::new(1.into());
+        let cm = ConcurrencyManager::new_for_test(1.into());
         let mut statistics = Statistics::default();
 
         let k1 = b"k1";
@@ -2341,6 +2379,7 @@ mod tests {
             statistics: &mut statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         assert!(prewrite_cmd.cmd.process_write(snap, context).is_err());
@@ -2365,6 +2404,7 @@ mod tests {
             statistics: &mut statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         assert!(prewrite_cmd.cmd.process_write(snap, context).is_err());
@@ -2444,7 +2484,7 @@ mod tests {
 
         // Txn1 continues. If the two keys are sent in the single prewrite request, the
         // AssertionFailed error won't be returned since there are other error.
-        let cm = ConcurrencyManager::new(1.into());
+        let cm = ConcurrencyManager::new_for_test(1.into());
         let mut stat = Statistics::default();
         // Two keys in single request:
         let cmd = PrewritePessimistic::with_defaults(
@@ -2566,11 +2606,12 @@ mod tests {
         );
         let context = WriteContext {
             lock_mgr: &MockLockManager::new(),
-            concurrency_manager: ConcurrencyManager::new(20.into()),
+            concurrency_manager: ConcurrencyManager::new_for_test(20.into()),
             extra_op: ExtraOp::Noop,
             statistics: &mut statistics,
             async_apply_prewrite: false,
             raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let res = prewrite_cmd.cmd.process_write(snap, context).unwrap();
@@ -2586,7 +2627,7 @@ mod tests {
     #[test]
     fn test_repeated_prewrite_commit_ts_too_large() {
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = ConcurrencyManager::new(1.into());
+        let cm = ConcurrencyManager::new_for_test(1.into());
         let mut statistics = Statistics::default();
 
         // First, prewrite and commit normally.
@@ -2623,7 +2664,7 @@ mod tests {
         must_commit(&mut engine, b"k2", 5, 18);
 
         // Update max_ts to be larger than the max_commit_ts.
-        cm.update_max_ts(50.into());
+        cm.update_max_ts(50.into(), "").unwrap();
 
         // Retry the prewrite on non-pessimistic key.
         // (is_retry_request flag is not set, here we don't rely on it.)
@@ -2656,7 +2697,7 @@ mod tests {
         use crate::storage::txn::sched_pool::set_tls_feature_gate;
 
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = concurrency_manager::ConcurrencyManager::new(1.into());
+        let cm = concurrency_manager::ConcurrencyManager::new_for_test(1.into());
 
         let key = b"k";
         let value = b"v";
@@ -2738,7 +2779,7 @@ mod tests {
         use crate::storage::txn::sched_pool::set_tls_feature_gate;
 
         let mut engine = TestEngineBuilder::new().build().unwrap();
-        let cm = concurrency_manager::ConcurrencyManager::new(1.into());
+        let cm = concurrency_manager::ConcurrencyManager::new_for_test(1.into());
 
         let key = b"k";
         let value = b"v";
@@ -2950,5 +2991,55 @@ mod tests {
         must_locked(&mut engine, k1, 10);
         must_locked(&mut engine, k2, 10);
         must_locked(&mut engine, k3, 10);
+    }
+
+    #[test]
+    fn test_shared_lock_prewrite_cannot_amend_pessimistic_lock() {
+        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let cm = ConcurrencyManager::new_for_test(1.into());
+        let mut statistics = Statistics::default();
+
+        let key = b"shared-lock-key";
+        let cmd = PrewritePessimistic::with_defaults(
+            vec![(
+                Mutation::make_shared_lock(Key::from_raw(key)),
+                DoPessimisticCheck,
+            )],
+            key.to_vec(),
+            10.into(),
+            10.into(),
+        );
+        // cannot amend pessimistic lock when there is no shared lock.
+        let err = prewrite_command(&mut engine, cm.clone(), &mut statistics, cmd).unwrap_err();
+        assert!(matches!(
+            err,
+            Error(box ErrorInner::Mvcc(MvccError(box MvccErrorInner::PessimisticLockNotFound {
+                ..
+            })))
+        ));
+
+        // Create a shared lock belonging to another transaction
+        must_acquire_shared_pessimistic_lock(&mut engine, key, key, 11u64, 11u64, 2000);
+        must_load_shared_lock(&mut engine, key);
+
+        let cmd = PrewritePessimistic::with_defaults(
+            vec![(
+                Mutation::make_shared_lock(Key::from_raw(key)),
+                DoPessimisticCheck,
+            )],
+            key.to_vec(),
+            10.into(),
+            10.into(),
+        );
+        // cannot amend pessimistic lock when there is shared lock belong to another
+        // transaction.
+        let err = prewrite_command(&mut engine, cm, &mut statistics, cmd).unwrap_err();
+        assert!(matches!(
+            err,
+            Error(box ErrorInner::Mvcc(MvccError(box MvccErrorInner::PessimisticLockNotFound {
+                ..
+            })))
+        ));
+        must_load_shared_lock(&mut engine, key);
     }
 }

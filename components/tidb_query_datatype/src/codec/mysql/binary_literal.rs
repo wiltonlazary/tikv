@@ -2,11 +2,12 @@
 
 use std::{
     cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd},
+    fmt,
     string::ToString,
 };
 
 use crate::{
-    codec::{error::Error, Result},
+    codec::{Result, error::Error},
     expr::EvalContext,
 };
 
@@ -76,7 +77,7 @@ impl BinaryLiteral {
             // format is x'val' or X'val'
             let trimed = s[1..].trim_start_matches('\'');
             let trimed = trimed.trim_end_matches('\'');
-            if trimed.len() % 2 != 0 {
+            if !trimed.len().is_multiple_of(2) {
                 return Err(box_err!(
                     "invalid hexadecimal format, must even numbers, but {}",
                     s.len()
@@ -171,12 +172,12 @@ impl BinaryLiteral {
     }
 }
 
-impl ToString for BinaryLiteral {
-    fn to_string(&self) -> String {
+impl fmt::Display for BinaryLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.is_empty() {
-            return String::new();
+            return Ok(());
         }
-        format!("0x{}", hex::encode(self.0.as_slice()))
+        write!(f, "0x{}", hex::encode(self.0.as_slice()))
     }
 }
 

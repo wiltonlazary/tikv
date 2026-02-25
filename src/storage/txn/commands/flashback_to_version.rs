@@ -7,11 +7,13 @@ use tikv_kv::ScanMode;
 use txn_types::{Key, TimeStamp};
 
 use crate::storage::{
+    ProcessResult, Snapshot,
     kv::WriteData,
     lock_manager::LockManager,
     metrics::{CommandKind, KV_COMMAND_COUNTER_VEC_STATIC},
     mvcc::{MvccReader, MvccTxn},
     txn::{
+        Result,
         actions::flashback_to_version::{
             commit_flashback_key, flashback_to_version_write, prewrite_flashback_key,
             rollback_locks,
@@ -20,15 +22,17 @@ use crate::storage::{
             Command, CommandExt, FlashbackToVersionReadPhase, FlashbackToVersionState,
             ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand, WriteContext, WriteResult,
         },
-        latch, Result,
+        latch,
     },
-    ProcessResult, Snapshot,
 };
 
 command! {
     FlashbackToVersion:
         cmd_ty => (),
-        display => "kv::command::flashback_to_version -> {} | {} {} | {:?}", (version, start_ts, commit_ts, ctx),
+        display => {
+            "kv::command::flashback_to_version -> {} | {} {} | {:?}",
+            (version, start_ts, commit_ts, ctx),
+        }
         content => {
             start_ts: TimeStamp,
             commit_ts: TimeStamp,
@@ -36,6 +40,10 @@ command! {
             start_key: Key,
             end_key: Option<Key>,
             state: FlashbackToVersionState,
+        }
+        in_heap => {
+            start_key,
+            end_key,
         }
 }
 
@@ -185,6 +193,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for FlashbackToVersion {
             new_acquired_locks: vec![],
             lock_guards: vec![],
             response_policy: ResponsePolicy::OnApplied,
+            known_txn_status: vec![],
         })
     }
 }

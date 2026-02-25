@@ -21,6 +21,13 @@ pub enum Tz {
 }
 
 impl Tz {
+    pub fn get_chrono_tz(&self) -> Option<chrono_tz::Tz> {
+        match self {
+            Tz::Name(tz) => Some(*tz),
+            _ => None,
+        }
+    }
+
     /// Constructs a time zone from the offset in seconds.
     pub fn from_offset(secs: i64) -> Option<Self> {
         FixedOffset::east_opt(secs as i32).map(Tz::Offset)
@@ -68,6 +75,7 @@ impl fmt::Display for Tz {
     }
 }
 
+#[allow(deprecated)]
 impl TimeZone for Tz {
     type Offset = TzOffset;
 

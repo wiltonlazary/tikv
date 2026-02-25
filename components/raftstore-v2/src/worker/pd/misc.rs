@@ -1,18 +1,17 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 
 use causal_ts::CausalTsProvider;
 use engine_traits::{KvEngine, RaftEngine};
-use futures::{compat::Future01CompatExt, FutureExt};
+use futures::{FutureExt, compat::Future01CompatExt};
 use pd_client::PdClient;
-use raftstore::{store::TxnExt, Result};
+use raftstore::{Result, store::TxnExt};
 use slog::{info, warn};
 use tikv_util::{box_err, timer::GLOBAL_TIMER_HANDLE};
-use txn_types::TimeStamp;
 
 use super::Runner;
 
@@ -51,18 +50,22 @@ where
                 // And it won't break correctness of transaction commands, as
                 // causal_ts_provider.flush() is implemented as
                 // pd_client.get_tso() + renew TSO cached.
-                let res: Result<TimeStamp> = if let Some(causal_ts_provider) = &causal_ts_provider {
+                let res: Result<()> = if let Some(causal_ts_provider) = &causal_ts_provider {
                     causal_ts_provider
                         .async_flush()
                         .await
                         .map_err(|e| box_err!(e))
                 } else {
                     pd_client.get_tso().await.map_err(Into::into)
-                };
+                }
+                .and_then(|ts| {
+                    concurrency_manager
+                        .update_max_ts(ts, "raftstore-v2")
+                        .map_err(|e| crate::Error::Other(box_err!(e)))
+                });
 
                 match res {
-                    Ok(ts) => {
-                        concurrency_manager.update_max_ts(ts);
+                    Ok(()) => {
                         success = txn_ext
                             .max_ts_sync_status
                             .compare_exchange(

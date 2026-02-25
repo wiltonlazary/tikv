@@ -19,19 +19,19 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
 };
 
-use futures::{task::AtomicWaker, FutureExt, Stream};
+use futures::{FutureExt, Stream, task::AtomicWaker};
 use kvproto::{kvrpcpb::ExtraOp as TxnExtraOp, raft_cmdpb::RaftCmdResponse};
 use raftstore::store::{
-    local_metrics::TimeTracker, msg::ErrorCallback, region_meta::RegionMeta, ReadCallback,
-    WriteCallback,
+    ReadCallback, WriteCallback, local_metrics::TimeTracker, msg::ErrorCallback,
+    region_meta::RegionMeta,
 };
-use tracker::{get_tls_tracker_token, TrackerToken};
+use tracker::{TrackerToken, get_tls_tracker_token};
 
 union Tracker {
     read: TrackerToken,
@@ -49,6 +49,7 @@ struct EventCore<Res> {
     /// - 0b01 means the event is fired and not subscribed.
     /// - 0b10 means the event is not fired and subscribed.
     /// - 0b11 means the event is fired and subscribed.
+    ///
     /// Event 0 and Event 31 is reserved as payload and cancel respectively.
     /// Other events should be defined within [1, 30].
     event: AtomicU64,
@@ -152,7 +153,7 @@ fn check_bit(e: u64, fired_bit: u64) -> Option<bool> {
     None
 }
 
-impl<'a, Res> Future for WaitEvent<'a, Res> {
+impl<Res> Future for WaitEvent<'_, Res> {
     type Output = bool;
 
     #[inline]
@@ -186,7 +187,7 @@ struct WaitResult<'a, Res> {
     sub: &'a BaseSubscriber<Res>,
 }
 
-impl<'a, Res> Future for WaitResult<'a, Res> {
+impl<Res> Future for WaitResult<'_, Res> {
     type Output = Option<Res>;
 
     #[inline]
@@ -727,9 +728,8 @@ pub use flush_channel::{FlushChannel, FlushSubscriber};
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
 
-    use futures::{executor::block_on, StreamExt};
+    use futures::{StreamExt, executor::block_on};
 
     use super::*;
 
@@ -790,7 +790,9 @@ mod tests {
         let (chan, sub) = builder.build();
         let mut stream = CmdResStream::new(sub);
         chan.set_result(RaftCmdResponse::default());
-        assert_matches!(block_on(stream.next()), Some(CmdResEvent::Finished(res)) if res.get_header().get_current_term() == 6);
+        assert!(
+            matches!(block_on(stream.next()), Some(CmdResEvent::Finished(res)) if res.get_header().get_current_term() == 6)
+        );
 
         // When using builder, no event is subscribed by default.
         let (mut chan, sub) = CmdResChannelBuilder::default().build();
@@ -798,7 +800,7 @@ mod tests {
         chan.notify_proposed();
         chan.notify_committed();
         drop(chan);
-        assert_matches!(block_on(stream.next()), None);
+        assert!(block_on(stream.next()).is_none());
 
         let mut builder = CmdResChannelBuilder::default();
         builder.subscribe_proposed();
@@ -806,9 +808,12 @@ mod tests {
         let mut stream = CmdResStream::new(sub);
         chan.notify_proposed();
         chan.notify_committed();
-        assert_matches!(block_on(stream.next()), Some(CmdResEvent::Proposed));
+        assert!(matches!(
+            block_on(stream.next()),
+            Some(CmdResEvent::Proposed)
+        ));
         drop(chan);
-        assert_matches!(block_on(stream.next()), None);
+        assert!(block_on(stream.next()).is_none());
 
         let mut builder = CmdResChannelBuilder::default();
         builder.subscribe_committed();
@@ -816,8 +821,11 @@ mod tests {
         let mut stream = CmdResStream::new(sub);
         chan.notify_proposed();
         chan.notify_committed();
-        assert_matches!(block_on(stream.next()), Some(CmdResEvent::Committed));
+        assert!(matches!(
+            block_on(stream.next()),
+            Some(CmdResEvent::Committed)
+        ));
         drop(chan);
-        assert_matches!(block_on(stream.next()), None);
+        assert!(block_on(stream.next()).is_none());
     }
 }

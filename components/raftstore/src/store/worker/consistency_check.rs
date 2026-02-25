@@ -9,7 +9,7 @@ use tikv_util::{error, info, warn, worker::Runnable};
 
 use super::metrics::*;
 use crate::{
-    coprocessor::{dispatcher::StoreHandle, CoprocessorHost},
+    coprocessor::{CoprocessorHost, dispatcher::StoreHandle},
     store::metrics::*,
 };
 
@@ -114,19 +114,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{assert_matches::assert_matches, sync::mpsc, time::Duration};
+    use std::{sync::mpsc, time::Duration};
 
     use byteorder::{BigEndian, WriteBytesExt};
-    use engine_test::kv::{new_engine, KvTestEngine};
-    use engine_traits::{KvEngine, SyncMutable, ALL_CFS};
+    use engine_test::kv::{KvTestEngine, new_engine};
+    use engine_traits::{ALL_CFS, KvEngine, SyncMutable};
     use kvproto::metapb::*;
     use tempfile::Builder;
     use tikv_util::worker::Runnable;
 
     use super::*;
     use crate::coprocessor::{
-        dispatcher::SchedTask, BoxConsistencyCheckObserver, ConsistencyCheckMethod,
-        RawConsistencyCheckObserver,
+        BoxConsistencyCheckObserver, ConsistencyCheckMethod, RawConsistencyCheckObserver,
+        dispatcher::SchedTask,
     };
 
     #[test]
@@ -168,8 +168,10 @@ mod tests {
         checksum_bytes.write_u32::<BigEndian>(sum).unwrap();
 
         let res = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_matches!(res, SchedTask::UpdateComputeHashResult { region_id, index, hash, context} if
-            region_id == region.get_id() && index == 10 && context == vec![0] && hash == checksum_bytes
+        assert!(
+            matches!(res, SchedTask::UpdateComputeHashResult { region_id, index, hash, context} if
+                region_id == region.get_id() && index == 10 && context == vec![0] && hash == checksum_bytes
+            )
         );
     }
 }

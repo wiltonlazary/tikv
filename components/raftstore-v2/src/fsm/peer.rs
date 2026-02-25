@@ -10,21 +10,21 @@ use encryption_export::DataKeyManager;
 use engine_traits::{KvEngine, RaftEngine, TabletRegistry};
 use kvproto::{errorpb, raft_cmdpb::RaftCmdResponse};
 use raftstore::store::{Config, ReadCallback, TabletSnapManager, Transport};
-use slog::{debug, info, trace, Logger};
+use slog::{Logger, debug, info, trace};
 use tikv_util::{
     is_zero_duration,
     mpsc::{self, LooseBoundedSender, Receiver},
     slog_panic,
-    time::{duration_to_sec, Instant},
+    time::{Instant, duration_to_sec},
 };
-use tracker::{TrackerToken, GLOBAL_TRACKERS};
+use tracker::{GLOBAL_TRACKERS, TrackerToken};
 
 use crate::{
+    Result,
     batch::StoreContext,
     operation::ReplayWatch,
     raft::{Peer, Storage},
     router::{PeerMsg, PeerTick, QueryResult},
-    Result,
 };
 
 pub type SenderFsmPair<EK, ER> = (LooseBoundedSender<PeerMsg>, Box<PeerFsm<EK, ER>>);
@@ -102,6 +102,8 @@ impl<EK: KvEngine, ER: RaftEngine> PeerFsm<EK, ER> {
 
 impl<EK: KvEngine, ER: RaftEngine> Fsm for PeerFsm<EK, ER> {
     type Message = PeerMsg;
+
+    const FSM_TYPE: batch_system::FsmType = batch_system::FsmType::store;
 
     #[inline]
     fn is_stopped(&self) -> bool {
@@ -196,6 +198,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> PeerFsmDelegate<'a, EK, ER,
         self.schedule_tick(PeerTick::SplitRegionCheck);
         self.schedule_tick(PeerTick::PdHeartbeat);
         self.schedule_tick(PeerTick::CompactLog);
+        self.fsm.peer.on_check_merge(self.store_ctx);
         if self.fsm.peer.storage().is_initialized() {
             self.fsm.peer.schedule_apply_fsm(self.store_ctx);
         }
@@ -246,8 +249,10 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> PeerFsmDelegate<'a, EK, ER,
     pub fn on_msgs(&mut self, peer_msgs_buf: &mut Vec<PeerMsg>) {
         for msg in peer_msgs_buf.drain(..) {
             match msg {
-                PeerMsg::RaftMessage(msg) => {
-                    self.fsm.peer.on_raft_message(self.store_ctx, msg);
+                PeerMsg::RaftMessage(msg, send_time) => {
+                    self.fsm
+                        .peer
+                        .on_raft_message(self.store_ctx, msg, send_time);
                 }
                 PeerMsg::RaftQuery(cmd) => {
                     self.on_receive_command(cmd.send_time, cmd.ch.read_tracker());
@@ -266,6 +271,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> PeerFsmDelegate<'a, EK, ER,
                         write.header,
                         write.data,
                         write.ch,
+                        Some(write.extra_opts),
                     );
                 }
                 PeerMsg::UnsafeWrite(write) => {
@@ -313,6 +319,9 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> PeerFsmDelegate<'a, EK, ER,
                 }
                 PeerMsg::StoreUnreachable { to_store_id } => {
                     self.fsm.peer_mut().on_store_unreachable(to_store_id)
+                }
+                PeerMsg::StoreMaybeTombstone { store_id } => {
+                    self.fsm.peer_mut().on_store_maybe_tombstone(store_id)
                 }
                 PeerMsg::SnapshotSent { to_peer_id, status } => {
                     self.fsm.peer_mut().on_snapshot_sent(to_peer_id, status)
@@ -377,9 +386,10 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> PeerFsmDelegate<'a, EK, ER,
                     syncer,
                     failed_stores,
                 ),
-                PeerMsg::ExitForceLeaderState => {
-                    self.fsm.peer_mut().on_exit_force_leader(self.store_ctx)
-                }
+                PeerMsg::ExitForceLeaderState => self
+                    .fsm
+                    .peer_mut()
+                    .on_exit_force_leader(self.store_ctx, false),
                 PeerMsg::ExitForceLeaderStateCampaign => {
                     self.fsm.peer_mut().on_exit_force_leader_campaign()
                 }
@@ -413,6 +423,9 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> PeerFsmDelegate<'a, EK, ER,
         // TODO: instead of propose pending commands immediately, we should use timeout.
         self.fsm.peer.propose_pending_writes(self.store_ctx);
         self.schedule_pending_ticks();
+        if self.fsm.peer.maybe_ack_transfer_leader_msg(self.store_ctx) {
+            self.fsm.peer.set_has_ready();
+        }
     }
 }
 

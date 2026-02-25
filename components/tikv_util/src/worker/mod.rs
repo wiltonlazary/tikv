@@ -16,13 +16,13 @@ mod metrics;
 mod pool;
 
 pub use pool::{
-    dummy_scheduler, Builder, LazyWorker, ReceiverWrapper, Runnable, RunnableWithTimer,
-    ScheduleError, Scheduler, Worker,
+    Builder, LazyWorker, ReceiverWrapper, Runnable, RunnableWithTimer, ScheduleError, Scheduler,
+    Worker, dummy_scheduler,
 };
 
 pub use self::future::{
-    dummy_scheduler as dummy_future_scheduler, Runnable as FutureRunnable,
-    Scheduler as FutureScheduler, Stopped, Worker as FutureWorker,
+    Runnable as FutureRunnable, Scheduler as FutureScheduler, Stopped, Worker as FutureWorker,
+    dummy_scheduler as dummy_future_scheduler,
 };
 
 #[cfg(test)]
@@ -64,6 +64,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct TickRunner {
         ch: mpsc::Sender<&'static str>,
     }
@@ -101,7 +102,7 @@ mod tests {
         assert!(worker.is_busy());
         drop(worker);
         // when shutdown, StepRunner should send back a 0.
-        assert_eq!(0, rx.recv().unwrap());
+        assert_eq!(0, rx.recv_timeout(Duration::from_secs(3)).unwrap());
     }
 
     #[test]
@@ -116,7 +117,7 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), 90);
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), 110);
         worker.stop();
-        assert_eq!(0, rx.recv().unwrap());
+        assert_eq!(0, rx.recv_timeout(Duration::from_secs(3)).unwrap());
     }
 
     #[test]

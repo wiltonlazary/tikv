@@ -1,37 +1,47 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{fmt::Write, path::Path, sync::Arc, thread, time::Duration};
+use std::{
+    fmt::Write,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
-use encryption_export::{data_key_manager_from_config, DataKeyManager};
+use encryption_export::{DataKeyManager, data_key_manager_from_config};
 use engine_rocks::{RocksEngine, RocksStatistics};
 use engine_test::raft::RaftTestEngine;
-use engine_traits::{CfName, KvEngine, TabletRegistry, CF_DEFAULT};
+use engine_traits::{CF_DEFAULT, CfName, KvEngine, TabletRegistry};
 use file_system::IoRateLimiter;
 use futures::future::BoxFuture;
+use grpcio::{ChannelBuilder, Environment};
 use kvproto::{
     encryptionpb::EncryptionMethod,
-    kvrpcpb::Context,
+    kvrpcpb::{Context, DiskFullOpt, GetResponse, Mutation, PrewriteResponse},
     metapb,
     raft_cmdpb::{CmdType, RaftCmdRequest, RaftCmdResponse},
+    tikvpb::TikvClient,
 };
-use raftstore::{store::ReadResponse, Result};
-use rand::{prelude::SliceRandom, RngCore};
+use raftstore::{Result, store::ReadResponse};
+use rand::{RngCore, prelude::SliceRandom};
 use server::common::ConfiguredRaftEngine;
 use tempfile::TempDir;
-use test_raftstore::{new_get_cmd, new_put_cf_cmd, new_request, new_snap_cmd, Config};
+use test_pd_client::TestPdClient;
+use test_raftstore::{Config, new_get_cmd, new_put_cf_cmd, new_request, new_snap_cmd, sleep_ms};
 use tikv::{
     server::KvEngineFactoryBuilder,
     storage::{
+        Engine, Snapshot,
         kv::{SnapContext, SnapshotExt},
-        point_key_range, Engine, Snapshot,
+        point_key_range,
     },
 };
 use tikv_util::{
-    config::ReadableDuration, escape, future::block_on_timeout, worker::LazyWorker, HandyRwLock,
+    HandyRwLock, config::ReadableDuration, escape, future::block_on_timeout,
+    thread_name_prefix::SST_RECOVERY_THREAD, time::InstantExt, worker::LazyWorker,
 };
 use txn_types::Key;
 
-use crate::{bootstrap_store, cluster::Cluster, ServerCluster, Simulator};
+use crate::{ServerCluster, Simulator, bootstrap_store, cluster::Cluster};
 
 pub fn create_test_engine(
     // TODO: pass it in for all cases.
@@ -61,7 +71,7 @@ pub fn create_test_engine(
         .build_shared_rocks_env(key_manager.clone(), limiter)
         .unwrap();
 
-    let sst_worker = LazyWorker::new("sst-recovery");
+    let sst_worker = LazyWorker::new(SST_RECOVERY_THREAD);
     let scheduler = sst_worker.scheduler();
 
     let (raft_engine, raft_statistics) = RaftTestEngine::build(&cfg, &env, &key_manager, &cache);
@@ -71,8 +81,14 @@ pub fn create_test_engine(
         bootstrap_store(&raft_engine, cluster_id, store_id).unwrap();
     }
 
-    let builder = KvEngineFactoryBuilder::new(env, &cfg.tikv, cache, key_manager.clone())
-        .sst_recovery_sender(Some(scheduler));
+    let builder = KvEngineFactoryBuilder::new(
+        env,
+        &cfg.tikv,
+        cache,
+        key_manager.clone(),
+        Default::default(),
+    )
+    .sst_recovery_sender(Some(scheduler));
 
     let factory = Box::new(builder.build());
     let rocks_statistics = factory.rocks_statistics();
@@ -131,12 +147,12 @@ pub fn put_cf_till_size<T: Simulator<EK>, EK: KvEngine>(
 }
 
 pub fn configure_for_encryption(config: &mut Config) {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let master_key = test_util::new_test_file_master_key(config.cfg_dir.as_ref().unwrap().path());
 
     let cfg = &mut config.security.encryption;
     cfg.data_encryption_method = EncryptionMethod::Aes128Ctr;
     cfg.data_key_rotation_period = ReadableDuration(Duration::from_millis(100));
-    cfg.master_key = test_util::new_test_file_master_key(manifest_dir);
+    cfg.master_key = master_key;
 }
 
 pub fn configure_for_snapshot(config: &mut Config) {
@@ -189,17 +205,31 @@ pub fn wait_for_synced(
         .get(&node_id)
         .unwrap()
         .clone();
-    let leader = cluster.leader_of_region(region_id).unwrap();
-    let epoch = cluster.get_region_epoch(region_id);
-    let mut ctx = Context::default();
-    ctx.set_region_id(region_id);
-    ctx.set_peer(leader);
-    ctx.set_region_epoch(epoch);
-    let snap_ctx = SnapContext {
-        pb_ctx: &ctx,
-        ..Default::default()
+
+    let mut count = 0;
+    let snapshot = loop {
+        count += 1;
+        let leader = cluster.leader_of_region(region_id).unwrap();
+        let epoch = cluster.get_region_epoch(region_id);
+        let mut ctx = Context::default();
+        ctx.set_region_id(region_id);
+        ctx.set_peer(leader);
+        ctx.set_region_epoch(epoch);
+        let snap_ctx = SnapContext {
+            pb_ctx: &ctx,
+            ..Default::default()
+        };
+        match storage.snapshot(snap_ctx) {
+            Ok(s) => break s,
+            Err(e) => {
+                if count <= 5 {
+                    continue;
+                }
+                panic!("all retry failed: {:?}", e);
+            }
+        }
     };
-    let snapshot = storage.snapshot(snap_ctx).unwrap();
+
     let txn_ext = snapshot.txn_ext.clone().unwrap();
     for retry in 0..10 {
         if txn_ext.is_max_ts_synced() {
@@ -436,7 +466,7 @@ pub fn wait_down_peers<T: Simulator<EK>, EK: KvEngine>(
 ) {
     let mut peers = cluster.get_down_peers();
     for _ in 1..1000 {
-        if peers.len() == count as usize && peer.as_ref().map_or(true, |p| peers.contains_key(p)) {
+        if peers.len() == count as usize && peer.as_ref().is_none_or(|p| peers.contains_key(p)) {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -446,4 +476,137 @@ pub fn wait_down_peers<T: Simulator<EK>, EK: KvEngine>(
         "got {:?}, want {} peers which should include {:?}",
         peers, count, peer
     );
+}
+
+pub fn wait_region_epoch_change<T: Simulator<EK>, EK: KvEngine>(
+    cluster: &Cluster<T, EK>,
+    waited_region: &metapb::Region,
+    timeout: Duration,
+) {
+    let timer = Instant::now();
+    loop {
+        if waited_region.get_region_epoch().get_version()
+            == cluster
+                .get_region_epoch(waited_region.get_id())
+                .get_version()
+        {
+            if timer.saturating_elapsed() > timeout {
+                panic!(
+                    "region {:?}, region epoch is still not changed.",
+                    waited_region
+                );
+            }
+        } else {
+            break;
+        }
+        sleep_ms(10);
+    }
+}
+
+pub struct PeerClient {
+    pub cli: TikvClient,
+    pub ctx: Context,
+}
+
+impl PeerClient {
+    pub fn new<EK: KvEngine>(
+        cluster: &Cluster<ServerCluster<EK>, EK>,
+        region_id: u64,
+        peer: metapb::Peer,
+    ) -> PeerClient {
+        let cli = {
+            let env = Arc::new(Environment::new(1));
+            let channel =
+                ChannelBuilder::new(env).connect(&cluster.sim.rl().get_addr(peer.get_store_id()));
+            TikvClient::new(channel)
+        };
+        let ctx = {
+            let epoch = cluster.get_region_epoch(region_id);
+            let mut ctx = Context::default();
+            ctx.set_region_id(region_id);
+            ctx.set_peer(peer);
+            ctx.set_region_epoch(epoch);
+            ctx
+        };
+        PeerClient { cli, ctx }
+    }
+
+    pub fn kv_read(&self, key: Vec<u8>, ts: u64) -> GetResponse {
+        test_raftstore::kv_read(&self.cli, self.ctx.clone(), key, ts)
+    }
+
+    pub fn must_kv_read_equal(&self, key: Vec<u8>, val: Vec<u8>, ts: u64) {
+        test_raftstore::must_kv_read_equal(&self.cli, self.ctx.clone(), key, val, ts)
+    }
+
+    pub fn must_kv_write(&self, pd_client: &TestPdClient, kvs: Vec<Mutation>, pk: Vec<u8>) -> u64 {
+        test_raftstore::must_kv_write(pd_client, &self.cli, self.ctx.clone(), kvs, pk)
+    }
+
+    pub fn must_kv_prewrite(&self, muts: Vec<Mutation>, pk: Vec<u8>, ts: u64) {
+        test_raftstore::must_kv_prewrite(&self.cli, self.ctx.clone(), muts, pk, ts)
+    }
+
+    pub fn try_kv_prewrite(
+        &self,
+        muts: Vec<Mutation>,
+        pk: Vec<u8>,
+        ts: u64,
+        opt: DiskFullOpt,
+    ) -> PrewriteResponse {
+        let mut ctx = self.ctx.clone();
+        ctx.disk_full_opt = opt;
+        test_raftstore::try_kv_prewrite(&self.cli, ctx, muts, pk, ts)
+    }
+
+    pub fn must_kv_prewrite_async_commit(&self, muts: Vec<Mutation>, pk: Vec<u8>, ts: u64) {
+        test_raftstore::must_kv_prewrite_with(
+            &self.cli,
+            self.ctx.clone(),
+            muts,
+            vec![],
+            pk,
+            ts,
+            0,
+            true,
+            false,
+        )
+    }
+
+    pub fn must_kv_prewrite_one_pc(&self, muts: Vec<Mutation>, pk: Vec<u8>, ts: u64) {
+        test_raftstore::must_kv_prewrite_with(
+            &self.cli,
+            self.ctx.clone(),
+            muts,
+            vec![],
+            pk,
+            ts,
+            0,
+            false,
+            true,
+        )
+    }
+
+    pub fn must_kv_commit(&self, keys: Vec<Vec<u8>>, start_ts: u64, commit_ts: u64) {
+        test_raftstore::must_kv_commit(
+            &self.cli,
+            self.ctx.clone(),
+            keys,
+            start_ts,
+            commit_ts,
+            commit_ts,
+        )
+    }
+
+    pub fn must_kv_rollback(&self, keys: Vec<Vec<u8>>, start_ts: u64) {
+        test_raftstore::must_kv_rollback(&self.cli, self.ctx.clone(), keys, start_ts)
+    }
+
+    pub fn must_kv_pessimistic_lock(&self, key: Vec<u8>, ts: u64) {
+        test_raftstore::must_kv_pessimistic_lock(&self.cli, self.ctx.clone(), key, ts)
+    }
+
+    pub fn must_kv_pessimistic_rollback(&self, key: Vec<u8>, ts: u64) {
+        test_raftstore::must_kv_pessimistic_rollback(&self.cli, self.ctx.clone(), key, ts, ts)
+    }
 }

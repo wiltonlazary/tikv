@@ -1,22 +1,36 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, result::Result, sync::Arc};
 
 use dashmap::{
-    mapref::{entry::Entry, one::RefMut as DashRefMut},
     DashMap,
+    mapref::{entry::Entry, one::RefMut as DashRefMut},
 };
 use kvproto::metapb::Region;
 use raftstore::coprocessor::*;
-use resolved_ts::{Resolver, TsSource};
-use tikv_util::{info, memory::MemoryQuota, warn};
+use resolved_ts::{Resolver, TsSource, TxnLocks};
+use tikv::storage::txn::txn_status_cache::TxnStatusCache;
+use tikv_util::{
+    info,
+    memory::{MemoryQuota, MemoryQuotaExceeded},
+    warn,
+};
 use txn_types::TimeStamp;
 
 use crate::{debug, metrics::TRACK_REGION, utils};
 
-/// A utility to tracing the regions being subscripted.
-#[derive(Clone, Default, Debug)]
-pub struct SubscriptionTracer(Arc<DashMap<u64, SubscribeState>>);
+/// A utility to tracing the regions being subscribed.
+#[derive(Clone)]
+pub struct SubscriptionTracer(
+    pub Arc<DashMap<u64, SubscribeState>>,
+    pub Arc<TxnStatusCache>,
+);
+
+impl std::fmt::Debug for SubscriptionTracer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SubscriptionTracer").field(&self.0).finish()
+    }
+}
 
 /// The state of the subscription state machine:
 /// Initial state is `ABSENT`, the subscription isn't in the tracer.
@@ -27,7 +41,7 @@ pub struct SubscriptionTracer(Arc<DashMap<u64, SubscribeState>>);
 /// You may notice there are also some state transforms in the
 /// [`TwoPhaseResolver`] struct, states there are sub-states of the `RUNNING`
 /// stage here.
-enum SubscribeState {
+pub enum SubscribeState {
     // NOTE: shall we add `SubscriptionHandle` here?
     // (So we can check this when calling `remove_if`.)
     Pending(Region),
@@ -69,8 +83,13 @@ impl std::fmt::Debug for ActiveSubscription {
 }
 
 impl ActiveSubscription {
-    pub fn new(region: Region, handle: ObserveHandle, start_ts: Option<TimeStamp>) -> Self {
-        let resolver = TwoPhaseResolver::new(region.get_id(), start_ts);
+    pub fn new(
+        region: Region,
+        handle: ObserveHandle,
+        start_ts: Option<TimeStamp>,
+        txn_status_cache: Arc<TxnStatusCache>,
+    ) -> Self {
+        let resolver = TwoPhaseResolver::new(region.get_id(), start_ts, txn_status_cache);
         Self {
             handle,
             meta: region,
@@ -82,6 +101,7 @@ impl ActiveSubscription {
         self.handle.stop_observing();
     }
 
+    #[cfg(test)]
     pub fn is_observing(&self) -> bool {
         self.handle.is_observing()
     }
@@ -95,11 +115,11 @@ impl ActiveSubscription {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone)]
 pub enum CheckpointType {
     MinTs,
     StartTsOfInitialScan,
-    StartTsOfTxn(Option<Arc<[u8]>>),
+    StartTsOfTxn(Option<(TimeStamp, TxnLocks)>),
 }
 
 impl std::fmt::Debug for CheckpointType {
@@ -109,15 +129,13 @@ impl std::fmt::Debug for CheckpointType {
             Self::StartTsOfInitialScan => write!(f, "StartTsOfInitialScan"),
             Self::StartTsOfTxn(arg0) => f
                 .debug_tuple("StartTsOfTxn")
-                .field(&format_args!(
-                    "{}",
-                    utils::redact(&arg0.as_ref().map(|x| x.as_ref()).unwrap_or(&[]))
-                ))
+                .field(&format_args!("{:?}", arg0))
                 .finish(),
         }
     }
 }
 
+#[derive(Clone)]
 pub struct ResolveResult {
     pub region: Region,
     pub checkpoint: TimeStamp,
@@ -169,6 +187,17 @@ impl SubscriptionTracer {
     /// there are still tiny impure things need to do. (e.g. getting the
     /// checkpoint of this region.)
     ///
+    /// A typical state machine of a region:
+    ///
+    /// ```text
+    ///                             +-----[Start(Err)]------+
+    ///                             +----+   +--------------+
+    ///                                  v   |
+    ///   Absent --------[Start]------> Pending --[Start(OK)]--> Active
+    ///    ^                                |                       |
+    ///    +-------------[Stop]-------------+--------[Stop]---------+
+    /// ```
+    ///
     /// This state is a placeholder for those regions: once they failed in the
     /// impure operations, this would be the evidence proofing they were here.
     ///
@@ -185,14 +214,15 @@ impl SubscriptionTracer {
     /// We should skip when we are going to refresh absent regions because there
     /// may be some stale commands.
     pub fn add_pending_region(&self, region: &Region) {
-        let r = self
-            .0
-            .insert(region.get_id(), SubscribeState::Pending(region.clone()));
-        if let Some(s) = r {
-            warn!(
-                "excepted state transform: running | pending -> pending";
-                "old" => ?s, utils::slog_region(region),
-            )
+        match self.0.entry(region.get_id()) {
+            Entry::Occupied(ent) => warn!(
+                "excepted state transform(will ignore): running | pending -> pending";
+                "old" => ?ent.get(), utils::slog_region(region),
+            ),
+            Entry::Vacant(ent) => {
+                debug!("inserting pending region."; utils::slog_region(region));
+                ent.insert(SubscribeState::Pending(region.clone()));
+            }
         }
     }
 
@@ -207,12 +237,12 @@ impl SubscriptionTracer {
         handle: ObserveHandle,
         start_ts: Option<TimeStamp>,
     ) {
-        info!("start listen stream from store"; "observer" => ?handle);
+        info!("start listen stream from store"; "observer" => ?handle, utils::slog_region(region));
         TRACK_REGION.inc();
         let e = self.0.entry(region.id);
         match e {
             Entry::Occupied(o) => {
-                let sub = ActiveSubscription::new(region.clone(), handle, start_ts);
+                let sub = ActiveSubscription::new(region.clone(), handle, start_ts, self.1.clone());
                 let (_, s) = o.replace_entry(SubscribeState::Running(sub));
                 if !s.is_pending() {
                     // If there is another subscription already (perhaps repeated Start),
@@ -223,7 +253,7 @@ impl SubscriptionTracer {
             }
             Entry::Vacant(e) => {
                 warn!("excepted state transform: absent -> running"; utils::slog_region(region));
-                let sub = ActiveSubscription::new(region.clone(), handle, start_ts);
+                let sub = ActiveSubscription::new(region.clone(), handle, start_ts, self.1.clone());
                 e.insert(SubscribeState::Running(sub));
             }
         }
@@ -258,6 +288,33 @@ impl SubscriptionTracer {
             }
             })
             .collect()
+    }
+
+    pub fn set_pending_if(
+        &self,
+        region: &Region,
+        if_cond: impl FnOnce(&ActiveSubscription, &Region) -> bool,
+    ) -> bool {
+        let region_id = region.get_id();
+        let remove_result = self.0.entry(region_id);
+        match remove_result {
+            Entry::Vacant(_) => false,
+            Entry::Occupied(mut o) => match o.get_mut() {
+                SubscribeState::Pending(_) => true,
+                SubscribeState::Running(s) => {
+                    if if_cond(s, region) {
+                        let r = s.meta.clone();
+                        TRACK_REGION.dec();
+                        s.stop();
+                        info!("Inactivating subscription."; "observer" => ?s, "region_id"=> %region_id);
+
+                        *o.get_mut() = SubscribeState::Pending(r);
+                        return true;
+                    }
+                    false
+                }
+            },
+        }
     }
 
     /// try to mark a region no longer be tracked by this observer.
@@ -322,6 +379,7 @@ impl SubscriptionTracer {
     }
 
     /// check whether the region_id should be observed by this observer.
+    #[cfg(test)]
     pub fn is_observing(&self, region_id: u64) -> bool {
         let sub = self.0.get_mut(&region_id);
         match sub {
@@ -339,7 +397,7 @@ impl SubscriptionTracer {
     ) -> Option<impl RefMut<Key = u64, Value = ActiveSubscription> + '_> {
         self.0
             .get_mut(&region_id)
-            .and_then(|x| SubscriptionRef::try_from_dash(x))
+            .and_then(|x| ActiveSubscriptionRef::try_from_dash(x))
     }
 }
 
@@ -347,6 +405,7 @@ pub trait Ref {
     type Key;
     type Value;
 
+    #[allow(dead_code)]
     fn key(&self) -> &Self::Key;
     fn value(&self) -> &Self::Value;
 }
@@ -355,7 +414,7 @@ pub trait RefMut: Ref {
     fn value_mut(&mut self) -> &mut <Self as Ref>::Value;
 }
 
-impl<'a> Ref for SubscriptionRef<'a> {
+impl Ref for ActiveSubscriptionRef<'_> {
     type Key = u64;
     type Value = ActiveSubscription;
 
@@ -368,15 +427,15 @@ impl<'a> Ref for SubscriptionRef<'a> {
     }
 }
 
-impl<'a> RefMut for SubscriptionRef<'a> {
+impl RefMut for ActiveSubscriptionRef<'_> {
     fn value_mut(&mut self) -> &mut <Self as Ref>::Value {
         self.sub_mut()
     }
 }
 
-struct SubscriptionRef<'a>(DashRefMut<'a, u64, SubscribeState>);
+struct ActiveSubscriptionRef<'a>(DashRefMut<'a, u64, SubscribeState>);
 
-impl<'a> SubscriptionRef<'a> {
+impl<'a> ActiveSubscriptionRef<'a> {
     fn try_from_dash(mut d: DashRefMut<'a, u64, SubscribeState>) -> Option<Self> {
         match d.value_mut() {
             SubscribeState::Pending(_) => None,
@@ -444,17 +503,18 @@ pub struct TwoPhaseResolver {
 }
 
 enum FutureLock {
-    Lock(Vec<u8>, TimeStamp),
+    Lock(Vec<u8>, TimeStamp, u64 /* generation */),
     Unlock(Vec<u8>),
 }
 
 impl std::fmt::Debug for FutureLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Lock(arg0, arg1) => f
+            Self::Lock(arg0, arg1, generation) => f
                 .debug_tuple("Lock")
                 .field(&format_args!("{}", utils::redact(arg0)))
                 .field(arg1)
+                .field(generation)
                 .finish(),
             Self::Unlock(arg0) => f
                 .debug_tuple("Unlock")
@@ -466,30 +526,43 @@ impl std::fmt::Debug for FutureLock {
 
 impl TwoPhaseResolver {
     /// try to get one of the key of the oldest lock in the resolver.
-    pub fn sample_far_lock(&self) -> Option<Arc<[u8]>> {
-        let (_, keys) = self.resolver.locks().first_key_value()?;
-        keys.iter().next().cloned()
+    pub fn sample_far_lock(&self) -> Option<(TimeStamp, TxnLocks)> {
+        self.resolver
+            .locks()
+            .first_key_value()
+            .map(|(ts, txn_locks)| (*ts, txn_locks.clone()))
     }
 
     pub fn in_phase_one(&self) -> bool {
         self.stable_ts.is_some()
     }
 
-    pub fn track_phase_one_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
+    pub fn track_phase_one_lock(
+        &mut self,
+        start_ts: TimeStamp,
+        key: Vec<u8>,
+        generation: u64,
+    ) -> Result<(), MemoryQuotaExceeded> {
         if !self.in_phase_one() {
             warn!("backup stream tracking lock as if in phase one"; "start_ts" => %start_ts, "key" => %utils::redact(&key))
         }
-        // TODO: handle memory quota exceed, for now, quota is set to usize::MAX.
-        self.resolver.track_lock(start_ts, key, None).unwrap();
+        self.resolver.track_lock(start_ts, key, None, generation)?;
+        Ok(())
     }
 
-    pub fn track_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
+    pub fn track_lock(
+        &mut self,
+        start_ts: TimeStamp,
+        key: Vec<u8>,
+        generation: u64,
+    ) -> Result<(), MemoryQuotaExceeded> {
         if self.in_phase_one() {
-            self.future_locks.push(FutureLock::Lock(key, start_ts));
-            return;
+            self.future_locks
+                .push(FutureLock::Lock(key, start_ts, generation));
+            return Ok(());
         }
-        // TODO: handle memory quota exceed, for now, quota is set to usize::MAX.
-        self.resolver.track_lock(start_ts, key, None).unwrap();
+        self.resolver.track_lock(start_ts, key, None, generation)?;
+        Ok(())
     }
 
     pub fn untrack_lock(&mut self, key: &[u8]) {
@@ -503,9 +576,9 @@ impl TwoPhaseResolver {
 
     fn handle_future_lock(&mut self, lock: FutureLock) {
         match lock {
-            FutureLock::Lock(key, ts) => {
+            FutureLock::Lock(key, ts, generation) => {
                 // TODO: handle memory quota exceed, for now, quota is set to usize::MAX.
-                self.resolver.track_lock(ts, key, None).unwrap();
+                self.resolver.track_lock(ts, key, None, generation).unwrap();
             }
             FutureLock::Unlock(key) => self.resolver.untrack_lock(&key, None),
         }
@@ -527,11 +600,15 @@ impl TwoPhaseResolver {
         self.resolver.resolved_ts()
     }
 
-    pub fn new(region_id: u64, stable_ts: Option<TimeStamp>) -> Self {
+    pub fn new(
+        region_id: u64,
+        stable_ts: Option<TimeStamp>,
+        txn_status_cache: Arc<TxnStatusCache>,
+    ) -> Self {
         // TODO: limit the memory usage of the resolver.
-        let memory_quota = Arc::new(MemoryQuota::new(std::usize::MAX));
+        let memory_quota = Arc::new(MemoryQuota::new(usize::MAX));
         Self {
-            resolver: Resolver::new(region_id, memory_quota),
+            resolver: Resolver::new(region_id, memory_quota, txn_status_cache),
             future_locks: Default::default(),
             stable_ts,
         }
@@ -570,8 +647,11 @@ impl std::fmt::Debug for TwoPhaseResolver {
 mod test {
     use std::sync::Arc;
 
+    use dashmap::DashMap;
     use kvproto::metapb::{Region, RegionEpoch};
     use raftstore::coprocessor::ObserveHandle;
+    use resolved_ts::TxnLocks;
+    use tikv::storage::txn::txn_status_cache::TxnStatusCache;
     use txn_types::TimeStamp;
 
     use super::{SubscriptionTracer, TwoPhaseResolver};
@@ -581,14 +661,15 @@ mod test {
     fn test_two_phase_resolver() {
         let key = b"somewhere_over_the_rainbow";
         let ts = TimeStamp::new;
-        let mut r = TwoPhaseResolver::new(42, Some(ts(42)));
-        r.track_phase_one_lock(ts(48), key.to_vec());
+        let mut r =
+            TwoPhaseResolver::new(42, Some(ts(42)), Arc::new(TxnStatusCache::new_for_test()));
+        r.track_phase_one_lock(ts(48), key.to_vec(), 0).unwrap();
         // When still in phase one, the resolver should not be advanced.
         r.untrack_lock(&key[..]);
         assert_eq!(r.resolve(ts(50)), ts(42));
 
         // Even new lock tracked...
-        r.track_lock(ts(52), key.to_vec());
+        r.track_lock(ts(52), key.to_vec(), 0).unwrap();
         r.untrack_lock(&key[..]);
         assert_eq!(r.resolve(ts(53)), ts(42));
 
@@ -597,7 +678,7 @@ mod test {
         assert_eq!(r.resolve(ts(54)), ts(54));
 
         // It should be able to track incremental locks.
-        r.track_lock(ts(55), key.to_vec());
+        r.track_lock(ts(55), key.to_vec(), 0).unwrap();
         assert_eq!(r.resolve(ts(56)), ts(55));
         r.untrack_lock(&key[..]);
         assert_eq!(r.resolve(ts(57)), ts(57));
@@ -615,7 +696,10 @@ mod test {
 
     #[test]
     fn test_delay_remove() {
-        let subs = SubscriptionTracer::default();
+        let subs = SubscriptionTracer(
+            Arc::new(DashMap::new()),
+            Arc::new(TxnStatusCache::new_for_test()),
+        );
         let handle = ObserveHandle::new();
         subs.register_region(&region(1, 1, 1), handle, Some(TimeStamp::new(42)));
         assert!(subs.get_subscription_of(1).is_some());
@@ -626,7 +710,10 @@ mod test {
 
     #[test]
     fn test_cal_checkpoint() {
-        let subs = SubscriptionTracer::default();
+        let subs = SubscriptionTracer(
+            Arc::new(DashMap::new()),
+            Arc::new(TxnStatusCache::new_for_test()),
+        );
         subs.register_region(
             &region(1, 1, 1),
             ObserveHandle::new(),
@@ -653,7 +740,8 @@ mod test {
         region4_sub
             .value_mut()
             .resolver
-            .track_lock(TimeStamp::new(128), b"Alpi".to_vec());
+            .track_lock(TimeStamp::new(128), b"Alpi".to_vec(), 0)
+            .unwrap();
         subs.register_region(&region(5, 8, 1), ObserveHandle::new(), None);
         subs.deregister_region_if(&region(5, 8, 1), |_, _| true);
         drop(region4_sub);
@@ -674,7 +762,13 @@ mod test {
                 (
                     region(4, 8, 1),
                     128.into(),
-                    StartTsOfTxn(Some(Arc::from(b"Alpi".as_slice())))
+                    StartTsOfTxn(Some((
+                        TimeStamp::new(128),
+                        TxnLocks {
+                            lock_count: 1,
+                            sample_lock: Some(Arc::from(b"Alpi".as_slice())),
+                        }
+                    )))
                 ),
             ]
         );

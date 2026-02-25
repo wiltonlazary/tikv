@@ -1,17 +1,17 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use engine_rocks::raw::DBStatisticsTickerType;
-use engine_traits::{MiscExt, CF_LOCK};
+use engine_traits::{CF_LOCK, MiscExt};
 use test_raftstore::*;
 use tikv_util::config::*;
 
-fn flush<T: Simulator>(cluster: &Cluster<T>) {
+fn flush<T: Simulator>(cluster: &mut Cluster<T>) {
     for engines in cluster.engines.values() {
         engines.kv.flush_cf(CF_LOCK, true).unwrap();
     }
 }
 
-fn flush_then_check<T: Simulator>(cluster: &Cluster<T>, interval: u64, written: bool) {
+fn flush_then_check<T: Simulator>(cluster: &mut Cluster<T>, interval: u64, written: bool) {
     flush(cluster);
     // Wait for compaction.
     sleep_ms(interval * 2);

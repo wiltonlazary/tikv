@@ -2,7 +2,7 @@
 
 use tidb_query_codegen::AggrFunction;
 use tidb_query_common::Result;
-use tidb_query_datatype::{codec::data_type::*, expr::EvalContext, EvalType};
+use tidb_query_datatype::{EvalType, codec::data_type::*, expr::EvalContext};
 use tidb_query_expr::RpnExpression;
 use tipb::{Expr, ExprType, FieldType};
 
@@ -34,8 +34,8 @@ impl super::parser::AggrDefinitionParser for AggrFnDefinitionParserSum {
         let out_ft = root_expr.take_field_type();
         let out_et = box_try!(EvalType::try_from(out_ft.as_accessor().tp()));
 
-        // The rewrite should always succeed.
-        super::util::rewrite_exp_for_sum_avg(src_schema, &mut exp).unwrap();
+        // Rewrite expression to insert CAST() if needed.
+        super::util::rewrite_exp_for_sum_avg(src_schema, &mut exp)?;
 
         let rewritten_eval_type =
             EvalType::try_from(exp.ret_field_type(src_schema).as_accessor().tp()).unwrap();
@@ -306,8 +306,8 @@ mod tests {
     use std::sync::Arc;
 
     use tidb_query_datatype::{
-        codec::batch::{LazyBatchColumn, LazyBatchColumnVec},
         FieldTypeAccessor, FieldTypeTp,
+        codec::batch::{LazyBatchColumn, LazyBatchColumnVec},
     };
     use tikv_util::buffer_vec::BufferVec;
     use tipb_helper::ExprDefBuilder;

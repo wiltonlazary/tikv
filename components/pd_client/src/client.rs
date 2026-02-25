@@ -3,26 +3,25 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
-    u64,
 };
 
 use futures::{
+    TryStreamExt,
     channel::mpsc,
     compat::{Compat, Future01CompatExt},
     executor::block_on,
     future::{self, BoxFuture, FutureExt, TryFlattenStream, TryFutureExt},
     sink::SinkExt,
     stream::{ErrInto, StreamExt},
-    TryStreamExt,
 };
 use grpcio::{EnvBuilder, Environment, WriteFlags};
 use kvproto::{
     meta_storagepb::{
-        self as mpb, GetRequest, GetResponse, PutRequest, WatchRequest, WatchResponse,
+        self as mpb, DeleteRequest, GetRequest, PutRequest, WatchRequest, WatchResponse,
     },
     metapb,
     pdpb::{self, Member},
@@ -31,18 +30,18 @@ use kvproto::{
 };
 use security::SecurityManager;
 use tikv_util::{
-    box_err, debug, error, info, thd_name, time::Instant, timer::GLOBAL_TIMER_HANDLE, warn, Either,
-    HandyRwLock,
+    Either, HandyRwLock, box_err, debug, error, info, thd_name,
+    thread_name_prefix::PD_MONITOR_THREAD, time::Instant, timer::GLOBAL_TIMER_HANDLE, warn,
 };
 use txn_types::TimeStamp;
-use yatp::{task::future::TaskCell, ThreadPool};
+use yatp::{ThreadPool, task::future::TaskCell};
 
 use super::{
-    meta_storage::{Get, MetaStorageClient, Put, Watch},
+    BucketStat, Config, Error, FeatureGate, PdClient, PdFuture, REQUEST_TIMEOUT, RegionInfo,
+    RegionStat, Result, UnixSecs,
+    meta_storage::{Delete, Get, MetaStorageClient, Put, Watch},
     metrics::*,
-    util::{call_option_inner, check_resp_header, sync_request, Client, PdConnector},
-    BucketStat, Config, Error, FeatureGate, PdClient, PdFuture, RegionInfo, RegionStat, Result,
-    UnixSecs, REQUEST_TIMEOUT,
+    util::{Client, PdConnector, call_option_inner, check_resp_header, sync_request},
 };
 
 pub const CQ_COUNT: usize = 1;
@@ -81,11 +80,11 @@ impl RpcClient {
 
         // -1 means the max.
         let retries = match cfg.retry_max_count {
-            -1 => std::isize::MAX,
+            -1 => isize::MAX,
             v => v.saturating_add(1),
         };
         let monitor = Arc::new(
-            yatp::Builder::new(thd_name!("pdmonitor"))
+            yatp::Builder::new(thd_name!(PD_MONITOR_THREAD))
                 .max_thread_count(1)
                 .build_future_pool(),
         );
@@ -165,7 +164,7 @@ impl RpcClient {
                     return Ok(rpc_client);
                 }
                 Err(e) => {
-                    if i as usize % cfg.retry_log_every == 0 {
+                    if (i as usize).is_multiple_of(cfg.retry_log_every) {
                         warn!("validate PD endpoints failed"; "err" => ?e);
                     }
                     let _ = GLOBAL_TIMER_HANDLE
@@ -330,94 +329,6 @@ const LEADER_CHANGE_RETRY: usize = 10;
 const NO_RETRY: usize = 1;
 
 impl PdClient for RpcClient {
-    fn store_global_config(
-        &self,
-        config_path: String,
-        items: Vec<pdpb::GlobalConfigItem>,
-    ) -> PdFuture<()> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .store_global_config
-            .start_coarse_timer();
-
-        let mut req = pdpb::StoreGlobalConfigRequest::new();
-        req.set_config_path(config_path);
-        req.set_changes(items.into());
-        let executor = move |client: &Client, req| match client
-            .inner
-            .rl()
-            .client_stub
-            .store_global_config_async(&req)
-        {
-            Ok(grpc_response) => Box::pin(async move {
-                if let Err(err) = grpc_response.await {
-                    return Err(box_err!("{:?}", err));
-                }
-                Ok(())
-            }) as PdFuture<_>,
-            Err(err) => Box::pin(async move { Err(box_err!("{:?}", err)) }) as PdFuture<_>,
-        };
-        self.pd_client
-            .request(req, executor, LEADER_CHANGE_RETRY)
-            .execute()
-    }
-
-    fn load_global_config(
-        &self,
-        config_path: String,
-    ) -> PdFuture<(Vec<pdpb::GlobalConfigItem>, i64)> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .load_global_config
-            .start_coarse_timer();
-
-        let mut req = pdpb::LoadGlobalConfigRequest::new();
-        req.set_config_path(config_path);
-        let executor = |client: &Client, req| match client
-            .inner
-            .rl()
-            .client_stub
-            .clone()
-            .load_global_config_async(&req)
-        {
-            Ok(grpc_response) => Box::pin(async move {
-                match grpc_response.await {
-                    Ok(grpc_response) => Ok((
-                        Vec::from(grpc_response.get_items()),
-                        grpc_response.get_revision(),
-                    )),
-                    Err(err) => Err(box_err!("{:?}", err)),
-                }
-            }) as PdFuture<_>,
-            Err(err) => Box::pin(async move {
-                Err(box_err!(
-                    "load global config failed, path: '{}', err:  {:?}",
-                    req.get_config_path(),
-                    err
-                ))
-            }) as PdFuture<_>,
-        };
-        self.pd_client
-            .request(req, executor, LEADER_CHANGE_RETRY)
-            .execute()
-    }
-
-    fn watch_global_config(
-        &self,
-        config_path: String,
-        revision: i64,
-    ) -> Result<grpcio::ClientSStreamReceiver<pdpb::WatchGlobalConfigResponse>> {
-        let _timer = PD_REQUEST_HISTOGRAM_VEC
-            .watch_global_config
-            .start_coarse_timer();
-
-        let mut req = pdpb::WatchGlobalConfigRequest::default();
-        info!("[global_config] start watch global config"; "path" => &config_path, "revision" => revision);
-        req.set_config_path(config_path);
-        req.set_revision(revision);
-        sync_request(&self.pd_client, LEADER_CHANGE_RETRY, |client, _| {
-            client.watch_global_config(&req)
-        })
-    }
-
     fn scan_regions(
         &self,
         start_key: &[u8],
@@ -695,6 +606,7 @@ impl PdClient for RpcClient {
         req.set_approximate_size(region_stat.approximate_size);
         req.set_approximate_keys(region_stat.approximate_keys);
         req.set_cpu_usage(region_stat.cpu_usage);
+        req.set_cpu_stats(region_stat.cpu_stats);
         if let Some(s) = replication_status {
             req.set_replication_status(s);
         }
@@ -740,7 +652,7 @@ impl PdClient for RpcClient {
                             info!("cancel region heartbeat sender");
                         }
                         Err(e) => {
-                            error!(?e; "failed to send heartbeat");
+                            warn!("failed to send heartbeat"; "err" => ?e);
                         }
                     };
                 });
@@ -807,6 +719,7 @@ impl PdClient for RpcClient {
         &self,
         region: metapb::Region,
         count: usize,
+        reason: pdpb::SplitReason,
     ) -> PdFuture<pdpb::AskBatchSplitResponse> {
         let timer = Instant::now();
 
@@ -814,6 +727,7 @@ impl PdClient for RpcClient {
         req.set_header(self.header());
         req.set_region(region);
         req.set_split_count(count as u32);
+        req.set_reason(reason);
 
         let executor = move |client: &Client, req: pdpb::AskBatchSplitRequest| {
             let handler = {
@@ -1039,6 +953,7 @@ impl PdClient for RpcClient {
         req.set_service_id(name.into());
         req.set_ttl(ttl.as_secs() as _);
         req.set_safe_point(safe_point.into_inner());
+        let req_for_check = req.clone();
         let executor = move |client: &Client, r: pdpb::UpdateServiceGcSafePointRequest| {
             let handler = {
                 let inner = client.inner.rl();
@@ -1052,12 +967,14 @@ impl PdClient for RpcClient {
                         )
                     })
             };
+            let req = req_for_check.clone();
             Box::pin(async move {
                 let resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
                     .update_service_safe_point
                     .observe(timer.saturating_elapsed_secs());
                 check_resp_header(resp.get_header())?;
+                crate::check_update_service_safe_point_resp(&resp, &req)?;
                 Ok(())
             }) as PdFuture<_>
         };
@@ -1098,9 +1015,7 @@ impl PdClient for RpcClient {
             }) as PdFuture<_>
         };
 
-        self.pd_client
-            .request(req, executor, LEADER_CHANGE_RETRY)
-            .execute()
+        self.pd_client.request(req, executor, NO_RETRY).execute()
     }
 
     fn report_region_buckets(&self, bucket_stat: &BucketStat, period: Duration) -> PdFuture<()> {
@@ -1232,7 +1147,7 @@ impl RpcClient {
 }
 
 impl MetaStorageClient for RpcClient {
-    fn get(&self, mut req: Get) -> PdFuture<GetResponse> {
+    fn get(&self, mut req: Get) -> PdFuture<kvproto::meta_storagepb::GetResponse> {
         let timer = Instant::now();
         self.fill_cluster_id_for(req.inner.mut_header());
         let executor = move |client: &Client, req: GetRequest| {
@@ -1244,9 +1159,6 @@ impl MetaStorageClient for RpcClient {
                 futures::future::ready(r).err_into().try_flatten()
             };
             Box::pin(async move {
-                // Migrated to 2021 migration. This let statement is probably not needed, see
-                //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
-                let _ = &req;
                 fail::fail_point!("meta_storage_get", req.key.ends_with(b"rejectme"), |_| {
                     Err(super::Error::Grpc(grpcio::Error::RemoteStopped))
                 });
@@ -1278,6 +1190,31 @@ impl MetaStorageClient for RpcClient {
                 let resp = handler.await?;
                 PD_REQUEST_HISTOGRAM_VEC
                     .meta_storage_put
+                    .observe(timer.saturating_elapsed_secs());
+                Ok(resp)
+            }) as _
+        };
+
+        self.pd_client
+            .request(req.into(), executor, LEADER_CHANGE_RETRY)
+            .execute()
+    }
+
+    fn delete(&self, mut req: Delete) -> PdFuture<kvproto::meta_storagepb::DeleteResponse> {
+        let timer = Instant::now();
+        self.fill_cluster_id_for(req.inner.mut_header());
+        let executor = move |client: &Client, req: DeleteRequest| {
+            let handler = {
+                let inner = client.inner.rl();
+                let r = inner
+                    .meta_storage
+                    .delete_async_opt(&req, call_option_inner(&inner));
+                futures::future::ready(r).err_into().try_flatten()
+            };
+            Box::pin(async move {
+                let resp = handler.await?;
+                PD_REQUEST_HISTOGRAM_VEC
+                    .meta_storage_delete
                     .observe(timer.saturating_elapsed_secs());
                 Ok(resp)
             }) as _

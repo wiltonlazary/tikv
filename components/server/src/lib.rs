@@ -2,7 +2,6 @@
 
 #![allow(incomplete_features)]
 #![feature(specialization)]
-#![feature(let_chains)]
 
 #[macro_use]
 extern crate tikv_util;
@@ -15,3 +14,4 @@ pub mod raft_engine_switch;
 pub mod server;
 pub mod server2;
 pub mod signal_handler;
+mod utils;

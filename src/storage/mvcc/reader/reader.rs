@@ -8,18 +8,22 @@ use kvproto::{
     errorpb::{self, EpochNotMatch, FlashbackInProgress, StaleCommand},
     kvrpcpb::Context,
 };
-use raftstore::store::LocksStatus;
-use tikv_kv::{SnapshotExt, SEEK_BOUND};
-use txn_types::{Key, LastChange, Lock, OldValue, TimeStamp, Value, Write, WriteRef, WriteType};
+use raftstore::store::{LocksStatus, PeerPessimisticLocks};
+use tikv_kv::{SEEK_BOUND, SnapshotExt};
+use tikv_util::{Either, time::Instant};
+use txn_types::{
+    Key, LastChange, Lock, LockOrSharedLocks, OldValue, PessimisticLock, TimeStamp, TxnLockRef,
+    Value, Write, WriteRef, WriteType,
+};
 
 use crate::storage::{
     kv::{
         Cursor, CursorBuilder, Error as KvError, ScanMode, Snapshot as EngineSnapshot, Statistics,
     },
     mvcc::{
-        default_not_found_error,
+        Result, default_not_found_error,
+        metrics::{SCAN_LOCK_READ_TIME_VEC, ScanLockReadTimeSource},
         reader::{OverlappedWrite, TxnCommitRecord},
-        Result,
     },
 };
 
@@ -59,7 +63,7 @@ impl<S: EngineSnapshot> SnapshotReader<S> {
     }
 
     #[inline(always)]
-    pub fn load_lock(&mut self, key: &Key) -> Result<Option<Lock>> {
+    pub fn load_lock(&mut self, key: &Key) -> Result<Option<LockOrSharedLocks>> {
         self.reader.load_lock(key)
     }
 
@@ -226,24 +230,24 @@ impl<S: EngineSnapshot> MvccReader<S> {
         }
     }
 
-    pub fn load_lock(&mut self, key: &Key) -> Result<Option<Lock>> {
+    pub fn load_lock(&mut self, key: &Key) -> Result<Option<LockOrSharedLocks>> {
         if let Some(pessimistic_lock) = self.load_in_memory_pessimistic_lock(key)? {
-            return Ok(Some(pessimistic_lock));
+            return Ok(Some(Either::Left(pessimistic_lock)));
         }
 
         if self.scan_mode.is_some() {
-            self.create_lock_cursor()?;
+            self.create_lock_cursor_if_not_exist()?;
         }
 
         let res = if let Some(ref mut cursor) = self.lock_cursor {
             match cursor.get(key, &mut self.statistics.lock)? {
-                Some(v) => Some(Lock::parse(v)?),
+                Some(v) => Some(txn_types::parse_lock(v)?),
                 None => None,
             }
         } else {
             self.statistics.lock.get += 1;
             match self.snapshot.get_cf(CF_LOCK, key)? {
-                Some(v) => Some(Lock::parse(&v)?),
+                Some(v) => Some(txn_types::parse_lock(&v)?),
                 None => None,
             }
         };
@@ -251,44 +255,209 @@ impl<S: EngineSnapshot> MvccReader<S> {
         Ok(res)
     }
 
-    fn load_in_memory_pessimistic_lock(&self, key: &Key) -> Result<Option<Lock>> {
-        self.snapshot
-            .ext()
-            .get_txn_ext()
-            .and_then(|txn_ext| {
-                // If the term or region version has changed, do not read the lock table.
-                // Instead, just return a StaleCommand or EpochNotMatch error, so the
-                // client will not receive a false error because the lock table has been
-                // cleared.
-                let locks = txn_ext.pessimistic_locks.read();
-                if self.term != 0 && locks.term != self.term {
-                    let mut err = errorpb::Error::default();
-                    err.set_stale_command(StaleCommand::default());
-                    return Some(Err(KvError::from(err).into()));
-                }
-                if self.version != 0 && locks.version != self.version {
-                    let mut err = errorpb::Error::default();
-                    // We don't know the current regions. Just return an empty EpochNotMatch error.
-                    err.set_epoch_not_match(EpochNotMatch::default());
-                    return Some(Err(KvError::from(err).into()));
-                }
-                // If the region is in the flashback state, it should not be allowed to read the
-                // locks.
-                if locks.status == LocksStatus::IsInFlashback && !self.allow_in_flashback {
-                    let mut err = errorpb::Error::default();
-                    err.set_flashback_in_progress(FlashbackInProgress::default());
-                    return Some(Err(KvError::from(err).into()));
-                }
+    fn check_term_version_status(&self, locks: &PeerPessimisticLocks) -> Result<()> {
+        // If the term or region version has changed, do not read the lock table.
+        // Instead, just return a StaleCommand or EpochNotMatch error, so the
+        // client will not receive a false error because the lock table has been
+        // cleared.
+        if self.term != 0 && locks.term != self.term {
+            let mut err = errorpb::Error::default();
+            err.set_stale_command(StaleCommand::default());
+            return Err(KvError::from(err).into());
+        }
+        if self.version != 0 && locks.version != self.version {
+            let mut err = errorpb::Error::default();
+            err.set_epoch_not_match(EpochNotMatch::default());
+            return Err(KvError::from(err).into());
+        }
+        if locks.status == LocksStatus::IsInFlashback && !self.allow_in_flashback {
+            let mut err = errorpb::Error::default();
+            err.set_flashback_in_progress(FlashbackInProgress::default());
+            return Err(KvError::from(err).into());
+        }
+        Ok(())
+    }
 
-                locks.get(key).map(|(lock, _)| {
-                    // For write commands that are executed in serial, it should be impossible
-                    // to read a deleted lock.
-                    // For read commands in the scheduler, it should read the lock marked deleted
-                    // because the lock is not actually deleted from the underlying storage.
-                    Ok(lock.to_lock())
-                })
-            })
-            .transpose()
+    /// Scan all types of locks(pessimitic, prewrite) satisfying `filter`
+    /// condition from both in-memory pessimitic lock table and the storage
+    /// within [start_key, end_key) .
+    pub fn scan_locks<F>(
+        &mut self,
+        start_key: Option<&Key>,
+        end_key: Option<&Key>,
+        filter: F,
+        limit: usize,
+        source: ScanLockReadTimeSource,
+    ) -> Result<(Vec<(Key, LockOrSharedLocks)>, bool)>
+    where
+        F: Fn(&Key, TxnLockRef<'_>) -> bool,
+    {
+        let (memory_locks, memory_has_remain) = self.load_in_memory_pessimistic_lock_range(
+            start_key,
+            end_key,
+            |k, l| filter(k, l.into()),
+            limit,
+            source,
+        )?;
+        let memory_locks: Vec<(Key, LockOrSharedLocks)> = memory_locks
+            .into_iter()
+            .map(|(k, l)| (k, Either::Left(l)))
+            .collect();
+        if memory_locks.is_empty() {
+            return self.scan_locks_from_storage(
+                start_key,
+                end_key,
+                |k, l| filter(k, TxnLockRef::Persisted(l)),
+                limit,
+            );
+        }
+
+        let mut lock_cursor_seeked = false;
+        let mut storage_iteration_finished = false;
+        let mut next_pair_from_storage = || -> Result<Option<(Key, LockOrSharedLocks)>> {
+            if storage_iteration_finished {
+                return Ok(None);
+            }
+            self.create_lock_cursor_if_not_exist()?;
+            let cursor = self.lock_cursor.as_mut().unwrap();
+            if !lock_cursor_seeked {
+                let ok = match start_key {
+                    Some(x) => cursor.seek(x, &mut self.statistics.lock)?,
+                    None => cursor.seek_to_first(&mut self.statistics.lock),
+                };
+                if !ok {
+                    storage_iteration_finished = true;
+                    return Ok(None);
+                }
+                lock_cursor_seeked = true;
+            } else {
+                cursor.next(&mut self.statistics.lock);
+            }
+
+            while cursor.valid()? {
+                let key = Key::from_encoded_slice(cursor.key(&mut self.statistics.lock));
+                if let Some(end) = end_key {
+                    if key >= *end {
+                        storage_iteration_finished = true;
+                        return Ok(None);
+                    }
+                }
+                let mut lock_or_shared_locks =
+                    txn_types::parse_lock(cursor.value(&mut self.statistics.lock))?;
+                match &mut lock_or_shared_locks {
+                    Either::Left(l) => {
+                        if filter(&key, TxnLockRef::Persisted(l)) {
+                            self.statistics.lock.processed_keys += 1;
+                            return Ok(Some((key, lock_or_shared_locks)));
+                        }
+                    }
+                    Either::Right(shared_locks) => {
+                        shared_locks.filter_shared_locks(|shared_lock| {
+                            filter(&key, TxnLockRef::Persisted(shared_lock))
+                        })?;
+                        if !shared_locks.is_empty() {
+                            self.statistics.lock.processed_keys += 1;
+                            return Ok(Some((key, lock_or_shared_locks)));
+                        }
+                    }
+                }
+                cursor.next(&mut self.statistics.lock);
+            }
+            storage_iteration_finished = true;
+            Ok(None)
+        };
+
+        let mut locks: Vec<(Key, LockOrSharedLocks)> =
+            Vec::with_capacity(limit.min(memory_locks.len()));
+        let mut memory_iter = memory_locks.into_iter();
+        let mut memory_pair = memory_iter.next();
+        let mut storage_pair = next_pair_from_storage()?;
+        let has_remain = loop {
+            let next_key = match (memory_pair.as_ref(), storage_pair.as_ref()) {
+                (Some((memory_key, _)), Some((storage_key, _))) => {
+                    if storage_key <= memory_key {
+                        let next_key = storage_pair.take().unwrap();
+                        storage_pair = next_pair_from_storage()?;
+                        next_key
+                    } else {
+                        let next_key = memory_pair.take().unwrap();
+                        memory_pair = memory_iter.next();
+                        next_key
+                    }
+                }
+                (Some(_), None) => {
+                    let next_key = memory_pair.take().unwrap();
+                    memory_pair = memory_iter.next();
+                    next_key
+                }
+                (None, Some(_)) => {
+                    let next_key = storage_pair.take().unwrap();
+                    storage_pair = next_pair_from_storage()?;
+                    next_key
+                }
+                (None, None) => break memory_has_remain,
+            };
+            // The same key could exist in both memory and storage when there is ongoing
+            // leader transfer, split or merge on this region. In this case, duplicated
+            // keys should be ignored.
+            if locks.is_empty() || locks.last().unwrap().0 != next_key.0 {
+                locks.push(next_key);
+            }
+            if limit > 0 && locks.len() >= limit {
+                break memory_pair.is_some() || storage_pair.is_some() || memory_has_remain;
+            }
+        };
+        Ok((locks, has_remain))
+    }
+
+    pub fn load_in_memory_pessimistic_lock_range<F>(
+        &self,
+        start_key: Option<&Key>,
+        end_key: Option<&Key>,
+        filter: F,
+        scan_limit: usize,
+        source: ScanLockReadTimeSource,
+    ) -> Result<(Vec<(Key, Lock)>, bool)>
+    where
+        F: Fn(&Key, &PessimisticLock) -> bool,
+    {
+        if let Some(txn_ext) = self.snapshot.ext().get_txn_ext() {
+            let begin_instant = Instant::now();
+            let pessimistic_locks_guard = txn_ext.pessimistic_locks.read();
+            let res = match self.check_term_version_status(&pessimistic_locks_guard) {
+                Ok(_) => {
+                    // Scan locks within the specified range and filter.
+                    Ok(pessimistic_locks_guard.scan_locks(start_key, end_key, filter, scan_limit))
+                }
+                Err(e) => Err(e),
+            };
+            drop(pessimistic_locks_guard);
+
+            let elapsed = begin_instant.saturating_elapsed();
+            SCAN_LOCK_READ_TIME_VEC
+                .get(source)
+                .observe(elapsed.as_secs_f64());
+
+            res
+        } else {
+            Ok((vec![], false))
+        }
+    }
+
+    fn load_in_memory_pessimistic_lock(&self, key: &Key) -> Result<Option<Lock>> {
+        if let Some(txn_ext) = self.snapshot.ext().get_txn_ext() {
+            let locks = txn_ext.pessimistic_locks.read();
+            self.check_term_version_status(&locks)?;
+            Ok(locks.get(key).map(|(lock, _)| {
+                // For write commands that are executed in serial, it should be impossible
+                // to read a deleted lock.
+                // For read commands in the scheduler, it should read the lock marked deleted
+                // because the lock is not actually deleted from the underlying storage.
+                lock.to_lock()
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn get_scan_mode(&self, allow_backward: bool) -> ScanMode {
@@ -309,7 +478,7 @@ impl<S: EngineSnapshot> MvccReader<S> {
         //
         // When it switches to another key in prefix seek mode, creates a new cursor for
         // it because the current position of the cursor is seldom around `key`.
-        if self.scan_mode.is_none() && self.current_key.as_ref().map_or(true, |k| k != key) {
+        if self.scan_mode.is_none() && self.current_key.as_ref().is_none_or(|k| k != key) {
             self.current_key = Some(key.clone());
             self.write_cursor.take();
         }
@@ -511,7 +680,7 @@ impl<S: EngineSnapshot> MvccReader<S> {
         Ok(())
     }
 
-    fn create_lock_cursor(&mut self) -> Result<()> {
+    fn create_lock_cursor_if_not_exist(&mut self) -> Result<()> {
         if self.lock_cursor.is_none() {
             let cursor = CursorBuilder::new(&self.snapshot, CF_LOCK)
                 .fill_cache(self.fill_cache)
@@ -543,23 +712,23 @@ impl<S: EngineSnapshot> MvccReader<S> {
         Ok(None)
     }
 
-    /// Scan locks that satisfies `filter(lock)` returns true in the key range
+    /// Scan locks that satisfies `filter(lock)` from storage in the key range
     /// [start, end). At most `limit` locks will be returned. If `limit` is
     /// set to `0`, it means unlimited.
     ///
     /// The return type is `(locks, has_remain)`. `has_remain` indicates whether
     /// there MAY be remaining locks that can be scanned.
-    pub fn scan_locks<F>(
+    pub fn scan_locks_from_storage<F>(
         &mut self,
         start: Option<&Key>,
         end: Option<&Key>,
         filter: F,
         limit: usize,
-    ) -> Result<(Vec<(Key, Lock)>, bool)>
+    ) -> Result<(Vec<(Key, LockOrSharedLocks)>, bool)>
     where
-        F: Fn(&Lock) -> bool,
+        F: Fn(&Key, &Lock) -> bool,
     {
-        self.create_lock_cursor()?;
+        self.create_lock_cursor_if_not_exist()?;
         let cursor = self.lock_cursor.as_mut().unwrap();
         let ok = match start {
             Some(x) => cursor.seek(x, &mut self.statistics.lock)?,
@@ -569,6 +738,7 @@ impl<S: EngineSnapshot> MvccReader<S> {
             return Ok((vec![], false));
         }
         let mut locks = Vec::with_capacity(limit);
+        let mut lock_count: usize = 0;
         let mut has_remain = false;
         while cursor.valid()? {
             let key = Key::from_encoded_slice(cursor.key(&mut self.statistics.lock));
@@ -579,17 +749,37 @@ impl<S: EngineSnapshot> MvccReader<S> {
                 }
             }
 
-            let lock = Lock::parse(cursor.value(&mut self.statistics.lock))?;
-            if filter(&lock) {
-                locks.push((key, lock));
-                if limit > 0 && locks.len() == limit {
-                    has_remain = true;
-                    break;
+            let mut lock_or_shared_locks =
+                txn_types::parse_lock(cursor.value(&mut self.statistics.lock))?;
+            match &mut lock_or_shared_locks {
+                Either::Left(l) => {
+                    if filter(&key, l) {
+                        lock_count += 1;
+                        locks.push((key, lock_or_shared_locks));
+                    }
                 }
+                Either::Right(shared_locks) => {
+                    shared_locks.filter_shared_locks(|shared_lock| filter(&key, shared_lock))?;
+                    if !shared_locks.is_empty() {
+                        if limit > 0 {
+                            let remaining = limit - lock_count;
+                            if shared_locks.len() > remaining {
+                                shared_locks.truncate_to(remaining);
+                                has_remain = true;
+                            }
+                        }
+                        lock_count += shared_locks.len();
+                        locks.push((key, lock_or_shared_locks));
+                    }
+                }
+            }
+            if limit > 0 && lock_count >= limit {
+                has_remain = true;
+                break;
             }
             cursor.next(&mut self.statistics.lock);
         }
-        self.statistics.lock.processed_keys += locks.len();
+        self.statistics.lock.processed_keys += lock_count;
         Ok((locks, has_remain))
     }
 
@@ -802,16 +992,16 @@ impl<S: EngineSnapshot> MvccReader<S> {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{ops::Bound, u64};
+    use std::ops::Bound;
 
     use concurrency_manager::ConcurrencyManager;
     use engine_rocks::{
-        properties::MvccPropertiesCollectorFactory, RocksCfOptions, RocksDbOptions, RocksEngine,
-        RocksSnapshot,
+        RocksCfOptions, RocksDbOptions, RocksEngine, RocksSnapshot,
+        properties::MvccPropertiesCollectorFactory,
     };
     use engine_traits::{
-        CompactExt, IterOptions, MiscExt, Mutable, SyncMutable, WriteBatch, WriteBatchExt, ALL_CFS,
-        CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE,
+        ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, CompactExt, IterOptions,
+        ManualCompactionOptions, MiscExt, Mutable, SyncMutable, WriteBatch, WriteBatchExt,
     };
     use kvproto::{
         kvrpcpb::{AssertionLevel, Context, PrewriteRequestPessimisticAction::*},
@@ -819,17 +1009,17 @@ pub mod tests {
     };
     use pd_client::FeatureGate;
     use raftstore::store::RegionSnapshot;
-    use txn_types::{LastChange, LockType, Mutation};
+    use txn_types::{LastChange, Lock, LockType, Mutation, SharedLocks, TimeStamp};
 
     use super::*;
     use crate::storage::{
-        kv::Modify,
-        mvcc::{tests::write, MvccReader, MvccTxn},
-        txn::{
-            acquire_pessimistic_lock, cleanup, commit, gc, prewrite,
-            sched_pool::set_tls_feature_gate, CommitKind, TransactionKind, TransactionProperties,
-        },
         Engine, TestEngineBuilder,
+        kv::Modify,
+        mvcc::{MvccReader, MvccTxn, tests::write},
+        txn::{
+            CommitKind, TransactionKind, TransactionProperties, acquire_pessimistic_lock, cleanup,
+            commit, gc, prewrite, sched_pool::set_tls_feature_gate,
+        },
     };
 
     pub struct RegionEngine {
@@ -915,7 +1105,7 @@ pub mod tests {
         pub fn prewrite(&mut self, m: Mutation, pk: &[u8], start_ts: impl Into<TimeStamp>) {
             let snap = self.snapshot();
             let start_ts = start_ts.into();
-            let cm = ConcurrencyManager::new(start_ts);
+            let cm = ConcurrencyManager::new_for_test(start_ts);
             let mut txn = MvccTxn::new(start_ts, cm);
             let mut reader = SnapshotReader::new(start_ts, snap, true);
 
@@ -940,7 +1130,7 @@ pub mod tests {
         ) {
             let snap = self.snapshot();
             let start_ts = start_ts.into();
-            let cm = ConcurrencyManager::new(start_ts);
+            let cm = ConcurrencyManager::new_for_test(start_ts);
             let mut txn = MvccTxn::new(start_ts, cm);
             let mut reader = SnapshotReader::new(start_ts, snap, true);
 
@@ -966,7 +1156,7 @@ pub mod tests {
         ) {
             let snap = self.snapshot();
             let for_update_ts = for_update_ts.into();
-            let cm = ConcurrencyManager::new(for_update_ts);
+            let cm = ConcurrencyManager::new_for_test(for_update_ts);
             let start_ts = start_ts.into();
             let mut txn = MvccTxn::new(start_ts, cm);
             let mut reader = SnapshotReader::new(start_ts, snap, true);
@@ -984,6 +1174,7 @@ pub mod tests {
                 true,
                 false,
                 false,
+                false,
             )
             .unwrap();
             self.write(txn.into_modifies());
@@ -997,17 +1188,24 @@ pub mod tests {
         ) {
             let snap = self.snapshot();
             let start_ts = start_ts.into();
-            let cm = ConcurrencyManager::new(start_ts);
+            let cm = ConcurrencyManager::new_for_test(start_ts);
             let mut txn = MvccTxn::new(start_ts, cm);
             let mut reader = SnapshotReader::new(start_ts, snap, true);
-            commit(&mut txn, &mut reader, Key::from_raw(pk), commit_ts.into()).unwrap();
+            commit(
+                &mut txn,
+                &mut reader,
+                Key::from_raw(pk),
+                commit_ts.into(),
+                None,
+            )
+            .unwrap();
             self.write(txn.into_modifies());
         }
 
         pub fn rollback(&mut self, pk: &[u8], start_ts: impl Into<TimeStamp>) {
             let snap = self.snapshot();
             let start_ts = start_ts.into();
-            let cm = ConcurrencyManager::new(start_ts);
+            let cm = ConcurrencyManager::new_for_test(start_ts);
             let mut txn = MvccTxn::new(start_ts, cm);
             let mut reader = SnapshotReader::new(start_ts, snap, true);
             cleanup(
@@ -1022,7 +1220,7 @@ pub mod tests {
         }
 
         pub fn gc(&mut self, pk: &[u8], safe_point: impl Into<TimeStamp> + Copy) {
-            let cm = ConcurrencyManager::new(safe_point.into());
+            let cm = ConcurrencyManager::new_for_test(safe_point.into());
             loop {
                 let snap = self.snapshot();
                 let mut txn = MvccTxn::new(safe_point.into(), cm.clone());
@@ -1075,7 +1273,14 @@ pub mod tests {
 
         pub fn compact(&mut self) {
             for cf in ALL_CFS {
-                self.db.compact_range_cf(cf, None, None, false, 1).unwrap();
+                self.db
+                    .compact_range_cf(
+                        cf,
+                        None,
+                        None,
+                        ManualCompactionOptions::new(false, 1, false),
+                    )
+                    .unwrap();
             }
         }
     }
@@ -1155,7 +1360,7 @@ pub mod tests {
             (Bound::Unbounded, Bound::Excluded(8), vec![2u64, 4, 6, 8]),
         ];
 
-        for (_, &(min, max, ref res)) in tests.iter().enumerate() {
+        for &(min, max, ref res) in tests.iter() {
             let mut iopt = IterOptions::default();
             iopt.set_hint_min_ts(min);
             iopt.set_hint_max_ts(max);
@@ -1164,16 +1369,16 @@ pub mod tests {
 
             for (i, expect_ts) in res.iter().enumerate() {
                 if i == 0 {
-                    assert_eq!(iter.seek_to_first().unwrap(), true);
+                    assert!(iter.seek_to_first().unwrap());
                 } else {
-                    assert_eq!(iter.next().unwrap(), true);
+                    assert!(iter.next().unwrap());
                 }
 
                 let ts = Key::decode_ts_from(iter.key()).unwrap();
                 assert_eq!(ts.into_inner(), *expect_ts);
             }
 
-            assert_eq!(iter.next().unwrap(), false);
+            assert!(!iter.next().unwrap());
         }
     }
 
@@ -1211,7 +1416,7 @@ pub mod tests {
         let mut iter = snap.iter(CF_WRITE, iopt).unwrap();
 
         // Must not omit the latest deletion of key1 to prevent seeing outdated record.
-        assert_eq!(iter.seek_to_first().unwrap(), true);
+        assert!(iter.seek_to_first().unwrap());
         assert_eq!(
             Key::from_encoded_slice(iter.key())
                 .to_raw()
@@ -1219,7 +1424,7 @@ pub mod tests {
                 .as_slice(),
             key2
         );
-        assert_eq!(iter.next().unwrap(), false);
+        assert!(!iter.next().unwrap());
     }
 
     #[test]
@@ -1695,21 +1900,23 @@ pub mod tests {
         .map(|(k, lock_type, short_value, ts, for_update_ts)| {
             (
                 Key::from_raw(&k),
-                Lock::new(
-                    lock_type,
-                    b"k1".to_vec(),
-                    ts,
-                    0,
-                    short_value,
-                    for_update_ts,
-                    0,
-                    TimeStamp::zero(),
-                    false,
-                )
-                .set_last_change(LastChange::from_parts(
-                    TimeStamp::zero(),
-                    (lock_type == LockType::Lock || lock_type == LockType::Pessimistic) as u64,
-                )),
+                Either::Left(
+                    Lock::new(
+                        lock_type,
+                        b"k1".to_vec(),
+                        ts,
+                        0,
+                        short_value,
+                        for_update_ts,
+                        0,
+                        TimeStamp::zero(),
+                        false,
+                    )
+                    .set_last_change(LastChange::from_parts(
+                        TimeStamp::zero(),
+                        (lock_type == LockType::Lock || lock_type == LockType::Pessimistic) as u64,
+                    )),
+                ),
             )
         })
         .collect();
@@ -1723,10 +1930,10 @@ pub mod tests {
             let snap = RegionSnapshot::<RocksSnapshot>::from_raw(db.clone(), region.clone());
             let mut reader = MvccReader::new(snap, None, false);
             let res = reader
-                .scan_locks(
+                .scan_locks_from_storage(
                     start_key.as_ref(),
                     end_key.as_ref(),
-                    |l| l.ts <= 10.into(),
+                    |_, l| l.ts <= 10.into(),
                     limit,
                 )
                 .unwrap();
@@ -1788,6 +1995,67 @@ pub mod tests {
             2,
             &visible_locks[..2],
             true,
+        );
+    }
+
+    #[test]
+    fn test_scan_locks_from_storage_shared_locks_limit() {
+        // This test guarantees that the limit parameter take effect on shared locks as
+        // well.
+        let path = tempfile::Builder::new()
+            .prefix("_test_storage_mvcc_reader_scan_locks_from_storage_shared_locks_limit")
+            .tempdir()
+            .unwrap();
+        let path = path.path().to_str().unwrap();
+        let region = make_region(1, vec![], vec![]);
+        let db = open_db(path, true);
+        let mut engine = RegionEngine::new(&db, &region);
+
+        // Create a SharedLocks with 5 individual locks on key "k1"
+        let mut shared_locks = SharedLocks::new();
+        for i in 1..=5u64 {
+            let lock = Lock::new(
+                LockType::Pessimistic,
+                format!("k{}", i).into_bytes(),
+                i.into(),
+                100,
+                None,
+                TimeStamp::zero(),
+                0,
+                TimeStamp::zero(),
+                false,
+            );
+            shared_locks.insert_lock(lock).unwrap();
+        }
+
+        // Write SharedLocks directly to CF_LOCK
+        let key = Key::from_raw(b"shared_lock_key");
+        engine.write(vec![Modify::Put(
+            CF_LOCK,
+            key.clone(),
+            shared_locks.to_bytes(),
+        )]);
+
+        // Scan with limit=1
+        let snap = RegionSnapshot::<RocksSnapshot>::from_raw(db.clone(), region.clone());
+        let mut reader = MvccReader::new(snap, None, false);
+        let (locks, _has_remain) = reader
+            .scan_locks_from_storage(None, None, |_, _| true, 1)
+            .unwrap();
+
+        // Count total individual locks returned
+        let total_locks: usize = locks
+            .iter()
+            .map(|(_, lor)| match lor {
+                Either::Left(_) => 1,
+                Either::Right(shared) => shared.len(),
+            })
+            .sum();
+
+        assert!(
+            total_locks <= 1,
+            "Expected at most 1 lock when limit=1, but got {} locks.",
+            total_locks
         );
     }
 
@@ -1915,7 +2183,7 @@ pub mod tests {
             expect_is_remain: bool,
         }
 
-        let cases = vec![
+        let cases = [
             // Test the limit.
             Case {
                 start_key: None,
@@ -2322,7 +2590,7 @@ pub mod tests {
         ];
         for (i, case) in cases.into_iter().enumerate() {
             let mut engine = TestEngineBuilder::new().build().unwrap();
-            let cm = ConcurrencyManager::new(42.into());
+            let cm = ConcurrencyManager::new_for_test(42.into());
             let mut txn = MvccTxn::new(TimeStamp::new(10), cm.clone());
             for (write_record, put_ts) in case.written.iter() {
                 txn.put_write(

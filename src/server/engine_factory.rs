@@ -4,22 +4,22 @@ use std::{path::Path, sync::Arc};
 
 use encryption_export::DataKeyManager;
 use engine_rocks::{
-    raw::{Cache, Env},
-    util::RangeCompactionFilterFactory,
     CompactedEventSender, CompactionListener, FlowListener, RocksCfOptions, RocksCompactionJobInfo,
     RocksDbOptions, RocksEngine, RocksEventListener, RocksPersistenceListener, RocksStatistics,
     TabletLogger,
+    raw::{Cache, Env},
+    util::RangeCompactionFilterFactory,
 };
 use engine_traits::{
-    CompactionJobInfo, MiscExt, PersistenceListener, Result, StateStorage, TabletContext,
-    TabletFactory, CF_DEFAULT, CF_WRITE,
+    CF_DEFAULT, CF_WRITE, CompactionJobInfo, MiscExt, PersistenceListener, Result, StateStorage,
+    TabletContext, TabletFactory,
 };
 use kvproto::kvrpcpb::ApiVersion;
-use raftstore::RegionInfoAccessor;
+use raftstore::{RegionInfoAccessor, store::ForcePartitionRangeManager};
 use tikv_util::worker::Scheduler;
 
 use crate::{
-    config::{CfResources, DbConfig, DbResources, TikvConfig, DEFAULT_ROCKSDB_SUB_DIR},
+    config::{CfResources, DEFAULT_ROCKSDB_SUB_DIR, DbConfig, DbResources, TikvConfig},
     storage::config::EngineType,
 };
 
@@ -47,6 +47,7 @@ impl KvEngineFactoryBuilder {
         config: &TikvConfig,
         cache: Cache,
         key_manager: Option<Arc<DataKeyManager>>,
+        force_partition_range_mgr: ForcePartitionRangeManager,
     ) -> Self {
         Self {
             inner: FactoryInner {
@@ -56,8 +57,10 @@ impl KvEngineFactoryBuilder {
                 flow_listener: None,
                 sst_recovery_sender: None,
                 encryption_key_manager: key_manager,
-                db_resources: config.rocksdb.build_resources(env),
-                cf_resources: config.rocksdb.build_cf_resources(cache),
+                db_resources: config.rocksdb.build_resources(env, config.storage.engine),
+                cf_resources: config
+                    .rocksdb
+                    .build_cf_resources(cache, force_partition_range_mgr),
                 state_storage: None,
                 lite: false,
             },
@@ -210,15 +213,16 @@ impl TabletFactory<RocksEngine> for KvEngineFactory {
         if let Some(listener) = &self.inner.flow_listener {
             db_opts.add_event_listener(listener.clone_with(ctx.id));
         }
-        if let Some(storage) = &self.inner.state_storage
-            && let Some(flush_state) = ctx.flush_state {
-            let listener = PersistenceListener::new(
-                ctx.id,
-                ctx.suffix.unwrap(),
-                flush_state,
-                storage.clone(),
-            );
-            db_opts.add_event_listener(RocksPersistenceListener::new(listener));
+        if let Some(storage) = &self.inner.state_storage {
+            if let Some(flush_state) = ctx.flush_state {
+                let listener = PersistenceListener::new(
+                    ctx.id,
+                    ctx.suffix.unwrap(),
+                    flush_state,
+                    storage.clone(),
+                );
+                db_opts.add_event_listener(RocksPersistenceListener::new(listener));
+            }
         }
         let kv_engine =
             engine_rocks::util::new_engine_opt(path.to_str().unwrap(), db_opts, cf_opts);
@@ -287,7 +291,8 @@ mod tests {
         let dir = test_util::temp_dir(name, false);
         let env = cfg.build_shared_rocks_env(None, None).unwrap();
 
-        let factory = KvEngineFactoryBuilder::new(env, &cfg, cache, None).build();
+        let factory =
+            KvEngineFactoryBuilder::new(env, &cfg, cache, None, Default::default()).build();
         let reg = TabletRegistry::new(Box::new(factory), dir.path()).unwrap();
         (dir, reg)
     }
